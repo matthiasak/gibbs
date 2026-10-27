@@ -36,6 +36,14 @@ pub static PAR_LIMIT: AtomicUsize = AtomicUsize::new(0);
 pub fn set_par_limit(limit: usize) {
     PAR_LIMIT.store(limit, Ordering::Relaxed);
 }
+
+/// Threads a parallel region may use: every core, capped by [`set_par_limit`] when set.
+pub fn par_limit() -> usize {
+    match PAR_LIMIT.load(Ordering::Relaxed) {
+        0 => *THREADS,
+        limit => (*THREADS).min(limit),
+    }
+}
 /// Raw output pointer shared across workers that write provably disjoint regions.
 #[derive(Clone, Copy)]
 struct Out {
@@ -65,13 +73,7 @@ impl Out {
 /// slower efficiency cores simply take fewer tasks. `S` is per-worker scratch.
 // ponytail: spawns scoped threads per call (~tens of µs); a persistent pool if small-op overhead shows in profiles.
 pub(crate) fn par_tasks<S: Default>(tasks: usize, parallel: bool, f: impl Fn(&mut S, usize) + Sync) {
-    let limit = PAR_LIMIT.load(Ordering::Relaxed);
-    let max_t = if limit > 0 {
-        (*THREADS).min(limit)
-    } else {
-        *THREADS
-    };
-    let threads = if parallel { max_t.min(tasks) } else { 1 };
+    let threads = if parallel { par_limit().min(tasks) } else { 1 };
     let next = AtomicUsize::new(0);
     let work = || {
         let mut state = S::default();
