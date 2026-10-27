@@ -7,6 +7,12 @@
 //! `~/.cache/gibbs/host/pjrt-<fnv64 of the plugin path>.json` with the plugin's API version.
 //! [`supports_op`] reports it, and a graph holding a rejected op fails to load with the plugin's
 //! compile error.
+//!
+//! Paged KV (`crate::kv`): the host pages stay the source of truth (copy-on-write, forks, rings
+//! and eviction all act on them), so each run binds every paged state as a page window gathered
+//! through the view's table, padded to a power-of-4 page count (≥ 16) so one executable serves a
+//! bucket. The window is donated to the module, written rows scatter into their slots, rows a
+//! slot does not hold are masked, and the written rows go back into their host pages.
 
 pub mod emit;
 pub mod pjrt;
@@ -65,6 +71,7 @@ fn probe_module(p: &probe::Probe) -> Result<emit::Module, String> {
         &p.graph,
         &|name| p.weights.get(name).map(|t| (t.len(), Ty::F32)),
         &states,
+        &[],
     )
 }
 
@@ -219,6 +226,18 @@ struct DeviceWeight {
 /// Compiled executables by module text hash, least recently used first.
 type ExeCache = Vec<(u64, Arc<pjrt::Executable>, Arc<emit::Module>)>;
 
+/// One page class bound for a run: each state's `(name, row width, window)`, which stored row
+/// every window slot holds (`-1` empty), the slot of each written query row, and `kv_base`.
+struct PagedBind {
+    class: usize,
+    pos: usize,
+    nq: usize,
+    names: Vec<(String, usize, Vec<f32>)>,
+    slot_row: Vec<i32>,
+    write_slot: Vec<i32>,
+    base: usize,
+}
+
 pub struct XlaSession {
     plugin: &'static Plugin,
     weights: HashMap<String, DeviceWeight>,
@@ -337,6 +356,9 @@ impl XlaSession {
             if v.shape.is_empty() {
                 return Err(format!("state '{name}' has no static shape"));
             }
+            if state.kv.as_ref().is_some_and(|kv| kv.has(name)) {
+                continue;
+            }
             let mut data = state.get(name).map(Tensor::to_f32).unwrap_or_default();
             let kv_only = graph.nodes.iter().all(|n| {
                 !n.inputs.contains(&crate::graph::ValueId(i as u32))
@@ -364,6 +386,119 @@ impl XlaSession {
         Ok(out)
     }
 
+    /// Reserves this run's rows in the paged KV view (as the CPU executor, node by node) and
+    /// gathers each paged state's page window from the host pages: the class's stored rows
+    /// (rings: its ring slots), padded to a power-of-4 page count of at least 16 so one
+    /// executable serves a whole bucket.
+    fn bind_paged(
+        graph: &Graph,
+        state: &mut StateStore,
+        inputs: &[Tensor],
+    ) -> Result<Vec<PagedBind>, String> {
+        let Some(kv) = state.kv.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut binds: Vec<PagedBind> = Vec::new();
+        for node in &graph.nodes {
+            let Op::CachedAttention {
+                heads,
+                head_dim,
+                write,
+                ..
+            } = node.op
+            else {
+                continue;
+            };
+            let name = |k: usize| match node.inputs.get(k).map(|&v| &graph.value(v).kind) {
+                Some(ValueKind::State { name, .. }) => Some(name.clone()),
+                _ => None,
+            };
+            let (Some(kn), Some(vn)) = (name(3), name(4)) else {
+                continue;
+            };
+            if node.inputs.len() < 6 || !kv.has(&kn) || !kv.has(&vn) {
+                continue;
+            }
+            let pos = graph
+                .inputs
+                .iter()
+                .position(|&i| i == node.inputs[5])
+                .and_then(|i| inputs[i].as_u32().ok()?.first().copied())
+                .ok_or_else(|| format!("node '{}': paged KV needs host positions", node.name))?
+                as usize;
+            let nq = graph.value(node.inputs[0]).shape.iter().product::<usize>()
+                / (heads * head_dim).max(1);
+            let rows = if write { pos..pos + nq } else { pos..pos };
+            kv.reserve(pos + nq, rows)
+                .map_err(|e| format!("node '{}': {e}", node.name))?;
+            let (class, _) = kv.pool().locate(&kn).expect("paged above");
+            match binds.iter_mut().find(|b| b.class == class) {
+                Some(b) if (b.pos, b.nq) != (pos, nq) => {
+                    return Err(format!(
+                        "node '{}': one page class at two positions in one graph",
+                        node.name
+                    ))
+                }
+                Some(b) => {
+                    for n in [kn, vn] {
+                        if !b.names.iter().any(|(m, ..)| *m == n) {
+                            b.names.push((n, 0, Vec::new()));
+                        }
+                    }
+                }
+                None => binds.push(PagedBind {
+                    class,
+                    pos,
+                    nq,
+                    names: vec![(kn, 0, Vec::new()), (vn, 0, Vec::new())],
+                    slot_row: Vec::new(),
+                    write_slot: Vec::new(),
+                    base: 0,
+                }),
+            }
+        }
+        let kv = state.kv.as_ref().expect("checked above");
+        for b in &mut binds {
+            let ring = kv.ring(b.class);
+            b.base = kv.stored(b.class, b.pos);
+            let last = kv.stored(b.class, b.pos + b.nq);
+            let held = if ring > 0 { ring * crate::kv::PAGE_TOKENS } else { kv.lens[b.class] };
+            let pages = held.div_ceil(crate::kv::PAGE_TOKENS);
+            let mut bucket = 16;
+            while bucket < pages {
+                bucket *= 4;
+            }
+            let win = bucket * crate::kv::PAGE_TOKENS;
+            b.slot_row = (0..win)
+                .map(|j| match ring {
+                    _ if j >= held || j >= last => -1,
+                    0 => j as i32,
+                    // The newest stored row (below `last`) living in ring slot `j`.
+                    _ => (last - 1 - (last - 1 - j) % held) as i32,
+                })
+                .collect();
+            b.write_slot = (0..b.nq)
+                .map(|i| match ring {
+                    0 => (b.base + i) as i32,
+                    _ => ((b.base + i) % held) as i32,
+                })
+                .collect();
+            for (name, w, data) in &mut b.names {
+                let rows = kv.host_rows(name).expect("paged above");
+                if rows.elem != 4 {
+                    return Err(format!("XLA reads f32 KV pages only ('{name}')"));
+                }
+                let (c, i) = kv.pool().locate(name).expect("paged above");
+                *w = kv.pool().classes[c].names[i].row_width;
+                *data = vec![0f32; win * *w];
+                for (j, out) in data.chunks_exact_mut(*w).enumerate().take(held.min(last)) {
+                    rows.read(j, out);
+                }
+            }
+        }
+        Ok(binds)
+    }
+
     pub fn run(
         &self,
         graph: &Graph,
@@ -378,7 +513,21 @@ impl XlaSession {
             ));
         }
         let client = &self.plugin.client;
-        let bound = Self::bind_states(graph, state, &inputs)?;
+        let paged = Self::bind_paged(graph, state, &inputs)?;
+        let mut bound = Self::bind_states(graph, state, &inputs)?;
+        let classes: Vec<emit::PagedClass> = paged
+            .iter()
+            .map(|b| emit::PagedClass {
+                names: b.names.iter().map(|(n, ..)| n.clone()).collect(),
+                rows: b.slot_row.len(),
+                nq: b.nq,
+            })
+            .collect();
+        for b in &paged {
+            for (n, w, data) in &b.names {
+                bound.push((n.clone(), vec![b.slot_row.len(), *w], data.clone()));
+            }
+        }
         let shapes: HashMap<String, Vec<usize>> = bound
             .iter()
             .map(|(n, s, _)| (n.clone(), s.clone()))
@@ -387,6 +536,7 @@ impl XlaSession {
             graph,
             &|name| self.weights.get(name).map(|w| (w.len, w.ty)),
             &shapes,
+            &classes,
         )?;
         let key = fnv64(&module.text);
         let (exe, module) = {
@@ -438,6 +588,11 @@ impl XlaSession {
                 .expect("emitted states are bound");
             owned.push(client.upload(bytes(data), pjrt::ElemType::F32, &[shape.iter().product()])?);
         }
+        for b in &paged {
+            owned.push(client.upload(bytes(&b.slot_row), pjrt::ElemType::S32, &[b.slot_row.len()])?);
+            owned.push(client.upload(bytes(&b.write_slot), pjrt::ElemType::S32, &[b.nq])?);
+            owned.push(client.upload(bytes(&[b.base as i32]), pjrt::ElemType::S32, &[1])?);
+        }
         let n_in = graph.inputs.len();
         let mut args: Vec<&pjrt::Buffer> = owned[..n_in].iter().collect();
         for name in &module.weights {
@@ -476,7 +631,22 @@ impl XlaSession {
             client.download(buf, unsafe {
                 std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, buf.bytes)
             })?;
-            state.insert(name, Tensor::F32(v));
+            match paged.iter().find(|b| b.names.iter().any(|(n, ..)| n == name)) {
+                // Copy the rows this run wrote back into their host pages.
+                Some(b) => {
+                    let kv = state.kv.as_ref().expect("paged");
+                    let rows = kv.host_rows(name).expect("paged");
+                    let w = b.names.iter().find(|(n, ..)| n == name).expect("found").1;
+                    for &j in &b.write_slot {
+                        let src = &v[j as usize * w..][..w];
+                        // SAFETY: a host page row of `w` f32 (checked at bind).
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src.as_ptr(), rows.row(j as usize) as *mut f32, w)
+                        };
+                    }
+                }
+                None => state.insert(name, Tensor::F32(v)),
+            }
         }
         Ok(outs)
     }

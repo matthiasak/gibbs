@@ -83,12 +83,24 @@ pub struct Module {
     pub params: Vec<(usize, Ty)>,
 }
 
+/// One page class of the graph's paged KV states, bound as page windows: each named state's
+/// parameter is `[rows, w]` (window slot `j` holds stored row `slot_row[j]`, `-1` = empty), and
+/// the class adds the parameters `slot_row [rows]`, `write_slot [nq]` (the slot each written
+/// query row lands in) and `base [1]` (`kv_base`: stored row of the run's first position).
+pub struct PagedClass {
+    pub names: Vec<String>,
+    pub rows: usize,
+    pub nq: usize,
+}
+
 /// Emits `g`. `weight(name)` is the bound weight's element count and type (`None`: missing);
-/// `states[name]` is the bound shape of each state the graph reads (f32).
+/// `states[name]` is the bound shape of each state the graph reads (f32); `paged` lists the
+/// page classes whose states are bound as windows.
 pub fn emit(
     g: &Graph,
     weight: &dyn Fn(&str) -> Option<(usize, Ty)>,
     states: &HashMap<String, Vec<usize>>,
+    paged: &[PagedClass],
 ) -> Result<Module, String> {
     let mut e = Em {
         g,
@@ -97,6 +109,8 @@ pub fn emit(
         vals: vec![None; g.values.len()],
         cur: HashMap::new(),
         written: Vec::new(),
+        paged: HashMap::new(),
+        classes: Vec::new(),
     };
     let mut params: Vec<(String, String)> = Vec::new();
     let mut layout: Vec<(usize, Ty)> = Vec::new();
@@ -162,6 +176,24 @@ pub fn emit(
         layout.push((numel(shape), Ty::F32));
         let v = e.reshape(&p, shape);
         e.cur.insert(name.clone(), v);
+    }
+    for (c, pc) in paged.iter().enumerate() {
+        let mut vals = Vec::with_capacity(3);
+        for (tag, n) in [("slot", pc.rows), ("wslot", pc.nq), ("base", 1)] {
+            let p = V {
+                name: format!("%{tag}{c}"),
+                shape: vec![n],
+                ty: Ty::I32,
+            };
+            params.push((p.name.clone(), p.t()));
+            layout.push((n, Ty::I32));
+            vals.push(p);
+        }
+        let base = e.reshape(&vals[2], &[]);
+        e.classes.push((vals[0].clone(), vals[1].clone(), base));
+        for name in &pc.names {
+            e.paged.insert(name.clone(), c);
+        }
     }
     // Weight values: flat param -> declared shape, f32 unless integer.
     for (i, v) in g.values.iter().enumerate() {
@@ -256,6 +288,10 @@ struct Em<'g> {
     /// The current value of each state (a write replaces it for later readers).
     cur: HashMap<String, V>,
     written: Vec<String>,
+    /// Paged state name → its class in `classes`.
+    paged: HashMap<String, usize>,
+    /// Per paged class: `slot_row`, `write_slot`, scalar `base`.
+    classes: Vec<(V, V, V)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1483,6 +1519,70 @@ impl<'g> Em<'g> {
                 let q = self.reshape(&q, &[nq, h, hd]);
                 let kn = self.flt(ins[1])?;
                 let vn = self.flt(ins[2])?;
+                let class = match ins.get(3).map(|&v| &g.value(v).kind) {
+                    Some(ValueKind::State { name, .. }) if ins.len() >= 6 => {
+                        self.paged.get(name).copied()
+                    }
+                    _ => None,
+                };
+                if let Some(c) = class {
+                    // Page windows in stored-row space (`crate::kv`): written rows scatter into
+                    // their slots, keys are masked by the stored row each slot holds.
+                    let (slot, wslot, base) = self.classes[c].clone();
+                    let p = self.idx(ins[5])?;
+                    let p = self.reshape(&p, &[numel(&p.shape)]);
+                    let p0 = self.elem(&p, 0);
+                    let ks = self.flt(ins[3])?;
+                    let vs = self.flt(ins[4])?;
+                    let mut ks = self.rows(&ks, kvh * hd)?;
+                    let mut vs = self.rows(&vs, kvh * vhd)?;
+                    if *write {
+                        let kn = self.rows(&kn, kvh * hd)?;
+                        let vn = self.rows(&vn, kvh * vhd)?;
+                        ks = self.scatter_rows(&ks, &wslot, &kn);
+                        vs = self.scatter_rows(&vs, &wslot, &vn);
+                        self.set_state(ins[3], ks.clone())?;
+                        self.set_state(ins[4], vs.clone())?;
+                    }
+                    let rows = ks.shape[0];
+                    let t = self.bcast(&slot, &[nq, rows], &[1]);
+                    let qi = self.iota(&[nq, rows], 0);
+                    let bb = self.bcast(&base, &[nq, rows], &[]);
+                    let cur = self.add(&bb, &qi);
+                    let shift = self.sub(&p0, &base);
+                    let vis = match ins.get(6) {
+                        Some(&vi) => {
+                            let v = self.idx(vi)?;
+                            let v = self.reshape(&v, &[nq]);
+                            let sh = self.bcast(&shift, &[nq], &[]);
+                            Some(self.sub(&v, &sh))
+                        }
+                        None => None,
+                    };
+                    let hi = match (*causal, &vis) {
+                        (true, Some(v)) => self.bcast(v, &[nq, rows], &[0]),
+                        (true, None) => self.addc(&cur, 1.0),
+                        (false, _) => {
+                            let mut all = self.addc(&base, nq as f64);
+                            if let Some(v) = &vis {
+                                let vm = self.reduce(v, &[0], Red::Max);
+                                all = self.bin("maximum", &all, &vm);
+                            }
+                            self.bcast(&all, &[nq, rows], &[])
+                        }
+                    };
+                    let valid = self.cmpc("GE", &t, 0.0);
+                    let below = self.cmp("LT", &t, &hi);
+                    let mut mask = self.and(&valid, &below);
+                    if let Some(w) = window {
+                        let tw = self.addc(&t, *w as f64);
+                        let c = self.cmp("GT", &tw, &cur);
+                        mask = self.and(&mask, &c);
+                    }
+                    let k3 = self.reshape(&ks, &[rows, kvh, hd]);
+                    let v3 = self.reshape(&vs, &[rows, kvh, vhd]);
+                    return Ok(self.attend(&q, &k3, &v3, &mask, *scale, *soft_cap, None));
+                }
                 let (k_all, v_all, pos) = if ins.len() >= 6 {
                     let p = self.idx(ins[5])?;
                     let p = self.reshape(&p, &[numel(&p.shape)]);
