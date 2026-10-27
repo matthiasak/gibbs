@@ -1319,23 +1319,6 @@ impl Runtime {
         Ok(pso)
     }
 
-    /// The cooperative decode MLP megakernel (`codegen::mlp_megakernel_msl`) for `f`, compiled on
-    /// first use (cached under the otherwise unused `rows_per_sg == 0xFF` slot).
-    fn mlp_mega_pso(&self, f: QuantFormat, is_geglu: bool) -> Result<ComputePipelineState, String> {
-        let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        let key = (c.format, 0xFF, is_geglu as u8);
-        if let Some(p) = self.gen_psos.lock().get(&key) {
-            return Ok(p.clone());
-        }
-        let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
-        src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
-        src.push_str(&crate::graph::codegen::mlp_megakernel_msl(c, is_geglu));
-        let name = crate::graph::codegen::mlp_megakernel_name(c, is_geglu);
-        let pso = self.compile_generated(&src, &name)?;
-        self.gen_psos.lock().insert(key, pso.clone());
-        Ok(pso)
-    }
-
     /// The generated in-tile dequantization GEMM pipeline for `f` and `epi`, compiled on first use.
     fn gemm_pso(&self, f: QuantFormat, epi: Epi) -> Result<ComputePipelineState, String> {
         let c = crate::graph::codegen::gemm_codec(f)
@@ -4023,137 +4006,112 @@ impl Session {
                 let off_gate = bytes_norm;
                 let off_up = bytes_norm + bytes_inter;
 
-                let fmt_of = |name: &str| {
-                    self.weights
-                        .get(name)
-                        .map(|w| w.3)
-                        .unwrap_or(WeightFormat::F32)
-                };
-                let (gate_fmt, up_fmt) = (fmt_of(gate_name), fmt_of(up_name));
-                // Cooperative path: one dispatch for norm + gate + up + GLU into scratch[off_gate]
-                // (one weight codec, `hidden` within its 4096-float threadgroup row).
-                let coop = gate_fmt
-                    .codec_format()
-                    .filter(|_| pre_res.is_none() && hidden <= 4096 && gate_fmt == up_fmt)
-                    .filter(|&q| codec::codec(q).is_some_and(|c| hidden % c.block_elems as usize == 0));
-                if let Some(q) = coop {
+                // 1. RMSNorm: x * norm_w -> scratch[off_norm] (optionally fused with preceding post-attn norm/residual -> x)
+                if let Some((x0, g0, res0, scale0, eps0)) = pre_res {
                     #[repr(C)]
-                    struct MlpMegaParams(u32, u32, f32);
-                    let pso = rt.mlp_mega_pso(q, is_geglu)?;
-                    enc.set_compute_pipeline_state(&pso);
+                    struct RmsNormFusedParams {
+                        rows: u32,
+                        d: u32,
+                        eps: f32,
+                        eps2: f32,
+                        flags: u32,
+                        n_seq: u32,
+                        rotary_dim: u32,
+                        pair_stride: u32,
+                        mscale: f32,
+                    }
+                    enc.set_compute_pipeline_state(rt.pso("rmsnorm_fused_f32")?);
+                    bind(0, x0);
+                    bind(1, g0);
+                    bind(2, res0.unwrap_or(x0));
+                    bind(3, scale0.unwrap_or(x0));
+                    bind(4, x);
+                    bind(5, norm_w);
+                    enc.set_buffer(6, Some(scratch), off_norm as u64);
+                    let flags = (res0.is_some() as u32) | ((scale0.is_some() as u32) << 1) | 4;
+                    let p = RmsNormFusedParams {
+                        rows: 1,
+                        d: u32_of(hidden)?,
+                        eps: eps0,
+                        eps2: eps,
+                        flags,
+                        n_seq: 1,
+                        rotary_dim: 0,
+                        pair_stride: 1,
+                        mscale: 1.0,
+                    };
+                    set_bytes(enc, 7, &p);
+                    bind(8, x0);
+                    bind(9, x0);
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
+                } else {
+                    enc.set_compute_pipeline_state(rt.pso("rmsnorm_f32")?);
                     bind(0, x);
                     bind(1, norm_w);
-                    bind(2, gate_w);
-                    bind(3, up_w);
-                    enc.set_buffer(4, Some(scratch), off_gate as u64);
-                    set_bytes(enc, 5, &MlpMegaParams(u32_of(hidden)?, u32_of(inter)?, eps));
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((inter as u64).div_ceil(8), 1, 1),
-                        MTLSize::new(TG, 1, 1),
-                    );
-                } else {
-                    // 1. RMSNorm: x * norm_w -> scratch[off_norm] (optionally fused with preceding post-attn norm/residual -> x)
-                    if let Some((x0, g0, res0, scale0, eps0)) = pre_res {
-                        #[repr(C)]
-                        struct RmsNormFusedParams {
-                            rows: u32,
-                            d: u32,
-                            eps: f32,
-                            eps2: f32,
-                            flags: u32,
-                            n_seq: u32,
-                            rotary_dim: u32,
-                            pair_stride: u32,
-                            mscale: f32,
-                        }
-                        enc.set_compute_pipeline_state(rt.pso("rmsnorm_fused_f32")?);
-                        bind(0, x0);
-                        bind(1, g0);
-                        bind(2, res0.unwrap_or(x0));
-                        bind(3, scale0.unwrap_or(x0));
-                        bind(4, x);
-                        bind(5, norm_w);
-                        enc.set_buffer(6, Some(scratch), off_norm as u64);
-                        let flags = (res0.is_some() as u32) | ((scale0.is_some() as u32) << 1) | 4;
-                        let p = RmsNormFusedParams {
-                            rows: 1,
-                            d: u32_of(hidden)?,
-                            eps: eps0,
-                            eps2: eps,
-                            flags,
-                            n_seq: 1,
-                            rotary_dim: 0,
-                            pair_stride: 1,
-                            mscale: 1.0,
-                        };
-                        set_bytes(enc, 7, &p);
-                        bind(8, x0);
-                        bind(9, x0);
-                        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
-                    } else {
-                        enc.set_compute_pipeline_state(rt.pso("rmsnorm_f32")?);
-                        bind(0, x);
-                        bind(1, norm_w);
-                        enc.set_buffer(2, Some(scratch), off_norm as u64);
-                        #[repr(C)]
-                        struct RmsNormParams(u32, u32, f32);
-                        let p = RmsNormParams(1, u32_of(hidden)?, eps);
-                        set_bytes(enc, 3, &p);
-                        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
-                    }
-                    // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
+                    enc.set_buffer(2, Some(scratch), off_norm as u64);
+                    #[repr(C)]
+                    struct RmsNormParams(u32, u32, f32);
+                    let p = RmsNormParams(1, u32_of(hidden)?, eps);
+                    set_bytes(enc, 3, &p);
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
+                }
+                // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
+                self.encode_gemv_or_gemm(
+                    enc,
+                    (scratch, off_norm),
+                    loc(gate_w),
+                    variants[0],
+                    gate_name,
+                    None,
+                    (scratch, off_gate),
+                    inter,
+                    hidden,
+                    Epi::None,
+                )?;
+
+                // 3. Up GEMV + SwiGLU / GeGLU (fused into Up GEMV epilogue for non-F32 weights):
+                let up_fmt = self
+                    .weights
+                    .get(up_name)
+                    .map(|w| w.3)
+                    .unwrap_or(WeightFormat::F32);
+                if up_fmt != WeightFormat::F32 {
                     self.encode_gemv_or_gemm(
                         enc,
                         (scratch, off_norm),
-                        loc(gate_w),
-                        variants[0],
-                        gate_name,
-                        None,
+                        loc(up_w),
+                        variants[1],
+                        up_name,
+                        Some((scratch, off_gate)),
                         (scratch, off_gate),
+                        inter,
+                        hidden,
+                        if is_geglu {
+                            Epi::UpGeGlu
+                        } else {
+                            Epi::UpSwiGlu
+                        },
+                    )?;
+                } else {
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(up_w),
+                        variants[1],
+                        up_name,
+                        None,
+                        (scratch, off_up),
                         inter,
                         hidden,
                         Epi::None,
                     )?;
-
-                    // 3. Up GEMV + SwiGLU / GeGLU (fused into Up GEMV epilogue for non-F32 weights):
-                    if up_fmt != WeightFormat::F32 {
-                        self.encode_gemv_or_gemm(
-                            enc,
-                            (scratch, off_norm),
-                            loc(up_w),
-                            variants[1],
-                            up_name,
-                            Some((scratch, off_gate)),
-                            (scratch, off_gate),
-                            inter,
-                            hidden,
-                            if is_geglu {
-                                Epi::UpGeGlu
-                            } else {
-                                Epi::UpSwiGlu
-                            },
-                        )?;
-                    } else {
-                        self.encode_gemv_or_gemm(
-                            enc,
-                            (scratch, off_norm),
-                            loc(up_w),
-                            variants[1],
-                            up_name,
-                            None,
-                            (scratch, off_up),
-                            inter,
-                            hidden,
-                            Epi::None,
-                        )?;
-                        let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
-                        enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                        enc.set_buffer(0, Some(scratch), off_gate as u64);
-                        enc.set_buffer(1, Some(scratch), off_up as u64);
-                        enc.set_buffer(2, Some(scratch), off_gate as u64);
-                        set_bytes(enc, 3, &u32_of(inter)?);
-                        grid1(inter);
-                    }
+                    let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
+                    enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                    enc.set_buffer(0, Some(scratch), off_gate as u64);
+                    enc.set_buffer(1, Some(scratch), off_up as u64);
+                    enc.set_buffer(2, Some(scratch), off_gate as u64);
+                    set_bytes(enc, 3, &u32_of(inter)?);
+                    grid1(inter);
                 }
                 // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                 if let Some(pn) = post_norm_w {
