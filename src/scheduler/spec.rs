@@ -10,7 +10,7 @@
 
 use super::{recent, ExecutableModel, NO_STATE};
 use crate::model::native::SeqState;
-use crate::runtime::lm::nucleus;
+use crate::runtime::lm::{nucleus, sample_logits};
 use crate::runtime::noise_draft::{DraftKnobs, DraftMode};
 use crate::runtime::sched::Rng;
 use std::any::Any;
@@ -19,6 +19,12 @@ use std::time::Duration;
 
 /// A drafter's per-sequence state.
 pub type DraftState = Box<dyn Any + Send + Sync>;
+
+/// Draft logits a drafter hands `pick`: over the whole vocabulary, or over candidate ids only.
+pub enum DraftLogits<'a> {
+    Dense(&'a [f32]),
+    Sparse { ids: &'a [u32], logits: &'a [f32] },
+}
 
 /// Proposes draft tokens from the target's hidden states.
 pub trait Drafter: Send + Sync {
@@ -38,11 +44,24 @@ pub trait Drafter: Send + Sync {
         tokens: &[u32],
         hidden: &[f32],
         k: usize,
-        pick: &mut dyn FnMut(&[f32]) -> u32,
+        pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
     ) -> Result<Vec<u32>, String>;
     /// Most tokens one [`Self::propose`] call may draft; the scheduler tunes `k` in `0..=max_k`.
     fn max_k(&self) -> usize {
         4
+    }
+    /// After a verify: the target's logits rows (`width` wide) for the sequence's last token and
+    /// the accepted drafts; `accepted[j]` is the token committed from row `j`.
+    fn observe(&self, _st: &mut DraftState, _accepted: &[u32], _logits: &[f32], _width: usize) {}
+    /// A copy of `st` that a [`Self::propose`] may run ahead on during the target's verify;
+    /// `None` when the drafter cannot.
+    fn fork_state(&self, _st: &DraftState) -> Option<DraftState> {
+        None
+    }
+    /// Proposals need no verified hidden state, so the next step's drafts may be proposed while
+    /// the target verifies this step's.
+    fn overlaps(&self) -> bool {
+        false
     }
 }
 
@@ -153,22 +172,13 @@ pub(super) fn decode(
         spec.pending.clear();
         Vec::new()
     } else {
-        let rng = &mut spec.rng;
+        let (rng, picked) = (&mut spec.rng, &mut qs);
         let drafts = spec.drafter.propose(
             &mut spec.draft,
             all,
             &spec.pending,
             k,
-            &mut |logits: &[f32]| {
-                let l = &logits[..valid(logits.len())];
-                if greedy {
-                    return m.sample(l, &[], temp, top_p);
-                }
-                let q = dist(l, temp, top_p);
-                let t = draw(&q, rng.uniform());
-                qs.push(q);
-                t
-            },
+            &mut |l| pick(l, temp, top_p, vocab, rng, picked),
         )?;
         spec.pending.clear();
         if drafts.len() > k || (!greedy && qs.len() != drafts.len()) {
@@ -230,21 +240,17 @@ pub(super) fn decode(
             out.push(t);
             break;
         };
-        let (px, qx) = (prob(&p, x), prob(&qs[j], x));
-        if spec.rng.uniform() * qx as f64 <= px as f64 {
-            if let Some(k_lp) = top_logprobs {
-                logprobs.push(super::logprob_info(l, x, k_lp));
-            }
-            out.push(x);
-            continue;
-        }
-        let t = draw(&residual(&p, &qs[j]), spec.rng.uniform());
+        let (t, ok) = verify_draft(&p, &qs[j], x, &mut spec.rng);
         if let Some(k_lp) = top_logprobs {
             logprobs.push(super::logprob_info(l, t, k_lp));
         }
         out.push(t);
-        break;
+        if !ok {
+            break;
+        }
     }
+    spec.drafter
+        .observe(&mut spec.draft, &out, &logits[..out.len() * width], width);
     // The target keeps `last` and the accepted drafts; the final token has not run yet.
     m.truncate(kv, start + out.len())?;
     let taps = m.take_taps(kv);
@@ -257,6 +263,59 @@ pub(super) fn decode(
         synced,
         logprobs,
     })
+}
+
+/// Chooses a draft token from `l` the way the scheduler samples (`vocab`: the tokenizer's size, 0 =
+/// all ids); a sampled pick records its distribution `q` in `qs` for rejection sampling.
+fn pick(
+    l: DraftLogits<'_>,
+    temp: f32,
+    top_p: f32,
+    vocab: usize,
+    rng: &mut Rng,
+    qs: &mut Vec<Vec<(u32, f32)>>,
+) -> u32 {
+    let greedy = temp <= 1e-4;
+    let q = match l {
+        DraftLogits::Dense(l) => {
+            let l = &l[..if vocab > 0 { l.len().min(vocab) } else { l.len() }];
+            if greedy {
+                return sample_logits(l, &[], temp, TOP_K, top_p, 1.0);
+            }
+            dist(l, temp, top_p)
+        }
+        DraftLogits::Sparse { ids, logits } => {
+            let (ids, logits): (Vec<u32>, Vec<f32>) = ids
+                .iter()
+                .zip(logits)
+                .filter(|e| vocab == 0 || (*e.0 as usize) < vocab)
+                .map(|(&t, &l)| (t, l))
+                .unzip();
+            match (ids.is_empty(), greedy) {
+                (true, true) => return 0,
+                (true, false) => vec![(0, 1.0)],
+                (false, true) => {
+                    return ids[sample_logits(&logits, &[], temp, TOP_K, top_p, 1.0) as usize]
+                }
+                (false, false) => dist(&logits, temp, top_p)
+                    .into_iter()
+                    .map(|(i, p)| (ids[i as usize], p))
+                    .collect(),
+            }
+        }
+    };
+    let t = draw(&q, rng.uniform());
+    qs.push(q);
+    t
+}
+
+/// Rejection sampling of draft `x`, drawn from `q`, against the target's `p`: `x` with
+/// probability `min(1, p(x) / q(x))`, else a draw from `max(0, p - q)`; whether `x` was kept.
+fn verify_draft(p: &[(u32, f32)], q: &[(u32, f32)], x: u32, rng: &mut Rng) -> (u32, bool) {
+    if rng.uniform() * prob(q, x) as f64 <= prob(p, x) as f64 {
+        return (x, true);
+    }
+    (draw(&residual(p, q), rng.uniform()), false)
 }
 
 /// The scheduler's sampling distribution over `logits` (sparse, normalized).
@@ -626,6 +685,40 @@ impl KTuner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sparse draft (candidate ids only, over a support that misses target tokens and adds one
+    /// the target excludes) verified by rejection sampling emits exactly the target's
+    /// distribution: χ² over 20 000 seeded draws.
+    #[test]
+    fn sparse_draft_rejection_sampling_matches_target() {
+        let target = [2.0f32, 0.5, 1.5, -1.0, 0.0, 1.0, -30.0, 0.3];
+        let (temp, top_p) = (0.8, 0.95);
+        let p = dist(&target, temp, top_p);
+        let (ids, logits) = ([1u32, 3, 5, 6], [1.0f32, 0.2, 2.0, 0.5]);
+        let mut rng = Rng::new(11);
+        let n = 20_000;
+        let mut counts = [0usize; 8];
+        for _ in 0..n {
+            let mut qs = Vec::new();
+            let sparse = DraftLogits::Sparse {
+                ids: &ids,
+                logits: &logits,
+            };
+            let x = pick(sparse, temp, top_p, target.len(), &mut rng, &mut qs);
+            counts[verify_draft(&p, &qs[0], x, &mut rng).0 as usize] += 1;
+        }
+        let mut chi2 = 0.0;
+        for (t, &c) in counts.iter().enumerate() {
+            let e = prob(&p, t as u32) as f64 * n as f64;
+            if e == 0.0 {
+                assert_eq!(c, 0, "token {t} is outside the target's support");
+                continue;
+            }
+            chi2 += (c as f64 - e).powi(2) / e;
+        }
+        // 99.9th percentile of χ² with at most 7 degrees of freedom.
+        assert!(chi2 < 24.32, "χ² = {chi2}: {counts:?} vs {p:?}");
+    }
 
     /// Rejection sampling over a mismatched draft keeps the target distribution.
     #[test]

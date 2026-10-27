@@ -7,7 +7,7 @@
 //! 2. [`NoiseBlockHead`]: a multi-offset block drafter head over sketches of the target's own token
 //!    embeddings ([`EmbedFn`]), trained online from committed target tokens.
 
-use crate::scheduler::spec::{DraftState, Drafter};
+use crate::scheduler::spec::{DraftLogits, DraftState, Drafter};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -757,8 +757,15 @@ struct Inner {
 impl Inner {
     /// Teacher-forced update on committed `tokens`: every (context end `p`, offset `j`) pair whose
     /// target `tokens[p + j]` sits at index `from..` trains once, offset `j`'s refined context
-    /// reading the committed tokens before it.
-    fn learn(&mut self, tokens: &[u32], from: usize, knobs: &DraftKnobs) {
+    /// reading the committed tokens before it. A target the verifier scored (`soft`: by token
+    /// index) trains toward that distribution over the shortlist, else toward the token.
+    fn learn(
+        &mut self,
+        tokens: &[u32],
+        from: usize,
+        knobs: &DraftKnobs,
+        soft: &[(usize, Vec<(u32, f32)>)],
+    ) {
         let Self { head, sk } = self;
         let to = tokens.len();
         let lr = knobs.noise_lr;
@@ -794,7 +801,21 @@ impl Inner {
                 let m = (refine && j > 0).then(|| sk.mean(&tokens[p..p + j]));
                 let cj = m.as_ref().map_or_else(|| c.clone(), |m| head.refine(&c, m));
                 let hxj = hx[j].get_or_insert_with(|| head.probe_logits(j, &dirs));
-                let g = head.train_offset(j, &cj, &[(slot, 1.0)], &dirs, hxj, knobs.noise_sigma, lr);
+                let mut y: Vec<(usize, f32)> = soft
+                    .iter()
+                    .find(|e| e.0 == p + j)
+                    .map(|e| {
+                        let y = e.1.iter().filter_map(|&(t, q)| Some((*head.slot_of.get(&t)?, q)));
+                        y.collect()
+                    })
+                    .unwrap_or_default();
+                let total: f32 = y.iter().map(|e| e.1).sum();
+                if total > 0.0 {
+                    y.iter_mut().for_each(|e| e.1 /= total);
+                } else {
+                    y = vec![(slot, 1.0)];
+                }
+                let g = head.train_offset(j, &cj, &y, &dirs, hxj, knobs.noise_sigma, lr);
                 // Identity-path credit: `c_j`'s credit is `c`'s, and `U`'s through `m_j`.
                 if let Some(m) = &m {
                     head.u.step_outer(&g, m, lr * HIDDEN_LR);
@@ -843,9 +864,14 @@ impl Inner {
 // ---- OnlineNoiseDrafter -----------------------------------------------------------------------
 
 /// Per-sequence state for [`OnlineNoiseDrafter`].
+#[derive(Clone)]
 struct OnlineNoiseState {
     /// Committed tokens already ingested into the suffix lattices and the head.
     seen: usize,
+    /// A fork ingests no further than this on its next propose (its extra tokens are unverified).
+    cap: Option<usize>,
+    /// The verifier's distributions over upcoming tokens, by token index ([`Drafter::observe`]).
+    soft: Vec<(usize, Vec<(u32, f32)>)>,
     /// Local sequence suffix lattice (seeded immediately from the sequence's own prompt).
     local: SuffixLattice,
 }
@@ -926,8 +952,46 @@ impl Drafter for OnlineNoiseDrafter {
     fn new_state(&self) -> DraftState {
         Box::new(OnlineNoiseState {
             seen: 0,
+            cap: None,
+            soft: Vec::new(),
             local: SuffixLattice::new(),
         })
+    }
+
+    fn overlaps(&self) -> bool {
+        true
+    }
+
+    fn fork_state(&self, st: &DraftState) -> Option<DraftState> {
+        let s = st.downcast_ref::<OnlineNoiseState>()?;
+        Some(Box::new(OnlineNoiseState {
+            cap: Some(s.seen),
+            ..s.clone()
+        }))
+    }
+
+    /// Keeps each verified row as a soft target: the softmax of its logits over the shortlist and
+    /// the row's top 8.
+    fn observe(&self, st: &mut DraftState, accepted: &[u32], logits: &[f32], width: usize) {
+        let Some(s) = st.downcast_mut::<OnlineNoiseState>() else {
+            return;
+        };
+        let mode = self.knobs.snapshot().mode;
+        if width == 0 || !self.embeds || matches!(mode, DraftMode::Suffix | DraftMode::Off) {
+            return;
+        }
+        let ids = self.inner.lock().head.ids.clone();
+        for (j, row) in logits.chunks_exact(width).take(accepted.len()).enumerate() {
+            let mut cand: Vec<u32> = ids.iter().copied().filter(|&t| (t as usize) < width).collect();
+            for t in top_n(row, 8) {
+                if !cand.contains(&t) {
+                    cand.push(t);
+                }
+            }
+            let mut p: Vec<f32> = cand.iter().map(|&t| row[t as usize]).collect();
+            softmax(&mut p);
+            s.soft.push((s.seen + j, cand.into_iter().zip(p).collect()));
+        }
     }
 
     fn propose(
@@ -936,7 +1000,7 @@ impl Drafter for OnlineNoiseDrafter {
         tokens: &[u32],
         _hidden: &[f32],
         k: usize,
-        pick: &mut dyn FnMut(&[f32]) -> u32,
+        pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
     ) -> Result<Vec<u32>, String> {
         let s = st
             .downcast_mut::<OnlineNoiseState>()
@@ -947,21 +1011,24 @@ impl Drafter for OnlineNoiseDrafter {
         }
         let neural = self.embeds && !matches!(knobs.mode, DraftMode::Suffix | DraftMode::Off);
         let k = k.min(NOISE_MAX_K);
-        let Some(&anchor) = tokens.last() else {
+        if tokens.is_empty() {
             return Ok(Vec::new());
-        };
+        }
 
         // 1. Ingest newly committed tokens into the local and shared suffix lattices; the head
         // learns from them even on `k == 0` steps.
-        if tokens.len() > s.seen {
-            let slice = &tokens[s.seen.saturating_sub(4)..];
+        let upto = s.cap.take().map_or(tokens.len(), |c| c.min(tokens.len()));
+        if upto > s.seen {
+            let slice = &tokens[s.seen.saturating_sub(4)..upto];
             s.local.observe_tokens(slice);
             self.lattice.write().observe_tokens(slice);
             if neural {
-                let from = s.seen.max(tokens.len().saturating_sub(LEARN_SPAN));
-                self.inner(&knobs).learn(tokens, from, &knobs);
+                let from = s.seen.max(upto.saturating_sub(LEARN_SPAN));
+                self.inner(&knobs)
+                    .learn(&tokens[..upto], from, &knobs, &s.soft);
             }
-            s.seen = tokens.len();
+            s.seen = upto;
+            s.soft.retain(|e| e.0 >= upto);
         }
         if k == 0 || knobs.mode == DraftMode::Off {
             return Ok(Vec::new());
@@ -994,53 +1061,63 @@ impl Drafter for OnlineNoiseDrafter {
             (Vec::new(), Vec::new(), 0)
         };
 
-        let mut logits = vec![-20.0f32; self.vocab];
+        // 4. Each offset's candidates: the shortlist, with the suffix match's token boosted.
+        let (mut cand, mut cand_logits) = (Vec::new(), Vec::new());
         let mut drafts = Vec::with_capacity(k);
         for offset in 0..k {
-            logits.fill(-20.0);
-            let mut has_candidate = false;
+            cand.clear();
+            cand_logits.clear();
             let mut top_prob = 0.0f32;
             if let Some(z) = rows.get(offset).filter(|z| !z.is_empty()) {
                 let mut p = z.clone();
                 softmax(&mut p);
                 top_prob = p.iter().fold(0.0f32, |a, &b| a.max(b));
-                for (&tok, &l) in ids.iter().zip(z) {
-                    if (tok as usize) < self.vocab {
-                        logits[tok as usize] = l;
-                        has_candidate = true;
+                cand.extend_from_slice(&ids);
+                cand_logits.extend_from_slice(z);
+            }
+            let has_suffix = suf_slice.get(offset).map(|&t| {
+                match cand.iter().position(|&c| c == t) {
+                    Some(i) => cand_logits[i] = cand_logits[i].max(0.0) + 14.0,
+                    None => {
+                        cand.push(t);
+                        cand_logits.push(14.0);
                     }
                 }
-            }
-
-            let has_suffix = if let Some(&suf_tok) = suf_slice.get(offset) {
-                if (suf_tok as usize) < self.vocab {
-                    // Suffix match boosts the candidate logit strongly while keeping valid distribution support.
-                    logits[suf_tok as usize] = logits[suf_tok as usize].max(0.0) + 14.0;
-                    has_candidate = true;
-                }
-                true
-            } else {
-                false
-            };
-
-            if knobs.mode == DraftMode::Suffix && !has_suffix {
+            });
+            if knobs.mode == DraftMode::Suffix && has_suffix.is_none() {
                 break;
             }
             if knobs.mode == DraftMode::Auto
-                && !has_suffix
+                && has_suffix.is_none()
                 && !(head_updates >= 4 && top_prob >= knobs.target_acceptance)
             {
                 break;
             }
-
-            if !has_candidate {
-                logits[anchor as usize % self.vocab] = 0.0;
+            if cand.is_empty() {
+                break;
             }
-            drafts.push(pick(&logits));
+            drafts.push(pick(DraftLogits::Sparse {
+                ids: &cand,
+                logits: &cand_logits,
+            }));
         }
 
         Ok(drafts)
     }
+}
+
+/// Ids of the `n` largest finite entries of `row`, largest first.
+fn top_n(row: &[f32], n: usize) -> Vec<u32> {
+    let mut best: Vec<(f32, u32)> = Vec::with_capacity(n + 1);
+    for (i, &v) in row.iter().enumerate() {
+        if v.is_nan() || (best.len() == n && v <= best[n - 1].0) {
+            continue;
+        }
+        let at = best.partition_point(|e| e.0 >= v);
+        best.insert(at, (v, i as u32));
+        best.truncate(n);
+    }
+    best.into_iter().map(|e| e.1).collect()
 }
 
 #[cfg(test)]
@@ -1143,7 +1220,7 @@ mod tests {
             let mut i = 1;
             while inner.head.updates < 2000 {
                 i += 1;
-                inner.learn(&train[..i], i - 1, &knobs);
+                inner.learn(&train[..i], i - 1, &knobs, &[]);
             }
             let (mut top1, mut two) = (0.0, 0.0);
             let n = test.len() - 8;
