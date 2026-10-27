@@ -364,7 +364,7 @@ fn pick(
         DraftLogits::Dense(l) => {
             let l = &l[..if vocab > 0 { l.len().min(vocab) } else { l.len() }];
             if greedy {
-                return sample_logits(l, &[], temp, TOP_K, top_p, 1.0);
+                return sample_logits(l, &[], temp, super::SAMPLE_TOP_K, top_p, 1.0);
             }
             dist(l, temp, top_p)
         }
@@ -379,7 +379,7 @@ fn pick(
                 (true, true) => return 0,
                 (true, false) => vec![(0, 1.0)],
                 (false, true) => {
-                    return ids[sample_logits(&logits, &[], temp, TOP_K, top_p, 1.0) as usize]
+                    return ids[sample_logits(&logits, &[], temp, super::SAMPLE_TOP_K, top_p, 1.0) as usize]
                 }
                 (false, false) => dist(&logits, temp, top_p)
                     .into_iter()
