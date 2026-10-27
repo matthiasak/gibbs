@@ -577,7 +577,7 @@ impl GraphProgram {
     }
 
     /// Like [`Self::stream_next`], supporting both greedy (`temp <= 1e-4`) and device-side
-    /// stochastic (`temp > 1e-4`, `top_p`, `rep_penalty`) decoding via `sample_logits_gpu`.
+    /// stochastic (`temp > 1e-4`, `top_p`, `rep_penalty`) decoding via the device top-k sampler.
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     pub fn stream_next_sampled(
@@ -660,7 +660,7 @@ impl GraphProgram {
                 ^ (last as u64);
             let sp = SampleGpuSpec {
                 vocab,
-                top_k: 64,
+                top_k: crate::scheduler::SAMPLE_TOP_K as u32,
                 inv_temp: 1.0 / temp.max(1e-4),
                 top_p: top_p.clamp(1e-4, 1.0),
                 rep_penalty,
@@ -1022,7 +1022,7 @@ mod tests {
         }
         prog.stream_end().unwrap();
         assert_eq!(got, want1[..8]);
-        // (d) Stochastic device stream (`sample_logits_gpu` at temp = 0.7, top_p = 0.9).
+        // (d) Stochastic device stream (the device sampler at temp = 0.7, top_p = 0.9).
         prog.state = StateStore::new();
         let mut sampled = Vec::new();
         for pos in 0..10 {

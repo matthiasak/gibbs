@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Quantized formats the Metal megakernel decodes inline; MLPs with any other quantized weight stay
 /// unfused so their Linears read the weights through a codec GEMV instead.
-const MEGAKERNEL_QUANT: &[crate::hardware::QuantFormat] = &[
+pub(crate) const MEGAKERNEL_QUANT: &[crate::hardware::QuantFormat] = &[
     crate::hardware::QuantFormat::GGUF_Q4_0,
     crate::hardware::QuantFormat::GGUF_Q8_0,
     crate::hardware::QuantFormat::GGUF_IQ4_XS,
@@ -23,11 +23,18 @@ const MEGAKERNEL_QUANT: &[crate::hardware::QuantFormat] = &[
     crate::hardware::QuantFormat::NVFP4,
 ];
 
-pub(crate) fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {
-    match graph.value(w).dtype {
-        crate::graph::DType::Quant(f) => MEGAKERNEL_QUANT.contains(&f),
-        _ => true,
+/// Weight dtypes a fused MLP may read: float, or a [`MEGAKERNEL_QUANT`] format with a GEMV codec
+/// (also the Metal executor's `Op::Megakernel` support predicate).
+pub(crate) fn megakernel_dtype(dtype: DType) -> bool {
+    match dtype {
+        DType::F32 | DType::F16 | DType::BF16 => true,
+        DType::Quant(f) => MEGAKERNEL_QUANT.contains(&f) && crate::graph::codec::codec(f).is_some(),
+        DType::U32 => false,
     }
+}
+
+pub(crate) fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {
+    megakernel_dtype(graph.value(w).dtype)
 }
 
 /// Materializes the e-graph's chosen `RmsNorm -> [Gate, Up Linear] -> SwiGLU/GeGLU -> Down Linear

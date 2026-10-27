@@ -812,6 +812,8 @@ impl Fusion {
             groups[gi].members.push((c, idx));
             groups[gi].keys.push(key);
         }
+        // `Step::MegakernelMlp` dispatches norm, gate, up (+ GLU when a weight is F32), down (+ the
+        // post-norm), through `hidden + 2 * inter` floats of scratch written and read back.
         let mut singles =
             |name: &str, kind: Kind, args: &dyn Fn(&[Value]) -> Vec<Value>| -> Result<(), String> {
                 for (c, ch) in rows_of(name)? {
@@ -821,9 +823,15 @@ impl Fusion {
                         .ok_or("egraph: fused e-node outside a known class")?;
                     let anchor = class.key;
                     let out = g.value(g.nodes[anchor as usize].outputs[0]);
-                    let cost_us = cost.dispatch_us
+                    let hidden = out.shape.last().copied().unwrap_or(0);
+                    let inter = g.value(value_of[&ch[4]]).shape[0];
+                    let f32_w = ch[4..7]
+                        .iter()
+                        .any(|w| g.value(value_of[w]).dtype == DType::F32);
+                    let dispatches = 4 + usize::from(f32_w) + usize::from(name == "MlpPn");
+                    let cost_us = dispatches as f64 * cost.dispatch_us
                         + reads_us(&a)
-                        + cost.act_us(out.shape.iter().product::<usize>() as f64 * 4.0);
+                        + cost.act_us(((hidden + 2 * inter) * 8) as f64);
                     class.nodes.push(ENode {
                         cost: cost_us,
                         kids: kids_of(&a),

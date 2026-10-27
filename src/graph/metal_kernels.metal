@@ -2397,95 +2397,196 @@ struct SampleGpuParams {
     ulong rng_seed;
 };
 
-kernel void sample_logits_gpu(device const float* logits [[buffer(0)]],
-                              device uint* out_token [[buffer(1)]],
-                              device uint* recent_ids [[buffer(2)]],
-                              constant SampleGpuParams& p [[buffer(3)]],
-                              uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup uint sh_recent[64];
-    threadgroup float sh_val[256];
-    threadgroup uint sh_id[256];
+/// Logits each `sample_topk_part` threadgroup covers (256 threads x 16 values).
+constant uint SAMPLE_SPAN = 4096;
 
+/// Sampling order: higher value first, then lower id.
+static inline bool sample_before(float av, uint ai, float bv, uint bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+/// The threadgroup's first `(v, i)` in sampling order (256 threads, 8 simdgroups), in every thread.
+/// `sv`/`si` hold 8 entries; callers alternate two sets per round so one barrier per round suffices.
+static inline void sample_tg_best(float v, uint i, threadgroup float* sv, threadgroup uint* si,
+                                  uint sg, uint lane, thread float& bv, thread uint& bi) {
+    const float m = simd_max(v);
+    const uint mi = simd_min(v == m ? i : 0xFFFFFFFFu);
+    if (lane == 0) {
+        sv[sg] = m;
+        si[sg] = mi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bv = sv[0];
+    bi = si[0];
+    for (uint s = 1; s < 8; ++s) {
+        if (sample_before(sv[s], si[s], bv, bi)) {
+            bv = sv[s];
+            bi = si[s];
+        }
+    }
+}
+
+/// Exact top-`k` (`k = clamp(top_k, 1, 64)`) of each 4096-wide logit span after the repetition
+/// penalty (NaN as -inf), in sampling order: `cand[part * k + j] = (value bits, id)`.
+/// Grid `ceil(vocab / 4096)` threadgroups of 256 threads.
+kernel void sample_topk_part(device const float* logits [[buffer(0)]],
+                             device uint2* cand [[buffer(1)]],
+                             device const uint* recent_ids [[buffer(2)]],
+                             constant SampleGpuParams& p [[buffer(3)]],
+                             uint part [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup uint sh_recent[64];
+    threadgroup float sv[2][8];
+    threadgroup uint si[2][8];
     if (tid < 64) {
         sh_recent[tid] = (tid < p.n_recent) ? recent_ids[tid] : 0xFFFFFFFFu;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float best_v = -FLT_MAX;
-    uint best_id = 0;
     const bool has_rep = (p.rep_penalty > 0.0f && p.rep_penalty != 1.0f && p.n_recent > 0);
-    for (uint i = tid; i < p.vocab; i += 256) {
-        float v = logits[i];
-        if (isnan(v)) v = -FLT_MAX;
-        if (has_rep) {
-            for (uint r = 0; r < p.n_recent && r < 64; ++r) {
-                if (sh_recent[r] == i) {
-                    v = (v > 0.0f) ? (v / p.rep_penalty) : (v * p.rep_penalty);
-                    break;
+    const uint base = part * SAMPLE_SPAN + tid;
+    float v[16];
+#pragma unroll
+    for (uint j = 0; j < 16; ++j) {
+        const uint i = base + 256 * j;
+        float x = -INFINITY;
+        if (i < p.vocab) {
+            x = logits[i];
+            if (isnan(x)) x = -INFINITY;
+            if (has_rep) {
+                for (uint r = 0; r < p.n_recent && r < 64; ++r) {
+                    if (sh_recent[r] == i) {
+                        x = (x > 0.0f) ? (x / p.rep_penalty) : (x * p.rep_penalty);
+                        break;
+                    }
                 }
             }
         }
-        if (v > best_v) {
-            best_v = v;
-            best_id = i;
+        v[j] = x;
+    }
+    const uint k = min(max(p.top_k, 1u), 64u);
+    // This thread's best value after the last one it gave up (`first`: none given up yet).
+    float lv = 0.0f;
+    uint li = 0;
+    bool first = true, rescan = true;
+    float bv = -INFINITY;
+    uint bi = 0xFFFFFFFFu;
+    for (uint r = 0; r < k; ++r) {
+        if (rescan) {
+            bv = -INFINITY;
+            bi = 0xFFFFFFFFu;
+#pragma unroll
+            for (uint j = 0; j < 16; ++j) {
+                const uint i = base + 256 * j;
+                if ((first || sample_before(lv, li, v[j], i)) && sample_before(v[j], i, bv, bi)) {
+                    bv = v[j];
+                    bi = i;
+                }
+            }
+            rescan = false;
+        }
+        float wv;
+        uint wi;
+        sample_tg_best(bv, bi, sv[r & 1], si[r & 1], sg, lane, wv, wi);
+        if (tid == 0) {
+            cand[part * k + r] = uint2(as_type<uint>(wv), wi);
+        }
+        if (bi == wi) {
+            lv = wv;
+            li = wi;
+            first = false;
+            rescan = true;
         }
     }
-    sh_val[tid] = best_v;
-    sh_id[tid] = best_id;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
 
-    if (tid == 0) {
-        const uint k = min(max(p.top_k, 1u), 64u);
-        float top_v[64];
-        uint top_i[64];
-        for (uint j = 0; j < k; ++j) {
-            float mv = -FLT_MAX;
-            uint mi = 0;
-            uint mslot = 0;
-            for (uint s = 0; s < 256; ++s) {
-                if (sh_val[s] > mv || (sh_val[s] == mv && sh_id[s] < mi)) {
-                    mv = sh_val[s];
-                    mi = sh_id[s];
-                    mslot = s;
+/// Exact top-`k` of the `ceil(vocab / 4096) * k` part candidates, then the draw: softmax at
+/// `inv_temp` over the top `k`, the top-`p` nucleus, one splitmix64 uniform from `rng_seed`.
+/// Writes the token to `out_token[0]` and the `recent_ids` slot, and the kept `(id, prob bits)`
+/// list to `cand[0..k]` (`(0xFFFFFFFF, 0)` past the nucleus). One threadgroup of 256 threads.
+kernel void sample_topk_final(device uint2* cand [[buffer(0)]],
+                              device uint* out_token [[buffer(1)]],
+                              device uint* recent_ids [[buffer(2)]],
+                              constant SampleGpuParams& p [[buffer(3)]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float sv[2][8];
+    threadgroup uint si[2][8];
+    const uint k = min(max(p.top_k, 1u), 64u);
+    const uint n = ((p.vocab + SAMPLE_SPAN - 1) / SAMPLE_SPAN) * k;
+    float top_v[64];
+    uint top_i[64];
+    float lv = 0.0f;
+    uint li = 0;
+    bool first = true, rescan = true;
+    float bv = -INFINITY;
+    uint bi = 0xFFFFFFFFu;
+    for (uint r = 0; r < k; ++r) {
+        if (rescan) {
+            bv = -INFINITY;
+            bi = 0xFFFFFFFFu;
+            for (uint c = tid; c < n; c += 256) {
+                const uint2 e = cand[c];
+                const float x = as_type<float>(e.x);
+                if ((first || sample_before(lv, li, x, e.y)) && sample_before(x, e.y, bv, bi)) {
+                    bv = x;
+                    bi = e.y;
                 }
             }
-            top_v[j] = mv;
-            top_i[j] = mi;
-            sh_val[mslot] = -FLT_MAX;
+            rescan = false;
         }
-        const float max_v = top_v[0];
-        float total = 0.0f;
-        for (uint j = 0; j < k; ++j) {
-            float w = exp((top_v[j] - max_v) * p.inv_temp);
-            top_v[j] = w;
-            total += w;
+        float wv;
+        uint wi;
+        sample_tg_best(bv, bi, sv[r & 1], si[r & 1], sg, lane, wv, wi);
+        if (tid == 0) {
+            top_v[r] = wv;
+            top_i[r] = wi;
         }
-        const float cutoff = total * clamp(p.top_p, 1e-6f, 1.0f);
-        float kept_sum = 0.0f;
-        uint kept_k = 0;
-        for (uint j = 0; j < k; ++j) {
-            kept_sum += top_v[j];
-            kept_k = j + 1;
-            if (kept_sum >= cutoff) break;
+        if (bi == wi) {
+            lv = wv;
+            li = wi;
+            first = false;
+            rescan = true;
         }
-        ulong z = p.rng_seed + 0x9e3779b97f4a7c15UL;
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9UL;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebUL;
-        z = z ^ (z >> 31);
-        const float u = (float(z >> 40) * (1.0f / 16777216.0f)) * kept_sum;
-        float acc = 0.0f;
-        uint chosen = top_i[0];
-        for (uint j = 0; j < kept_k; ++j) {
-            acc += top_v[j];
-            if (u <= acc) {
-                chosen = top_i[j];
-                break;
-            }
+    }
+    if (tid != 0) return;
+    const float max_v = top_v[0];
+    float total = 0.0f;
+    for (uint j = 0; j < k; ++j) {
+        float w = exp((top_v[j] - max_v) * p.inv_temp);
+        top_v[j] = w;
+        total += w;
+    }
+    const float cutoff = total * clamp(p.top_p, 1e-6f, 1.0f);
+    float kept_sum = 0.0f;
+    uint kept_k = 0;
+    for (uint j = 0; j < k; ++j) {
+        kept_sum += top_v[j];
+        kept_k = j + 1;
+        if (kept_sum >= cutoff) break;
+    }
+    ulong z = p.rng_seed + 0x9e3779b97f4a7c15UL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9UL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebUL;
+    z = z ^ (z >> 31);
+    const float u = (float(z >> 40) * (1.0f / 16777216.0f)) * kept_sum;
+    float acc = 0.0f;
+    uint chosen = top_i[0];
+    for (uint j = 0; j < kept_k; ++j) {
+        acc += top_v[j];
+        if (u <= acc) {
+            chosen = top_i[j];
+            break;
         }
-        out_token[0] = chosen;
-        if (p.n_recent > 0) {
-            recent_ids[uint(p.rng_seed) % min(p.n_recent, 64u)] = chosen;
-        }
+    }
+    out_token[0] = chosen;
+    if (p.n_recent > 0) {
+        recent_ids[uint(p.rng_seed) % min(p.n_recent, 64u)] = chosen;
+    }
+    for (uint j = 0; j < k; ++j) {
+        cand[j] = j < kept_k ? uint2(top_i[j], as_type<uint>(top_v[j] / total)) : uint2(0xFFFFFFFFu, 0u);
     }
 }
 

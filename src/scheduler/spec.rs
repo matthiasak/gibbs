@@ -72,9 +72,6 @@ pub trait Drafter: Send + Sync {
     }
 }
 
-/// Top-k the scheduler samples with (see `ExecutableModel::sample`).
-const TOP_K: usize = 50;
-
 /// One sequence's speculative state, tied to the drafter it started with.
 pub struct SpecSeq {
     drafter: Arc<dyn Drafter>,
@@ -367,7 +364,7 @@ fn pick(
         DraftLogits::Dense(l) => {
             let l = &l[..if vocab > 0 { l.len().min(vocab) } else { l.len() }];
             if greedy {
-                return sample_logits(l, &[], temp, TOP_K, top_p, 1.0);
+                return sample_logits(l, &[], temp, super::SAMPLE_TOP_K, top_p, 1.0);
             }
             dist(l, temp, top_p)
         }
@@ -382,7 +379,7 @@ fn pick(
                 (true, true) => return 0,
                 (true, false) => vec![(0, 1.0)],
                 (false, true) => {
-                    return ids[sample_logits(&logits, &[], temp, TOP_K, top_p, 1.0) as usize]
+                    return ids[sample_logits(&logits, &[], temp, super::SAMPLE_TOP_K, top_p, 1.0) as usize]
                 }
                 (false, false) => dist(&logits, temp, top_p)
                     .into_iter()
@@ -407,7 +404,7 @@ fn verify_draft(p: &[(u32, f32)], q: &[(u32, f32)], x: u32, rng: &mut Rng) -> (u
 
 /// The scheduler's sampling distribution over `logits` (sparse, normalized).
 fn dist(logits: &[f32], temp: f32, top_p: f32) -> Vec<(u32, f32)> {
-    let (cands, probs, n) = nucleus(logits, &[], temp, TOP_K, top_p, 1.0);
+    let (cands, probs, n) = nucleus(logits, &[], temp, super::SAMPLE_TOP_K, top_p, 1.0);
     let sum: f32 = probs[..n].iter().sum();
     cands[..n]
         .iter()
