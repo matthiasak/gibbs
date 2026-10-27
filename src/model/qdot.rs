@@ -17,6 +17,7 @@ const TASK_ROWS: usize = 64;
 enum Path {
     Generic,
     Dot,
+    I8mm,
 }
 
 /// Quantized activation layout a dot kernel reads.
@@ -48,6 +49,18 @@ fn dotprod() -> bool {
     return std::arch::is_aarch64_feature_detected!("dotprod");
     #[cfg(not(target_arch = "aarch64"))]
     false
+}
+
+fn i8mm() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    return std::arch::is_aarch64_feature_detected!("i8mm");
+    #[cfg(not(target_arch = "aarch64"))]
+    false
+}
+
+/// `linear_q` runs `smmla` kernels for `f` when the activation has two or more rows.
+pub fn i8mm_format(f: Q) -> bool {
+    i8mm() && kernel(Path::I8mm, f).is_some()
 }
 
 /// Quantized activations: `qs` [rows, cols], `d` one scale per block, `bs` per-16 sums (`Q8_K`).
@@ -177,6 +190,10 @@ fn kernel(path: Path, f: Q) -> Option<Kernel> {
             (Path::Dot, Q::GGUF_Q6_K) => dotk::<Q6K>,
             (Path::Dot, Q::GGUF_Q2_K) => dotk::<Q2K>,
             (Path::Dot, Q::GGUF_TQ2_0) => dotk::<Tq20>,
+            (Path::I8mm, Q::GGUF_Q4_0) => mm32::<Q40>,
+            (Path::I8mm, Q::GGUF_Q8_0) => mm32::<Q80>,
+            (Path::I8mm, Q::GGUF_Q4_K_M) => mmk::<Q4K>,
+            (Path::I8mm, Q::GGUF_Q6_K) => mmk::<Q6K>,
             _ => return None,
         };
         Some(k)
@@ -198,18 +215,17 @@ fn quant_kernel(m: &Mat, path: Path) -> Option<(Kernel, Act)> {
     Some((kernel(path, f)?, act))
 }
 
-fn path_for(rows: usize) -> Path {
-    let _ = rows;
-    if dotprod() {
-        Path::Dot
-    } else {
-        Path::Generic
+fn path_for(m: &Mat, rows: usize) -> Path {
+    match m.packed() {
+        Some(p) if rows >= 2 && i8mm_format(p.format) => Path::I8mm,
+        _ if dotprod() => Path::Dot,
+        _ => Path::Generic,
     }
 }
 
 /// `out[rows, m.rows] = x[rows, m.cols] · mᵀ (+ bias)`, straight from `m`'s stored encoding.
 pub fn linear_q(m: &Mat, x: &[f32], rows: usize, bias: Option<&[f32]>, out: &mut [f32]) {
-    linear_with(m, x, rows, bias, out, path_for(rows));
+    linear_with(m, x, rows, bias, out, path_for(m, rows));
 }
 
 fn linear_with(m: &Mat, x: &[f32], rows: usize, bias: Option<&[f32]>, out: &mut [f32], path: Path) {
@@ -541,6 +557,140 @@ mod neon {
             }
         }
     }
+
+    /// `acc + [w0·x0, w0·x1, w1·x0, w1·x1]` over 16 elements: two `smmla` on 8-wide halves.
+    #[target_feature(enable = "i8mm")]
+    #[inline]
+    unsafe fn mm16(
+        acc: int32x4_t,
+        w0: int8x16_t,
+        w1: int8x16_t,
+        x0: int8x16_t,
+        x1: int8x16_t,
+    ) -> int32x4_t {
+        let zip = |a: int8x16_t, b: int8x16_t| {
+            let (a, b) = (vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b));
+            (
+                vreinterpretq_s8_s64(vzip1q_s64(a, b)),
+                vreinterpretq_s8_s64(vzip2q_s64(a, b)),
+            )
+        };
+        let ((wa, wb), (xa, xb)) = (zip(w0, w1), zip(x0, x1));
+        let mut acc = acc;
+        // `vmmlaq_s32` is still unstable (`stdarch_neon_i8mm`).
+        core::arch::asm!(
+            "smmla {acc:v}.4s, {wa:v}.16b, {xa:v}.16b",
+            "smmla {acc:v}.4s, {wb:v}.16b, {xb:v}.16b",
+            acc = inout(vreg) acc,
+            wa = in(vreg) wa,
+            xa = in(vreg) xa,
+            wb = in(vreg) wb,
+            xb = in(vreg) xb,
+            options(pure, nomem, nostack),
+        );
+        acc
+    }
+
+    /// Two weight rows × two activation rows per step; output lanes are `(r0, j)`, `(r1, j)`,
+    /// `(r0, j + 1)`, `(r1, j + 1)`. An odd last row of either side pairs with itself.
+    #[inline(always)]
+    unsafe fn put4(job: &Job, r0: usize, r1: usize, j: usize, jb: usize, v: float32x4_t) {
+        let v: [f32; 4] = std::mem::transmute(v);
+        job.put(r0, j, v[0]);
+        if r1 != r0 {
+            job.put(r1, j, v[1]);
+        }
+        if jb != j {
+            job.put(r0, jb, v[2]);
+            if r1 != r0 {
+                job.put(r1, jb, v[3]);
+            }
+        }
+    }
+
+    #[target_feature(enable = "i8mm")]
+    pub unsafe fn mm32<T: B32>(job: &Job, j0: usize, j1: usize) {
+        let (cols, nb) = (job.cols, job.cols / 32);
+        let (qs, ds) = (job.a.qs.as_ptr(), job.a.d.as_ptr());
+        for rc in (0..job.rows).step_by(16) {
+            let pairs = (job.rows - rc).min(16).div_ceil(2);
+            for j in (j0..j1).step_by(2) {
+                let jb = (j + 1).min(j1 - 1);
+                let w0 = job.w.as_ptr().add((job.wrow0 + j) * job.row_bytes);
+                let w1 = job.w.as_ptr().add((job.wrow0 + jb) * job.row_bytes);
+                let mut acc = [vdupq_n_f32(0.0); 8];
+                for b in 0..nb {
+                    let (a0, a1, d0) = T::unpack(w0.add(b * T::BYTES));
+                    let (b0, b1, d1) = T::unpack(w1.add(b * T::BYTES));
+                    let dw = vcombine_f32(vdup_n_f32(d0), vdup_n_f32(d1));
+                    for (p, acc) in acc[..pairs].iter_mut().enumerate() {
+                        let r0 = rc + 2 * p;
+                        let r1 = (r0 + 1).min(job.rows - 1);
+                        let (y0, y1) = (qs.add(r0 * cols + b * 32), qs.add(r1 * cols + b * 32));
+                        let s = mm16(vdupq_n_s32(0), a0, b0, vld1q_s8(y0), vld1q_s8(y1));
+                        let s = mm16(s, a1, b1, vld1q_s8(y0.add(16)), vld1q_s8(y1.add(16)));
+                        let dy = vld1_f32([*ds.add(r0 * nb + b), *ds.add(r1 * nb + b)].as_ptr());
+                        *acc = vfmaq_f32(*acc, vcvtq_f32_s32(s), vmulq_f32(dw, vcombine_f32(dy, dy)));
+                    }
+                }
+                for (p, &a) in acc[..pairs].iter().enumerate() {
+                    let r0 = rc + 2 * p;
+                    put4(job, r0, (r0 + 1).min(job.rows - 1), j, jb, a);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "i8mm")]
+    pub unsafe fn mmk<T: BK>(job: &Job, j0: usize, j1: usize) {
+        let nb = job.cols / 256;
+        let (qs, ds, bs) = (job.a.qs.as_ptr(), job.a.d.as_ptr(), job.a.bs.as_ptr());
+        let pair = |a: f32, b: f32| vcombine_f32(vdup_n_f32(a), vdup_n_f32(b));
+        for rc in (0..job.rows).step_by(16) {
+            let pairs = (job.rows - rc).min(16).div_ceil(2);
+            for j in (j0..j1).step_by(2) {
+                let jb = (j + 1).min(j1 - 1);
+                let w0 = job.w.as_ptr().add((job.wrow0 + j) * job.row_bytes);
+                let w1 = job.w.as_ptr().add((job.wrow0 + jb) * job.row_bytes);
+                let mut acc = [vdupq_n_f32(0.0); 8];
+                for b in 0..nb {
+                    let k0 = T::unpack(w0.add(b * T::BYTES));
+                    let k1 = T::unpack(w1.add(b * T::BYTES));
+                    let sc: [int32x4_t; 16] = std::array::from_fn(|g| {
+                        vcombine_s32(vdup_n_s32(k0.sc[g]), vdup_n_s32(k1.sc[g]))
+                    });
+                    let (dw, dm) = (pair(k0.d, k1.d), pair(k0.dmin, k1.dmin));
+                    for (p, acc) in acc[..pairs].iter_mut().enumerate() {
+                        let r0 = rc + 2 * p;
+                        let r1 = (r0 + 1).min(job.rows - 1);
+                        let (b0, b1) = (r0 * nb + b, r1 * nb + b);
+                        let (y0, y1) = (qs.add(b0 * 256), qs.add(b1 * 256));
+                        let mut s = vdupq_n_s32(0);
+                        for g in 0..16 {
+                            let y = (vld1q_s8(y0.add(16 * g)), vld1q_s8(y1.add(16 * g)));
+                            let t = mm16(vdupq_n_s32(0), k0.q[g], k1.q[g], y.0, y.1);
+                            s = vmlaq_s32(s, t, sc[g]);
+                        }
+                        let (s0, s1) = (bs.add(b0 * 16), bs.add(b1 * 16));
+                        let m = [
+                            mins(&k0.mn, s0) as f32,
+                            mins(&k0.mn, s1) as f32,
+                            mins(&k1.mn, s0) as f32,
+                            mins(&k1.mn, s1) as f32,
+                        ];
+                        let dy = vld1_f32([*ds.add(b0), *ds.add(b1)].as_ptr());
+                        let v = vmulq_f32(dw, vcvtq_f32_s32(s));
+                        let v = vfmsq_f32(v, dm, vld1q_f32(m.as_ptr()));
+                        *acc = vfmaq_f32(*acc, v, vcombine_f32(dy, dy));
+                    }
+                }
+                for (p, &a) in acc[..pairs].iter().enumerate() {
+                    let r0 = rc + 2 * p;
+                    put4(job, r0, (r0 + 1).min(job.rows - 1), j, jb, a);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -598,6 +748,9 @@ mod tests {
                 if dotprod() && kernel(Path::Dot, f).is_some() {
                     paths.push(Path::Dot);
                 }
+                if i8mm() && kernel(Path::I8mm, f).is_some() {
+                    paths.push(Path::I8mm);
+                }
                 for path in paths {
                     let mut out = vec![0.0f32; rows * n];
                     linear_with(&m, &x, rows, Some(&bias), &mut out, path);
@@ -629,6 +782,9 @@ mod tests {
         assert!(exercised[&Path::Generic] > 0);
         if dotprod() {
             assert!(exercised[&Path::Dot] >= 7 * 4, "{exercised:?}");
+        }
+        if i8mm() {
+            assert!(exercised[&Path::I8mm] >= 4 * 4, "{exercised:?}");
         }
     }
 }
