@@ -105,6 +105,7 @@ fn ane_error(c: &Case, info: &AneInfo) -> Result<f32, String> {
 
 /// The CPU executor's result for `c` (the reference every case compares against).
 fn cpu_reference(c: &Case) -> Result<Vec<Tensor>, String> {
+    let _exact = crate::model::qdot::exact();
     crate::graph::cpu::run(&c.g, &c.w, &mut StateStore::new(), c.inputs.clone())
 }
 

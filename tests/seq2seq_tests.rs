@@ -15,7 +15,10 @@ fn model(repo: &str) -> Option<Arc<dyn NativeLm>> {
         return None;
     }
     let reg = gibbs_engine::arch::registry().expect("registry");
-    Some(gibbs_engine::runtime::encdec::load(&art, reg, None, PlacementMode::Pin(Device::Cpu)).expect("seq2seq model loads"))
+    Some(
+        gibbs_engine::runtime::encdec::load(&art, reg, None, PlacementMode::Pin(Device::Cpu))
+            .expect("seq2seq model loads"),
+    )
 }
 
 /// The reply to one chat turn at temperature 0 (beam models replay their search whatever the
@@ -27,7 +30,7 @@ fn chat(m: &dyn NativeLm, text: &str) -> Result<String, String> {
     let mut logits = m.forward(&ids, 0, &mut st)?;
     let mut out = Vec::new();
     loop {
-        let next = sample_logits(&logits, &[], 0.0, 50, 0.9, 1.0);
+        let next = sample_logits(&logits, &[], 0.0, 50, 0.9);
         if tok.ends_generation(next) {
             break;
         }
@@ -69,7 +72,7 @@ fn marian_en_de_translates() {
     let mut logits = m.forward(&p, 0, &mut st).unwrap();
     let mut n = 0;
     loop {
-        let t = sample_logits(&logits, &[], 0.0, 50, 0.9, 1.0);
+        let t = sample_logits(&logits, &[], 0.0, 50, 0.9);
         if tok.ends_generation(t) {
             break;
         }

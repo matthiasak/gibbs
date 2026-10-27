@@ -1968,6 +1968,7 @@ mod tests {
 
     /// The CPU executor's outputs for every run of `case`, in order, on one state.
     fn cpu_reference(case: &Case) -> Vec<Vec<Tensor>> {
+        let _exact = crate::model::qdot::exact();
         let mode = PlacementMode::Pin(Device::Cpu);
         let mut cpu =
             GraphProgram::compile(case.graph.clone(), case.weights.clone(), mode).unwrap();
