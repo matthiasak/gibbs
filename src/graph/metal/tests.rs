@@ -762,7 +762,11 @@ fn megakernel_mlp_fuses_pre_residual_norm_and_matches_cpu() {
         f,
     );
     g.output(out);
-    crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp);
+    crate::graph::egraph::fuse_rule(
+        &mut g,
+        crate::graph::passes::fusion::FuseWeights::None,
+        crate::graph::egraph::Rule::MegakernelMlp,
+    );
 
     let mut w = Weights::new();
     for (k, s) in [("g0", 1u64), ("norm_w", 2), ("post_w", 3)] {
@@ -1382,7 +1386,7 @@ fn megakernel_mlp_matches_cpu_for_every_variant() {
             assert_eq!(
                 crate::graph::egraph::fuse_rule(
                     &mut g,
-                    None,
+                    crate::graph::passes::fusion::FuseWeights::None,
                     crate::graph::egraph::Rule::MegakernelMlp
                 ),
                 1
@@ -4274,7 +4278,7 @@ fn prepared_plan_precomputes_mlp_scratch_size() {
     assert_eq!(
         crate::graph::egraph::fuse_rule(
             &mut g,
-            None,
+            crate::graph::passes::fusion::FuseWeights::None,
             crate::graph::egraph::Rule::MegakernelMlp
         ),
         1
