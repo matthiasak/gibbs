@@ -84,7 +84,8 @@ enum SlashCmd {
     Variant(Option<VariantPolicy>),
     Profile(ProfileArg),
     Placement,
-    Spec(SpecArg),
+    /// No arguments: print the status.
+    Spec(Vec<SpecArg>),
 }
 
 /// `/profile` arguments.
@@ -100,13 +101,18 @@ enum ProfileArg {
 /// `/spec` arguments for live speculative decoding & online noise drafter tuning.
 #[derive(Debug, PartialEq)]
 enum SpecArg {
-    Status,
     Mode(crate::runtime::noise_draft::DraftMode),
+    Objective(crate::runtime::noise_draft::DraftObjective),
     MaxK(usize),
     Accept(f32),
     Cost(f32),
     Suffix(usize),
     Lr(f32),
+    Sigma(f32),
+    Steps(usize),
+    Shortlist(usize),
+    Probes(usize),
+    Window(usize),
 }
 
 /// Parses `/reencode`, `/variant`, `/profile` and `/placement` lines; `None` for any other command.
@@ -139,37 +145,56 @@ fn parse_slash(raw: &str) -> Option<Result<SlashCmd, String>> {
     })
 }
 
-fn parse_spec(arg: &str) -> Result<SpecArg, String> {
-    let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
-    let val = rest.trim();
-    match (word, val) {
-        ("", _) => Ok(SpecArg::Status),
-        ("mode", m) => m.parse().map(SpecArg::Mode),
-        ("k" | "max-k" | "max_k", v) => v
-            .parse::<usize>()
-            .map(|k| SpecArg::MaxK(k.min(crate::runtime::noise_draft::NOISE_MAX_K)))
-            .map_err(|_| format!("invalid max_k '{v}'; expected integer 0..=15")),
-        ("accept" | "target-accept", v) => v
-            .parse::<f32>()
-            .map(SpecArg::Accept)
-            .map_err(|_| format!("invalid target acceptance '{v}'; expected float 0.10..=0.98")),
-        ("cost" | "cost-weight", v) => v
-            .parse::<f32>()
-            .map(SpecArg::Cost)
-            .map_err(|_| format!("invalid cost weight '{v}'; expected float 0.0..=1.0")),
-        ("suffix" | "suffix-min", v) => v
-            .parse::<usize>()
-            .map(SpecArg::Suffix)
-            .map_err(|_| format!("invalid suffix min match '{v}'; expected integer 1..=4")),
-        ("lr" | "noise-lr", v) => v
-            .parse::<f32>()
-            .map(SpecArg::Lr)
-            .map_err(|_| format!("invalid noise lr '{v}'; expected float 0.0..=0.10")),
-        (w, "") => w.parse().map(SpecArg::Mode),
-        (w, _) => Err(format!(
-            "unknown /spec argument '{w}'; use mode <auto|noise|suffix|model|off>, k <0..15>, accept <0.1..0.98>, cost <0..1>, suffix <1..4>, or lr <f32>"
-        )),
+/// `/spec` alone (status), `/spec <mode>`, `/spec <key> <value>` or `/spec key=value ...`.
+fn parse_spec(arg: &str) -> Result<Vec<SpecArg>, String> {
+    if arg.contains('=') {
+        return arg
+            .split_whitespace()
+            .map(|kv| {
+                let (k, v) = kv
+                    .split_once('=')
+                    .ok_or_else(|| format!("expected key=value, got '{kv}'"))?;
+                spec_arg(k, v)
+            })
+            .collect();
     }
+    let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+    match (word, rest.trim()) {
+        ("", _) => Ok(Vec::new()),
+        (w, "") => w.parse().map(|m| vec![SpecArg::Mode(m)]),
+        (w, v) => spec_arg(w, v).map(|a| vec![a]),
+    }
+}
+
+fn spec_arg(key: &str, v: &str) -> Result<SpecArg, String> {
+    fn num<T: std::str::FromStr>(v: &str, what: &str, range: &str) -> Result<T, String> {
+        v.parse()
+            .map_err(|_| format!("invalid {what} '{v}'; expected {range}"))
+    }
+    Ok(match key {
+        "mode" => SpecArg::Mode(v.parse()?),
+        "objective" => SpecArg::Objective(v.parse()?),
+        "k" | "max-k" | "max_k" => SpecArg::MaxK(
+            num::<usize>(v, "max_k", "integer 0..=15")?
+                .min(crate::runtime::noise_draft::NOISE_MAX_K),
+        ),
+        "accept" | "target-accept" => {
+            SpecArg::Accept(num(v, "target acceptance", "float 0.10..=0.98")?)
+        }
+        "cost" | "cost-weight" => SpecArg::Cost(num(v, "cost weight", "float 0.0..=1.0")?),
+        "suffix" | "suffix-min" => SpecArg::Suffix(num(v, "suffix min match", "integer 1..=4")?),
+        "lr" | "noise-lr" => SpecArg::Lr(num(v, "noise lr", "float 0.0..=0.10")?),
+        "sigma" | "noise-sigma" => SpecArg::Sigma(num(v, "noise sigma", "float 1e-5..=0.25")?),
+        "steps" | "denoise-steps" => SpecArg::Steps(num(v, "denoise steps", "integer 1..=4")?),
+        "shortlist" => SpecArg::Shortlist(num(v, "shortlist", "integer 64..=1024")?),
+        "probes" => SpecArg::Probes(num(v, "probes", "power of two 4..=32")?),
+        "window" => SpecArg::Window(num(v, "window", "integer 1..=8")?),
+        w => {
+            return Err(format!(
+                "unknown /spec argument '{w}'; use mode=<auto|noise|suffix|model|off> objective=<speed|tokens> k= accept= cost= suffix= lr= sigma= steps= shortlist= probes= window="
+            ))
+        }
+    })
 }
 
 fn parse_profile(arg: &str) -> Result<ProfileArg, String> {
@@ -301,6 +326,53 @@ fn media_message(prompt: &str) -> Result<Option<(ChatMessage, Vec<MediaInput>)>,
     Ok(Some((msg, media)))
 }
 
+/// Compacted turns and report for the chat `turns` (after `system_prompt`, before the `current`
+/// message when given) on the active model, within its context capped at `ctx_limit`; `None` when
+/// nothing was saved. The history holds text only, so no SnapCompact pages are drawn.
+fn compact_turns(
+    sched: &Arc<ContinuousBatchScheduler>,
+    system_prompt: &str,
+    turns: &[(String, String)],
+    current: Option<ChatMessage>,
+    ctx_limit: usize,
+    cfg: &crate::compact::CompactionConfig,
+    force: bool,
+) -> Result<Option<(Vec<(String, String)>, crate::compact::CompactionReport)>, String> {
+    let ctx = sched
+        .model()
+        .and_then(|m| m.context_len())
+        .map_or(ctx_limit, |c| c.min(ctx_limit));
+    let mut cfg = cfg.clone();
+    cfg.enable_snapcompact_vision = false;
+    let mut msgs = Vec::new();
+    if !system_prompt.is_empty() {
+        msgs.push(ChatMessage::new("system", system_prompt));
+    }
+    msgs.extend(turns.iter().map(|(r, c)| ChatMessage::new(r.as_str(), c.as_str())));
+    let has_current = current.is_some();
+    msgs.extend(current);
+    let report = crate::compact::compact_for_scheduler(
+        sched,
+        &mut msgs,
+        &mut Vec::new(),
+        Some(ctx),
+        &cfg,
+        force,
+    )?;
+    if report.saved_tokens() == 0 {
+        return Ok(None);
+    }
+    if has_current {
+        msgs.pop();
+    }
+    let to = msgs
+        .into_iter()
+        .filter(|m| m.role != "system")
+        .map(|m| (m.role.clone(), m.text()))
+        .collect();
+    Ok(Some((to, report)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Running,
@@ -348,6 +420,11 @@ enum Update {
     Probe(Result<String, String>),
     /// A `/bench` run on the loaded model.
     Bench(Result<crate::bench::ModelBenchResult, String>),
+    /// Chat history compaction: the history it started `from` and the compacted turns.
+    Compacted {
+        from: Vec<(String, String)>,
+        result: Result<(Vec<(String, String)>, crate::compact::CompactionReport), String>,
+    },
 }
 
 /// A prompt's background work: runs with its console entry index and the update channel.
@@ -537,6 +614,7 @@ impl TuiApp {
             let _ = crate::graph::ane::probe();
         });
         let (updates_tx, updates_rx) = mpsc::channel();
+        let saved = settings::load_settings();
         let spark_total = telemetry.total_tokens_generated.load(Ordering::Relaxed);
         let mut gemm_peak_gflops = 0.0f64;
         let mut gemm_top: Vec<(f64, String)> = Vec::new();
@@ -604,10 +682,10 @@ impl TuiApp {
             gemm_top,
             show_settings_modal: false,
             placement_modal: None,
-            reencode_policy: crate::model::weight_format::ReencodePolicy::MaxSpeed,
-            variant_policy: crate::model::weight_format::VariantPolicy::Fastest,
-            draft_knobs: settings::load_settings().draft,
-            compact_config: settings::load_settings().compact,
+            reencode_policy: saved.reencode,
+            variant_policy: saved.variant,
+            draft_knobs: saved.draft,
+            compact_config: saved.compact,
             ctx_limit: 8192,
             show_roofline_hud: true,
             frame_log_path: None,
@@ -798,7 +876,7 @@ impl TuiApp {
                      · /bench     : Benchmark the loaded model on Metal (128 tokens x 3 runs): tok/s, roofline % and where each token's time goes; refuses while generating\n\
                      · /placement : Where every graph node of the loaded model runs (op, device, avenue): 100% Metal, or the CPU ops\n\
                      · /roofline  : Focus ROOFLINE detail & run the calibration sweep\n\
-                     · /spec [mode|k|accept|cost|suffix|lr] : Live-tune speculative decoding & online noise drafter\n\
+                     · /spec [mode=|objective=|k=|accept=|cost=|suffix=|lr=|sigma=|steps=|shortlist=|probes=|window=] : Live-tune speculative decoding & the online drafter (no args: status)\n\
                      · /quant     : Display active weight quantization formats\n\
                      · /gibbs     : Full historical biography & ASCII portrait of J. Willard Gibbs\n\
                      · /system1 [on|off] : Turn the active LLM into a System 1 encoder & zero-shot judge (or return to chat)\n\
@@ -809,7 +887,7 @@ impl TuiApp {
                      · /clear (/reset, /new) : Clear multi-turn chat history and KV prefix cache\n\
                      · /pop (/undo)          : Remove the last user/assistant turn from chat history\n\
                      · /history              : Inspect active multi-turn chat messages\n\
-                     · /compact [auto|light|aggressive|off|now] : Configure or trigger 4-tier session compaction\n\
+                     · /compact [auto|light|aggressive|off] [now] [mode= threshold= target= keep= summarizer=] : Configure (saved) or run session compaction\n\
                      · /help      : This reference"
                         .to_string(),
                 ))
@@ -976,111 +1054,156 @@ impl TuiApp {
         Ok(self.reload_for("variant", next.name()))
     }
 
-    /// Applies a `/spec` command, updating `self.draft_knobs`, `settings.json`, and the live scheduler.
-    fn apply_spec_cmd(&mut self, arg: SpecArg) -> Result<String, String> {
+    /// Applies `/spec` arguments to `self.draft_knobs`, `settings.json` and the live scheduler, and
+    /// reports the knobs and what the `k` tuner measured.
+    fn apply_spec_cmd(&mut self, args: Vec<SpecArg>) -> Result<String, String> {
         let mut k = self
             .scheduler
             .as_ref()
             .map_or(self.draft_knobs, |s| s.draft_knobs());
-        match arg {
-            SpecArg::Status => {}
-            SpecArg::Mode(m) => k.mode = m,
-            SpecArg::MaxK(mk) => k.max_k = mk,
-            SpecArg::Accept(a) => k.target_acceptance = a,
-            SpecArg::Cost(c) => k.cost_weight = c,
-            SpecArg::Suffix(sm) => k.suffix_min_match = sm,
-            SpecArg::Lr(lr) => k.noise_lr = lr,
+        let changed = !args.is_empty();
+        for arg in args {
+            match arg {
+                SpecArg::Mode(m) => k.mode = m,
+                SpecArg::Objective(o) => k.objective = o,
+                SpecArg::MaxK(mk) => k.max_k = mk,
+                SpecArg::Accept(a) => k.target_acceptance = a,
+                SpecArg::Cost(c) => k.cost_weight = c,
+                SpecArg::Suffix(sm) => k.suffix_min_match = sm,
+                SpecArg::Lr(lr) => k.noise_lr = lr,
+                SpecArg::Sigma(s) => k.noise_sigma = s,
+                SpecArg::Steps(n) => k.denoise_steps = n,
+                SpecArg::Shortlist(n) => k.shortlist = n,
+                SpecArg::Probes(n) => k.probes = n,
+                SpecArg::Window(n) => k.window = n,
+            }
         }
         let k = k.sanitized();
         self.draft_knobs = k;
-        let mut s = settings::load_settings();
-        s.draft = k;
-        let _ = settings::save_settings(&s);
-        if let Some(sched) = &self.scheduler {
-            sched.set_draft_knobs(k);
+        if changed {
+            let mut s = settings::load_settings();
+            s.draft = k;
+            let _ = settings::save_settings(&s);
+            if let Some(sched) = &self.scheduler {
+                sched.set_draft_knobs(k);
+            }
         }
-        let active = self
+        let view = self.scheduler.as_ref().and_then(|sc| sc.view().spec);
+        let best = view.as_ref().and_then(|v| v.k);
+        let rate = self
             .scheduler
             .as_ref()
-            .and_then(|sc| sc.view().spec)
-            .map_or_else(
-                || "none (plain decode)".to_string(),
-                |sv| format!("{} (best k={:?})", sv.label, sv.k),
-            );
+            .zip(best)
+            .and_then(|(sc, b)| sc.k_tuner_rates().into_iter().find(|r| r.k == b));
+        let measured = rate.map_or_else(
+            || "acceptance — · tokens/forward — · tok/s —".to_string(),
+            |r| {
+                format!(
+                    "acceptance {:.0}% · tokens/forward {:.2} · tok/s {:.1}",
+                    r.acceptance_rate * 100.0,
+                    r.tokens_per_forward,
+                    r.tok_per_sec
+                )
+            },
+        );
         Ok(format!(
-            "Speculative decoding: mode={} · active={} · max_k={} · target_accept={:.0}% · cost_weight={:.2} · suffix_min={} · noise_lr={:.4}",
+            "Speculative decoding: mode={} · objective={} · active={} · k={} · {measured} · online updates={}\nKnobs: max_k={} · accept={:.0}% · cost={:.2} · suffix={} · lr={:.4} · sigma={:.4} · steps={} · shortlist={} · probes={} · window={}",
             k.mode.name(),
-            active,
+            k.objective.name(),
+            view.as_ref().map_or("none (plain decode)", |v| v.label.as_str()),
+            best.map_or_else(|| format!("0..{} (measuring)", k.max_k), |b| b.to_string()),
+            view.as_ref().and_then(|v| v.updates).map_or_else(|| "—".to_string(), |u| u.to_string()),
             k.max_k,
             k.target_acceptance * 100.0,
             k.cost_weight,
             k.suffix_min_match,
-            k.noise_lr
+            k.noise_lr,
+            k.noise_sigma,
+            k.denoise_steps,
+            k.shortlist,
+            k.probes,
+            k.window,
         ))
     }
 
-    /// `/compact [auto|light|aggressive|off|now]`: configures or runs 4-tier session compaction on `chat_history`.
+    /// `/compact [auto|light|aggressive|off] [now] [mode= threshold= target= keep= summarizer=]`:
+    /// sets and saves the compaction settings (chats compact once their prompt passes the
+    /// threshold); `now` compacts `chat_history` at once, in the background.
     fn run_compact_cmd(&mut self, arg: &str) -> Result<String, String> {
-        let run_now = matches!(arg, "now" | "run" | "force");
-        if !arg.is_empty() && !run_now {
-            let mode: crate::compact::CompactionMode = arg.parse()?;
-            self.compact_config.mode = mode;
-            let mut s = settings::load_settings();
-            s.compact = self.compact_config;
-            let _ = settings::save_settings(&s);
-        }
-        if run_now
-            || matches!(
-                self.compact_config.mode,
-                crate::compact::CompactionMode::Light | crate::compact::CompactionMode::Aggressive
-            )
-        {
-            if !self.chat_history.is_empty() {
-                let tok = self
-                    .scheduler
-                    .as_ref()
-                    .map(|s| s.tokenizer())
-                    .unwrap_or_else(|| Arc::new(Tokenizer::default_bpe()));
-                let msgs: Vec<crate::model::hf_loader::ChatMessage> = self
-                    .chat_history
-                    .iter()
-                    .map(|(r, c)| crate::model::hf_loader::ChatMessage::new(r.as_str(), c.as_str()))
-                    .collect();
-                let mut cfg = self.compact_config;
-                if run_now && cfg.mode == crate::compact::CompactionMode::Auto {
-                    cfg.mode = crate::compact::CompactionMode::Aggressive;
+        let mut o = crate::compact::CompactionOverride::default();
+        let mut run_now = false;
+        for word in arg.split_whitespace() {
+            let num = |v: &str| v.parse::<f32>().map_err(|_| format!("{word}: not a number"));
+            match word.split_once('=') {
+                Some(("mode", v)) => o.mode = Some(v.parse()?),
+                Some(("threshold", v)) => o.trigger = Some(num(v)?),
+                Some(("target", v)) => o.target = Some(num(v)?),
+                Some(("keep", v)) => {
+                    o.keep_turns = Some(v.parse().map_err(|_| format!("{word}: not a count"))?)
                 }
-                let (compacted, _, report) = crate::compact::compact_chat_session(
-                    &msgs,
-                    &tok,
-                    self.ctx_limit,
-                    &cfg,
-                    &[],
-                    false,
-                );
-                self.chat_history = compacted
-                    .into_iter()
-                    .map(|m| (m.role.clone(), m.text().to_string()))
-                    .collect();
-                return Ok(format!(
-                    "Session compacted (mode={}): {} -> {} tokens (-{} tok; tier1={}B, tier2={}B, tier3={} turns)",
-                    self.compact_config.mode.name(),
-                    report.before_tokens,
-                    report.after_tokens,
-                    report.saved_tokens(),
-                    report.tier1_chars_elided,
-                    report.tier2_chars_shaken,
-                    report.tier3_turns_summarized,
-                ));
+                Some(("summarizer", v)) => o.summarizer = Some(v.to_string()),
+                Some((k, _)) => {
+                    return Err(format!(
+                        "unknown /compact setting '{k}' (mode, threshold, target, keep, summarizer)"
+                    ))
+                }
+                None if matches!(word, "now" | "run" | "force") => run_now = true,
+                None => o.mode = Some(word.parse()?),
             }
         }
+        let mut cfg = self.compact_config.clone();
+        o.apply(&mut cfg);
+        let cfg = cfg.sanitized();
+        if cfg != self.compact_config {
+            let mut s = settings::load_settings();
+            s.compact = cfg.clone();
+            settings::save_settings(&s)?;
+            self.compact_config = cfg;
+        }
+        if run_now {
+            return self.compact_now();
+        }
+        let c = &self.compact_config;
         Ok(format!(
-            "Auto-compaction: mode={} · trigger={:.0}% · target={:.0}% · keep_recent_turns={} · snapcompact_vision={}",
-            self.compact_config.mode.name(),
-            self.compact_config.trigger_ratio * 100.0,
-            self.compact_config.target_ratio * 100.0,
-            self.compact_config.keep_recent_turns,
-            self.compact_config.enable_snapcompact_vision,
+            "Auto-compaction: mode={} · threshold={:.0}% · target={:.0}% · keep={} turns · summarizer={} · snapcompact_vision={}",
+            c.mode.name(),
+            c.trigger_ratio * 100.0,
+            c.target_ratio * 100.0,
+            c.keep_recent_turns,
+            c.summarizer.as_deref().unwrap_or("active"),
+            c.enable_snapcompact_vision,
+        ))
+    }
+
+    /// `/compact now`: compacts `chat_history` on a background thread (Auto and Off run as
+    /// Aggressive); the result arrives as [`Update::Compacted`].
+    fn compact_now(&mut self) -> Result<String, String> {
+        if self.chat_history.is_empty() {
+            return Ok("nothing to compact: the chat history is empty".into());
+        }
+        let sched = self
+            .scheduler
+            .clone()
+            .filter(|s| s.has_model())
+            .ok_or("no text model loaded; press m to load one")?;
+        let mut cfg = self.compact_config.clone();
+        if matches!(
+            cfg.mode,
+            crate::compact::CompactionMode::Auto | crate::compact::CompactionMode::Off
+        ) {
+            cfg.mode = crate::compact::CompactionMode::Aggressive;
+        }
+        let (from, system) = (self.chat_history.clone(), self.system_prompt.clone());
+        let (tx, ctx_limit, mode) = (self.updates_tx.clone(), self.ctx_limit, cfg.mode);
+        std::thread::spawn(move || {
+            let result = compact_turns(&sched, &system, &from, None, ctx_limit, &cfg, true)
+                .and_then(|r| r.ok_or_else(|| "it saves no tokens".to_string()));
+            let _ = tx.send(Update::Compacted { from, result });
+        });
+        Ok(format!(
+            "compacting {} messages ({} mode)…",
+            self.chat_history.len(),
+            mode.name()
         ))
     }
 
@@ -1346,7 +1469,39 @@ impl TuiApp {
                 let active_template = self.active_template;
                 let system_prompt = self.system_prompt.clone();
                 let prior_turns = self.chat_history.clone();
+                let (compact_cfg, ctx_limit) = (self.compact_config.clone(), self.ctx_limit);
                 let job: Job = Box::new(move |idx, tx| {
+                    // Over the trigger the history is compacted first; the UI adopts the result.
+                    let prior_turns = if compact_cfg.mode == crate::compact::CompactionMode::Off {
+                        prior_turns
+                    } else {
+                        let current = media.as_ref().map_or_else(
+                            || ChatMessage::new("user", body.as_str()),
+                            |(m, _)| m.clone(),
+                        );
+                        let result = compact_turns(
+                            &sched,
+                            &system_prompt,
+                            &prior_turns,
+                            Some(current),
+                            ctx_limit,
+                            &compact_cfg,
+                            false,
+                        );
+                        match result {
+                            Ok(None) => prior_turns,
+                            Ok(Some((to, report))) => {
+                                let result = Ok((to.clone(), report));
+                                let _ = tx.send(Update::Compacted { from: prior_turns, result });
+                                to
+                            }
+                            Err(e) => {
+                                let from = prior_turns.clone();
+                                let _ = tx.send(Update::Compacted { from, result: Err(e) });
+                                prior_turns
+                            }
+                        }
+                    };
                     // Instruct models get their chat template; base models (Plain) get the raw text.
                     // Answers run to EOS or the end of the model's context.
                     let params = SamplingParams {
@@ -1874,6 +2029,28 @@ impl TuiApp {
                     };
                     self.push_entry("/bench".into(), kind, text);
                 }
+                Update::Compacted { from, result } => match result {
+                    Ok((to, r)) => {
+                        // Turns committed meanwhile stay after the compacted ones; a history
+                        // cleared or popped meanwhile is left alone.
+                        if self.chat_history.starts_with(&from) {
+                            self.chat_history.splice(..from.len(), to);
+                        }
+                        let line = format!(
+                            "compacted {} → {} tokens (tier1 {}, tier2 {}, tier3 {} turns)",
+                            r.before_tokens,
+                            r.after_tokens,
+                            r.tier1_chars_elided,
+                            r.tier2_chars_shaken,
+                            r.tier3_turns_summarized
+                        );
+                        self.telemetry.log_info(&format!("TUI: {line}"));
+                        self.push_entry("/compact".into(), Kind::Text, line);
+                    }
+                    Err(e) => {
+                        self.push_entry("/compact".into(), Kind::Error, format!("not compacted: {e}"));
+                    }
+                },
                 Update::Probe(res) => {
                     self.roofline_probe_result = res.as_ref().ok().cloned();
                     match &res {
@@ -2166,10 +2343,10 @@ impl TuiApp {
             match key.code {
                 KeyCode::Esc | KeyCode::F(4) => self.show_settings_modal = false,
                 KeyCode::Char('1') => {
-                    self.reencode_policy = self.reencode_policy.next();
+                    let _ = self.set_reencode(None);
                 }
                 KeyCode::Char('2') => {
-                    self.variant_policy = self.variant_policy.next();
+                    let _ = self.set_variant(None);
                 }
                 KeyCode::Char('3') => {
                     self.show_roofline_hud = !self.show_roofline_hud;
@@ -2184,7 +2361,7 @@ impl TuiApp {
                 }
                 KeyCode::Char('5') => {
                     let next = self.draft_knobs.mode.next();
-                    let _ = self.apply_spec_cmd(SpecArg::Mode(next));
+                    let _ = self.apply_spec_cmd(vec![SpecArg::Mode(next)]);
                 }
                 KeyCode::Char('6') => {
                     let next = match self.draft_knobs.max_k {
@@ -2195,7 +2372,7 @@ impl TuiApp {
                         8 => 12,
                         _ => 0,
                     };
-                    let _ = self.apply_spec_cmd(SpecArg::MaxK(next));
+                    let _ = self.apply_spec_cmd(vec![SpecArg::MaxK(next)]);
                 }
                 KeyCode::Char('7') => {
                     let cur = (self.draft_knobs.target_acceptance * 100.0).round() as u32;
@@ -2205,11 +2382,19 @@ impl TuiApp {
                         71..=80 => 0.85,
                         _ => 0.50,
                     };
-                    let _ = self.apply_spec_cmd(SpecArg::Accept(next));
+                    let _ = self.apply_spec_cmd(vec![SpecArg::Accept(next)]);
                 }
                 KeyCode::Char('8') => {
                     let next = self.compact_config.mode.next();
                     let _ = self.run_compact_cmd(next.name());
+                }
+                KeyCode::Char('9') => {
+                    let next = self.draft_knobs.objective.next();
+                    let _ = self.apply_spec_cmd(vec![SpecArg::Objective(next)]);
+                }
+                KeyCode::Char('0') => {
+                    let next = self.draft_knobs.denoise_steps % 4 + 1;
+                    let _ = self.apply_spec_cmd(vec![SpecArg::Steps(next)]);
                 }
                 KeyCode::Enter => self.show_settings_modal = false,
                 _ => {}
@@ -3118,6 +3303,9 @@ mod tests {
     }
     #[test]
     fn test_settings_modal_and_policies() {
+        use crate::model::weight_format::{ReencodePolicy as R, VariantPolicy as V};
+        let _settings = settings_guard();
+        let _ = std::fs::remove_file(settings::settings_path());
         let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
 
         // 1. /settings toggles modal
@@ -3138,47 +3326,50 @@ mod tests {
         app.handle_key(key(KeyCode::F(4)));
         assert!(app.show_settings_modal);
 
-        // 3. '1' cycles reencode_policy: MaxSpeed -> LowBitNative -> BitExact -> MaxSpeed
-        assert_eq!(
-            app.reencode_policy,
-            crate::model::weight_format::ReencodePolicy::MaxSpeed
-        );
-        app.handle_key(key(KeyCode::Char('1')));
-        assert_eq!(
-            app.reencode_policy,
-            crate::model::weight_format::ReencodePolicy::LowBitNative
-        );
-        app.handle_key(key(KeyCode::Char('1')));
-        assert_eq!(
-            app.reencode_policy,
-            crate::model::weight_format::ReencodePolicy::BitExact
-        );
-        app.handle_key(key(KeyCode::Char('1')));
-        assert_eq!(
-            app.reencode_policy,
-            crate::model::weight_format::ReencodePolicy::MaxSpeed
-        );
+        // 3. '1' cycles reencode_policy: MaxSpeed -> LowBitNative -> BitExact -> MaxSpeed, saving
+        // each step to the settings file.
+        assert_eq!(app.reencode_policy, R::MaxSpeed);
+        for p in [R::LowBitNative, R::BitExact, R::MaxSpeed] {
+            app.handle_key(key(KeyCode::Char('1')));
+            assert_eq!(app.reencode_policy, p);
+            assert_eq!(settings::load_settings().reencode, p);
+        }
 
-        // 4. '2' cycles variant_policy: Fastest -> Fastest4Bit -> BestQuality -> Fastest
-        assert_eq!(
-            app.variant_policy,
-            crate::model::weight_format::VariantPolicy::Fastest
-        );
+        // 4. '2' cycles variant_policy: Fastest -> Fastest4Bit -> BestQuality -> Fastest, saved.
+        assert_eq!(app.variant_policy, V::Fastest);
+        for p in [V::Fastest4Bit, V::BestQuality, V::Fastest] {
+            app.handle_key(key(KeyCode::Char('2')));
+            assert_eq!(app.variant_policy, p);
+            assert_eq!(settings::load_settings().variant, p);
+        }
+        // A new app (restart) starts from the saved policies and compaction settings.
+        app.handle_key(key(KeyCode::Char('1')));
         app.handle_key(key(KeyCode::Char('2')));
-        assert_eq!(
-            app.variant_policy,
-            crate::model::weight_format::VariantPolicy::Fastest4Bit
+        type_and_run(
+            &mut app,
+            "/compact mode=aggressive threshold=0.3 target=0.2 keep=3 summarizer=org/sum",
         );
+        let c = settings::load_settings().compact;
+        assert_eq!(c.mode, crate::compact::CompactionMode::Aggressive);
+        assert_eq!((c.trigger_ratio, c.target_ratio, c.keep_recent_turns), (0.3, 0.2, 3));
+        assert_eq!(c.summarizer.as_deref(), Some("org/sum"));
+        let restarted = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        assert_eq!(
+            (restarted.reencode_policy, restarted.variant_policy),
+            (R::LowBitNative, V::Fastest4Bit)
+        );
+        assert_eq!(restarted.compact_config, c);
+        type_and_run(&mut app, "/compact light summarizer=active");
+        let c = settings::load_settings().compact;
+        assert_eq!((c.mode, c.summarizer), (crate::compact::CompactionMode::Light, None));
+        type_and_run(&mut app, "/compact keep=x");
+        assert_eq!(app.history.last().unwrap().kind, Kind::Error);
+        app.handle_key(key(KeyCode::Char('1')));
+        app.handle_key(key(KeyCode::Char('1')));
         app.handle_key(key(KeyCode::Char('2')));
-        assert_eq!(
-            app.variant_policy,
-            crate::model::weight_format::VariantPolicy::BestQuality
-        );
         app.handle_key(key(KeyCode::Char('2')));
-        assert_eq!(
-            app.variant_policy,
-            crate::model::weight_format::VariantPolicy::Fastest
-        );
+        assert_eq!((app.reencode_policy, app.variant_policy), (R::MaxSpeed, V::Fastest));
+        type_and_run(&mut app, "/compact auto");
 
         // 5. '3' toggles show_roofline_hud
         assert!(app.show_roofline_hud);
@@ -3196,6 +3387,24 @@ mod tests {
         assert_eq!(app.ctx_limit, 4096);
         app.handle_key(key(KeyCode::Char('4')));
         assert_eq!(app.ctx_limit, 8192);
+        // '9' cycles the draft objective and '0' the denoise steps 1 -> 2 -> 3 -> 4 -> 1; both
+        // persist.
+        use crate::runtime::noise_draft::DraftObjective;
+        assert_eq!(app.draft_knobs.objective, DraftObjective::Speed);
+        app.handle_key(key(KeyCode::Char('9')));
+        assert_eq!(app.draft_knobs.objective, DraftObjective::TokensPerForward);
+        assert_eq!(
+            settings::load_settings().draft.objective,
+            DraftObjective::TokensPerForward
+        );
+        app.handle_key(key(KeyCode::Char('9')));
+        assert_eq!(app.draft_knobs.objective, DraftObjective::Speed);
+        assert_eq!(app.draft_knobs.denoise_steps, 2);
+        for want in [3, 4, 1, 2] {
+            app.handle_key(key(KeyCode::Char('0')));
+            assert_eq!(app.draft_knobs.denoise_steps, want);
+            assert_eq!(settings::load_settings().draft.denoise_steps, want);
+        }
 
         // 7. Rendered F4 modal shows [FASTEST] defaults and bottom keybar shows F4 options & ↑↓ history
         let _g = truecolor();
@@ -3209,10 +3418,32 @@ mod tests {
             "{modal_text}"
         );
         assert!(!modal_text.contains("⟦^R⟧"), "{modal_text}");
+        assert!(
+            modal_text.contains("[9] Spec Objective") && modal_text.contains("[0] Draft Denoise"),
+            "{modal_text}"
+        );
 
         // 8. Esc closes modal
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.show_settings_modal);
+
+        // `/spec key=value ...` applies and persists every knob; `/spec` prints the status.
+        type_and_run(&mut app, "/spec objective=tokens steps=3 sigma=0.02");
+        assert_eq!(app.draft_knobs.objective, DraftObjective::TokensPerForward);
+        assert_eq!(settings::load_settings().draft.denoise_steps, 3);
+        type_and_run(&mut app, "/spec");
+        let out = &app.history.last().unwrap().output;
+        for want in [
+            "mode=auto",
+            "objective=tokens",
+            "tokens/forward",
+            "tok/s",
+            "online updates=",
+            "steps=3",
+            "sigma=0.0200",
+        ] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
 
         // 9. Up / Down arrow keys cycle prior prompt entries for retry/editing, mouse wheel scrolls
         type_and_run(&mut app, "/quant");
@@ -3616,6 +3847,28 @@ mod tests {
         assert!(err("/variant best").contains("valid: fastest"));
         assert!(err("/profile sort size").contains("'size'"));
         assert!(err("/profile xyz").contains("'xyz'"));
+        assert_eq!(ok("/spec"), SlashCmd::Spec(vec![]));
+        assert_eq!(
+            ok("/spec noise"),
+            SlashCmd::Spec(vec![SpecArg::Mode(
+                crate::runtime::noise_draft::DraftMode::Noise
+            )])
+        );
+        assert_eq!(ok("/spec k 6"), SlashCmd::Spec(vec![SpecArg::MaxK(6)]));
+        assert_eq!(
+            ok("/spec objective=tokens steps=3 shortlist=512 probes=16 window=6 sigma=0.02"),
+            SlashCmd::Spec(vec![
+                SpecArg::Objective(crate::runtime::noise_draft::DraftObjective::TokensPerForward),
+                SpecArg::Steps(3),
+                SpecArg::Shortlist(512),
+                SpecArg::Probes(16),
+                SpecArg::Window(6),
+                SpecArg::Sigma(0.02),
+            ])
+        );
+        assert!(err("/spec objective=fast").contains("valid: speed, tokens"));
+        assert!(err("/spec steps=two").contains("denoise steps"));
+        assert!(err("/spec turbo=1").contains("unknown /spec argument 'turbo'"));
         assert_eq!(parse_slash("/help"), None);
     }
 

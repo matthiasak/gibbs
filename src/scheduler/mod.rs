@@ -60,6 +60,10 @@ impl ExecutableModel {
     pub fn placement_summary(&self) -> Option<Vec<crate::graph::placement::PlacementRow>> {
         self.0.placement_summary()
     }
+    /// Row `id` of the model's token-embedding table ([`NativeLm::embed_row`]).
+    pub fn embed_row(&self, id: u32, out: &mut [f32]) -> bool {
+        self.0.embed_row(id, out)
+    }
     /// Decodes `last_token` against the sequence's state and samples the next token.
     /// `logprobs: Some(k)` also reports the chosen token's probability, the top `k` candidates
     /// and the entropy.
@@ -211,7 +215,7 @@ impl ExecutableModel {
 
     /// A private scheduler for one-shot generation: its KV pool holds the model's whole context
     /// (at least [`ONE_SHOT_POOL_BLOCKS`]).
-    fn one_shot_scheduler(&self) -> ContinuousBatchScheduler {
+    pub(crate) fn one_shot_scheduler(&self) -> ContinuousBatchScheduler {
         // ponytail: block ids are bookkeeping only; the 4M-token cap bounds that list.
         let blocks = self
             .context_len()
@@ -266,6 +270,16 @@ impl ExecutableModel {
             return false;
         };
         self.0.restore_kv_prefix(st, snap, prefix_len)
+    }
+
+    /// [`NativeLm::thinking_delimiters`].
+    pub fn thinking_delimiters(&self) -> Vec<(String, String)> {
+        self.0.thinking_delimiters()
+    }
+
+    /// [`NativeLm::has_vision`].
+    pub fn has_vision(&self) -> bool {
+        self.0.has_vision()
     }
 }
 
@@ -578,6 +592,8 @@ pub struct SpecView {
     /// Draft tokens per step the tuner currently rates best (0 = plain decoding pays off);
     /// `None` until it has measured a step.
     pub k: Option<usize>,
+    /// The drafter's online learning updates so far (online drafters).
+    pub updates: Option<u64>,
 }
 
 pub struct ContinuousBatchScheduler {
@@ -687,12 +703,17 @@ impl ContinuousBatchScheduler {
         s
     }
 
-    /// Updates `self.view.lock().spec` immediately when the active drafter or model changes.
-    fn sync_spec_view(&self) {
-        let spec = self.drafter.read().as_ref().map(|d| SpecView {
+    fn spec_view(&self) -> Option<SpecView> {
+        self.drafter.read().as_ref().map(|d| SpecView {
             label: d.label(),
             k: self.k_tuner.lock().best(),
-        });
+            updates: d.online_updates(),
+        })
+    }
+
+    /// Updates `self.view.lock().spec` immediately when the active drafter or model changes.
+    fn sync_spec_view(&self) {
+        let spec = self.spec_view();
         self.view.lock().spec = spec;
     }
 
@@ -844,8 +865,8 @@ impl ContinuousBatchScheduler {
         self.sync_spec_view();
     }
 
-    /// Per-`k` `(k, tok_per_sec, accept_rate)` summary from [`KTuner`].
-    pub fn k_tuner_rates(&self) -> Vec<(usize, f64, f64)> {
+    /// What [`KTuner`] measured for each `k`.
+    pub fn k_tuner_rates(&self) -> Vec<spec::KRate> {
         self.k_tuner.lock().rates_summary()
     }
 
@@ -1594,10 +1615,7 @@ impl ContinuousBatchScheduler {
         }));
         view.waiting = waiting;
         view.prefill_budget = budget;
-        view.spec = self.drafter.read().as_ref().map(|d| SpecView {
-            label: d.label(),
-            k: self.k_tuner.lock().best(),
-        });
+        view.spec = self.spec_view();
         if let Some(d) = busy {
             view.busy_step = d;
         }

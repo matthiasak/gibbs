@@ -351,7 +351,7 @@ pub enum TensorRole {
     Other,
 }
 
-fn parse_layer_idx(name: &str) -> Option<usize> {
+pub(crate) fn parse_layer_idx(name: &str) -> Option<usize> {
     let mut it = name.split('.');
     while let Some(part) = it.next() {
         if matches!(part, "layers" | "blk" | "h") {
@@ -476,7 +476,7 @@ pub fn reencode_native(
     let f = target(cfg, name, src, cols, false)?;
     // The source's own decoder, so the values are exactly what the GPU would have read.
     encode_blocks(
-        cfg.policy,
+        cfg,
         name,
         src,
         f,
@@ -505,7 +505,7 @@ pub fn reencode_values(
         }
     }
     encode_blocks(
-        cfg.policy,
+        cfg,
         name,
         src,
         f,
@@ -602,7 +602,7 @@ fn target(
 /// Re-encodes `raw` (`src`'s `rows x cols` weights as `(elems, block_bytes, decode)` blocks) into
 /// `f`, bumped until the per-tensor RMSE gate holds; `None` when that no longer beats `src`.
 fn encode_blocks(
-    policy: ReencodePolicy,
+    cfg: &crate::model::weight_format::ReencodeConfig,
     name: &str,
     src: Q,
     f: Q,
@@ -648,13 +648,18 @@ fn encode_blocks(
         (rmse_of(err), blocks)
     };
     let (mut f, mut rmse) = (f, encode(f, false).0);
-    let role = classify_tensor(name, None, None);
+    let policy = cfg.policy;
+    let role = classify_tensor(name, None, cfg.total_layers);
     let limit = match (policy, role) {
         (ReencodePolicy::MaxSpeed, TensorRole::LmHead) => rmse_limit(policy).min(0.05),
         (ReencodePolicy::MaxSpeed, TensorRole::FfnDown | TensorRole::BoundaryAttn) => {
             rmse_limit(policy).min(0.06)
         }
         _ => rmse_limit(policy),
+    };
+    let limit = match &cfg.sensitive_weights {
+        Some(pats) if pats.iter().any(|p| crate::arch::glob(p, name)) => limit.min(0.05),
+        _ => limit,
     };
     while rmse > limit {
         let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else {
@@ -1488,6 +1493,41 @@ mod tests {
             reencode_native(&cfg, "layers.0.mlp.up.weight", src, rows, cols, &raw),
             want
         );
+    }
+
+    /// A `runtime.sensitive_weights` glob holds a tensor to the LM head's 0.05 error floor: the
+    /// same weights re-encode to a wider format than without the glob.
+    #[test]
+    fn sensitive_weight_glob_tightens_rmse_limit() {
+        let (rows, cols, name) = (64, 256, "model.layers.3.self_attn.q_proj.weight");
+        let mut s = 0x2545f4914f6cdd1du64;
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                (0..4)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                    })
+                    .sum::<f32>()
+            })
+            .collect();
+        let run = |sensitive: Option<Vec<String>>| {
+            let cfg = crate::model::weight_format::ReencodeConfig {
+                policy: MinSize,
+                sensitive_weights: sensitive.map(Arc::new),
+                ..Default::default()
+            };
+            let (f, blocks) =
+                reencode_values(&cfg, name, Q::BF16, rows, cols, || Some(w.clone())).unwrap();
+            (f, relative_rmse(&w, &dequantize_gguf_blocks(f, &blocks).unwrap()))
+        };
+        let (loose, loose_err) = run(None);
+        let (tight, tight_err) = run(Some(vec!["*.self_attn.*".into()]));
+        assert!(loose_err > 0.05, "{loose:?} rmse {loose_err}");
+        assert!(tight_err <= 0.05, "{tight:?} rmse {tight_err}");
+        assert!(tight.bits_per_weight() > loose.bits_per_weight());
     }
 
     #[test]

@@ -55,7 +55,8 @@ struct Cli {
     prompt: Option<String>,
 
     /// Speculative decoding drafter for --model: a hidden-state drafter repo trained for it (a
-    /// `pipeline: drafter` family spec), or a small causal LM with the same tokenizer.
+    /// `pipeline: drafter` family spec), a small causal LM with the same tokenizer, or `noise` /
+    /// `suffix` for the built-in online drafter (same as `--draft-mode noise|suffix`).
     #[arg(long)]
     draft: Option<String>,
 
@@ -83,6 +84,31 @@ struct Cli {
     #[arg(long)]
     draft_noise_lr: Option<f32>,
 
+    /// What the speculative `k` tuner maximizes: speed (tok/s) | tokens (tokens per verify
+    /// forward).
+    #[arg(long)]
+    draft_objective: Option<String>,
+
+    /// Online drafter refinement passes (1..=4).
+    #[arg(long)]
+    draft_denoise_steps: Option<usize>,
+
+    /// Online drafter shortlist size (64..=1024).
+    #[arg(long)]
+    draft_shortlist: Option<usize>,
+
+    /// Online drafter Hadamard probe directions per update (4..=32, a power of two).
+    #[arg(long)]
+    draft_probes: Option<usize>,
+
+    /// Online drafter context window in tokens (1..=8).
+    #[arg(long)]
+    draft_window: Option<usize>,
+
+    /// Online drafter node-perturbation scale sigma (1e-5..=0.25).
+    #[arg(long)]
+    draft_noise_sigma: Option<f32>,
+
     /// Session compaction mode: auto | light | aggressive | off.
     #[arg(long)]
     compact_mode: Option<String>,
@@ -98,6 +124,10 @@ struct Cli {
     /// Number of recent turns kept verbatim during session compaction.
     #[arg(long)]
     compact_keep_turns: Option<usize>,
+
+    /// Tier 3 summarizer: `active` (the loaded model) or a model id loaded beside it.
+    #[arg(long)]
+    compact_summarizer: Option<String>,
 
     #[arg(long)]
     image: Option<String>,
@@ -186,6 +216,11 @@ struct Cli {
     /// unconsumed tensors (JSON), then exit.
     #[arg(long, default_value_t = false)]
     arch_dump: bool,
+}
+
+/// `--draft` values that select the built-in online drafter rather than a drafter repo.
+fn is_online_draft(d: &str) -> bool {
+    matches!(d, "noise" | "online-noise" | "suffix")
 }
 
 fn clock_seed() -> u64 {
@@ -659,22 +694,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 telemetry.set_model_size_bytes(b);
             }
             telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
-            if let Some(d) = &cli.draft {
-                let dr = if matches!(d.as_str(), "noise" | "online-noise" | "suffix") {
-                    let mut k = gibbs_engine::tui::settings::load_settings().draft;
-                    k.mode = if d == "suffix" {
-                        gibbs_engine::runtime::noise_draft::DraftMode::Suffix
-                    } else {
-                        gibbs_engine::runtime::noise_draft::DraftMode::Noise
-                    };
-                    let live = Arc::new(gibbs_engine::runtime::noise_draft::LiveDraftKnobs::new(k));
-                    gibbs_engine::runtime::draft::online_drafter_for_target(artifacts, live)
-                        .map_err(|e| format!("Cannot initialize online drafter '{d}': {e}"))?
-                } else {
-                    let da = hub.auto_download_and_cache(d, token.as_deref())?;
-                    gibbs_engine::runtime::draft::load_drafter(&da, artifacts, placement)
-                        .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?
-                };
+            if let Some(d) = cli.draft.as_ref().filter(|d| !is_online_draft(d)) {
+                let da = hub.auto_download_and_cache(d, token.as_deref())?;
+                let dr = gibbs_engine::runtime::draft::load_drafter(&da, artifacts, placement)
+                    .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?;
                 telemetry.log_info(&format!("Speculative decoding drafter: {}", dr.label()));
                 drafter = Some(dr);
             }
@@ -690,47 +713,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_exec,
         telemetry.clone(),
     ));
-    if cli.draft.is_some() && drafter.is_none() {
+    // `--draft noise|suffix` selects the online drafter, built by the scheduler on its live knobs.
+    let online_draft = cli.draft.as_deref().filter(|d| is_online_draft(d));
+    if cli.draft.is_some() && drafter.is_none() && online_draft.is_none() {
         return Err("--draft needs a text-generation --model".into());
     }
-    if drafter.is_some() {
+    if drafter.is_some() || online_draft.is_some() {
         if std::env::var("GIBBS_SPEC").as_deref() == Ok("off") {
             return Err("--draft: speculative decoding is disabled (GIBBS_SPEC=off)".into());
         }
+    }
+    if drafter.is_some() {
         scheduler.set_drafter(drafter);
     }
-    if cli.draft_mode.is_some()
-        || cli.draft_max_k.is_some()
-        || cli.draft_target_accept.is_some()
-        || cli.draft_cost_weight.is_some()
-        || cli.draft_suffix_min.is_some()
-        || cli.draft_noise_lr.is_some()
-    {
-        let mut knobs = scheduler.draft_knobs();
-        if let Some(m) = &cli.draft_mode {
-            knobs.mode = m.parse()?;
-        }
-        if let Some(k) = cli.draft_max_k {
-            knobs.max_k = k;
-        }
-        if let Some(a) = cli.draft_target_accept {
-            knobs.target_acceptance = a;
-        }
-        if let Some(c) = cli.draft_cost_weight {
-            knobs.cost_weight = c;
-        }
-        if let Some(s) = cli.draft_suffix_min {
-            knobs.suffix_min_match = s;
-        }
-        if let Some(lr) = cli.draft_noise_lr {
-            knobs.noise_lr = lr;
-        }
+    let before = scheduler.draft_knobs();
+    let mut knobs = before;
+    if let Some(d) = online_draft {
+        knobs.mode = if d == "suffix" {
+            gibbs_engine::runtime::noise_draft::DraftMode::Suffix
+        } else {
+            gibbs_engine::runtime::noise_draft::DraftMode::Noise
+        };
+    }
+    if let Some(m) = &cli.draft_mode {
+        knobs.mode = m.parse()?;
+    }
+    if let Some(o) = &cli.draft_objective {
+        knobs.objective = o.parse()?;
+    }
+    knobs.max_k = cli.draft_max_k.unwrap_or(knobs.max_k);
+    knobs.target_acceptance = cli.draft_target_accept.unwrap_or(knobs.target_acceptance);
+    knobs.cost_weight = cli.draft_cost_weight.unwrap_or(knobs.cost_weight);
+    knobs.suffix_min_match = cli.draft_suffix_min.unwrap_or(knobs.suffix_min_match);
+    knobs.noise_lr = cli.draft_noise_lr.unwrap_or(knobs.noise_lr);
+    knobs.noise_sigma = cli.draft_noise_sigma.unwrap_or(knobs.noise_sigma);
+    knobs.denoise_steps = cli.draft_denoise_steps.unwrap_or(knobs.denoise_steps);
+    knobs.shortlist = cli.draft_shortlist.unwrap_or(knobs.shortlist);
+    knobs.probes = cli.draft_probes.unwrap_or(knobs.probes);
+    knobs.window = cli.draft_window.unwrap_or(knobs.window);
+    if knobs != before {
         scheduler.set_draft_knobs(knobs);
+    }
+    if online_draft.is_some() && scheduler.view().spec.is_none() {
+        return Err("--draft needs a text-generation --model".into());
     }
     if cli.compact_mode.is_some()
         || cli.compact_threshold.is_some()
         || cli.compact_target.is_some()
         || cli.compact_keep_turns.is_some()
+        || cli.compact_summarizer.is_some()
     {
         let mut s = gibbs_engine::tui::settings::load_settings();
         if let Some(m) = &cli.compact_mode {
@@ -745,7 +776,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(kt) = cli.compact_keep_turns {
             s.compact.keep_recent_turns = kt;
         }
-        s.compact = s.compact.sanitized();
+        if let Some(id) = &cli.compact_summarizer {
+            s.compact.summarizer = gibbs_engine::compact::summarizer_id(id);
+        }
+        s.compact = s.compact.clone().sanitized();
         let _ = gibbs_engine::tui::settings::save_settings(&s);
     }
 
