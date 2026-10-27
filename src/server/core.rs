@@ -463,26 +463,37 @@ pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, 
     if let Prompt::Chat { messages, .. } = &mut req.prompt {
         let cfg = crate::tui::settings::load_settings().compact;
         if cfg.mode != crate::compact::CompactionMode::Off {
-            let tok = state.scheduler.tokenizer();
-            let ctx = state
-                .scheduler
-                .model()
-                .and_then(|m| m.context_len())
-                .unwrap_or(8192);
-            let (compacted, extra_media, report) =
-                crate::compact::compact_chat_session(messages, &tok, ctx, &cfg, &[], false);
-            if report.saved_tokens() > 0 {
-                state.telemetry.log_info(&format!(
-                    "compact: {} -> {} tokens (-{} tok; tier1={}B, tier2={}B, tier3={} turns)",
-                    report.before_tokens,
-                    report.after_tokens,
-                    report.saved_tokens(),
-                    report.tier1_chars_elided,
-                    report.tier2_chars_shaken,
-                    report.tier3_turns_summarized,
-                ));
-                *messages = compacted;
-                req.media.extend(extra_media);
+            let sched = state.scheduler.clone();
+            let (mut msgs, mut media) = (std::mem::take(messages), std::mem::take(&mut req.media));
+            // The summarizer generates on the scheduler: never on an async worker.
+            let (msgs, media, result) = tokio::task::spawn_blocking(move || {
+                let r = crate::compact::compact_for_scheduler(
+                    &sched, &mut msgs, &mut media, None, &cfg, false,
+                );
+                (msgs, media, r)
+            })
+            .await
+            .map_err(|e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("compaction failed: {e}"),
+            })?;
+            (*messages, req.media) = (msgs, media);
+            match result {
+                Ok(report) if report.saved_tokens() > 0 => {
+                    state.telemetry.log_info(&format!(
+                        "compact: {} -> {} tokens (-{} tok; tier1={}B, tier2={}B, tier3={} turns)",
+                        report.before_tokens,
+                        report.after_tokens,
+                        report.saved_tokens(),
+                        report.tier1_chars_elided,
+                        report.tier2_chars_shaken,
+                        report.tier3_turns_summarized,
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => state
+                    .telemetry
+                    .log_warn(&format!("compact: {e}; the request proceeds uncompacted")),
             }
         }
     }

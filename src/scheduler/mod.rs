@@ -211,7 +211,7 @@ impl ExecutableModel {
 
     /// A private scheduler for one-shot generation: its KV pool holds the model's whole context
     /// (at least [`ONE_SHOT_POOL_BLOCKS`]).
-    fn one_shot_scheduler(&self) -> ContinuousBatchScheduler {
+    pub(crate) fn one_shot_scheduler(&self) -> ContinuousBatchScheduler {
         // ponytail: block ids are bookkeeping only; the 4M-token cap bounds that list.
         let blocks = self
             .context_len()

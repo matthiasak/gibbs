@@ -1021,7 +1021,7 @@ impl TuiApp {
             let mode: crate::compact::CompactionMode = arg.parse()?;
             self.compact_config.mode = mode;
             let mut s = settings::load_settings();
-            s.compact = self.compact_config;
+            s.compact = self.compact_config.clone();
             let _ = settings::save_settings(&s);
         }
         if run_now
@@ -1031,29 +1031,29 @@ impl TuiApp {
             )
         {
             if !self.chat_history.is_empty() {
-                let tok = self
+                let sched = self
                     .scheduler
-                    .as_ref()
-                    .map(|s| s.tokenizer())
-                    .unwrap_or_else(|| Arc::new(Tokenizer::default_bpe()));
-                let msgs: Vec<crate::model::hf_loader::ChatMessage> = self
+                    .clone()
+                    .filter(|s| s.has_model())
+                    .ok_or("no text model loaded; press m to load one")?;
+                let mut msgs: Vec<crate::model::hf_loader::ChatMessage> = self
                     .chat_history
                     .iter()
                     .map(|(r, c)| crate::model::hf_loader::ChatMessage::new(r.as_str(), c.as_str()))
                     .collect();
-                let mut cfg = self.compact_config;
+                let mut cfg = self.compact_config.clone();
                 if run_now && cfg.mode == crate::compact::CompactionMode::Auto {
                     cfg.mode = crate::compact::CompactionMode::Aggressive;
                 }
-                let (compacted, _, report) = crate::compact::compact_chat_session(
-                    &msgs,
-                    &tok,
-                    self.ctx_limit,
+                let report = crate::compact::compact_for_scheduler(
+                    &sched,
+                    &mut msgs,
+                    &mut Vec::new(),
+                    Some(self.ctx_limit),
                     &cfg,
-                    &[],
-                    false,
-                );
-                self.chat_history = compacted
+                    run_now,
+                )?;
+                self.chat_history = msgs
                     .into_iter()
                     .map(|m| (m.role.clone(), m.text().to_string()))
                     .collect();

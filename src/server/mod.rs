@@ -768,7 +768,7 @@ pub struct CompactRequest {
 async fn handle_compact(
     State(state): State<AppState>,
     Json(req): Json<CompactRequest>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
     let mut cfg = crate::tui::settings::load_settings().compact;
     cfg.mode = req
         .mode
@@ -779,27 +779,26 @@ async fn handle_compact(
     if let Some(v) = req.enable_snapcompact_vision {
         cfg.enable_snapcompact_vision = v;
     }
-    let ctx = req.context_limit.unwrap_or_else(|| {
-        state
-            .scheduler
-            .model()
-            .and_then(|m| m.context_len())
-            .unwrap_or(8192)
-    });
-    let tok = state.scheduler.tokenizer();
-    let (messages, media, report) = crate::compact::compact_chat_session(
-        &req.messages,
-        &tok,
-        ctx,
-        &cfg,
-        &[],
-        cfg.enable_snapcompact_vision,
-    );
-    Json(serde_json::json!({
-        "messages": messages,
-        "media_count": media.len(),
-        "report": report,
-    }))
+    let sched = state.scheduler.clone();
+    let ctx = req.context_limit;
+    let mut messages = req.messages;
+    let result = tokio::task::spawn_blocking(move || {
+        let mut media = Vec::new();
+        crate::compact::compact_for_scheduler(&sched, &mut messages, &mut media, ctx, &cfg, true)
+            .map(|report| (messages, media.len(), report))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    match result {
+        Ok((messages, media_count, report)) => Json(serde_json::json!({
+            "messages": messages,
+            "media_count": media_count,
+            "report": report,
+        }))
+        .into_response(),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, format!("compaction failed: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -965,8 +964,33 @@ mod tests {
         assert_eq!(v["knobs"]["suffix_min_match"], 3);
     }
 
+    /// A served synthetic model (one token per character, never stops before `max_tokens`) with
+    /// a thread stepping its scheduler while the state lives.
+    fn model_state(dir: &std::path::Path) -> AppState {
+        let cfg = serde_json::json!({"max_position_embeddings": 16384});
+        let model = crate::arch::testing::synthetic_lm(dir, cfg, crate::hardware::Device::Cpu);
+        let scheduler = Arc::new(ContinuousBatchScheduler::new(
+            "gibbs/test-llama",
+            Arc::new(PagedKVPool::new(1024)),
+            Some(model),
+        ));
+        let weak = Arc::downgrade(&scheduler);
+        std::thread::spawn(move || {
+            while let Some(s) = weak.upgrade() {
+                if s.step().active_sequences_count == 0 {
+                    s.wait_for_work(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+        AppState {
+            scheduler,
+            ..create_test_state()
+        }
+    }
+
     #[tokio::test]
     async fn compact_endpoint_elides_thinking_and_folds_turns() {
+        let dir = tempfile::tempdir().unwrap();
         let payload = serde_json::json!({
             "messages": [
                 {"role": "user", "content": "Turn 1 user question"},
@@ -977,15 +1001,32 @@ mod tests {
                 {"role": "assistant", "content": "Turn 3 answer"}
             ],
             "mode": "aggressive",
-            "keep_recent_turns": 1,
-            "context_limit": 32
+            "keep_recent_turns": 1
         });
-        let body = post_body("/v1/compact", payload).await;
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["report"]["tier1_chars_elided"].as_u64().unwrap() > 0);
-        assert!(
-            v["report"]["after_tokens"].as_u64().unwrap()
-                < v["report"]["before_tokens"].as_u64().unwrap()
-        );
+        let app = create_router(model_state(dir.path()));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/compact")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["report"]["tier1_chars_elided"].as_u64().unwrap() > 0, "{v}");
+        assert_eq!(v["report"]["tier3_turns_summarized"], 2, "{v}");
+        let m = v["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 4, "{v}");
+        assert!(m[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Compacted session summary of 4 earlier messages]\n"));
+        assert_eq!(m[3]["content"], "Turn 3 answer");
+        // Without a model there is nothing to summarize with (a transcript with no cached summary).
+        let fresh = payload.to_string().replace("Turn 1 user", "Turn 1 other");
+        let body = post_body("/v1/compact", serde_json::from_str(&fresh).unwrap()).await;
+        assert!(body.contains("no text model is loaded"), "{body}");
     }
 }
