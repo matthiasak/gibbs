@@ -384,6 +384,8 @@ pub enum Kind {
 
 /// One console entry: a prompt or model load and its result.
 pub struct Entry {
+    /// Stable handle background work reports to (lines may be inserted before an entry).
+    id: usize,
     pub time: String,
     pub prompt: String,
     pub kind: Kind,
@@ -420,14 +422,17 @@ enum Update {
     Probe(Result<String, String>),
     /// A `/bench` run on the loaded model.
     Bench(Result<crate::bench::ModelBenchResult, String>),
-    /// Chat history compaction: the history it started `from` and the compacted turns.
+    /// Chat history compaction: the history it started `from` and the compacted turns. Its
+    /// console line goes right before entry `before` (the chat it ran for), else at the end.
     Compacted {
         from: Vec<(String, String)>,
         result: Result<(Vec<(String, String)>, crate::compact::CompactionReport), String>,
+        before: Option<usize>,
     },
 }
 
-/// A prompt's background work: runs with its console entry index and the update channel.
+/// A prompt's background work: runs with its console entry id ([`Entry::id`]) and the update
+/// channel.
 type Job = Box<dyn FnOnce(usize, mpsc::Sender<Update>) + Send>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,6 +546,8 @@ pub struct TuiApp {
     picker: Picker,
     load: Option<Load>,
     running: usize,
+    /// Id of the next console entry ([`Entry::id`]).
+    next_entry_id: usize,
     updates_tx: mpsc::Sender<Update>,
     updates_rx: mpsc::Receiver<Update>,
     /// Console lines scrolled up from the bottom; 0 follows new output.
@@ -662,6 +669,7 @@ impl TuiApp {
             picker,
             load: None,
             running: 0,
+            next_entry_id: 0,
             updates_tx,
             updates_rx,
             scroll: 0,
@@ -743,9 +751,13 @@ impl TuiApp {
             .unwrap_or_default()
     }
 
+    /// Appends an entry; returns its id (the handle background work reports to).
     fn push_entry(&mut self, prompt: String, kind: Kind, output: String) -> usize {
         let now = Instant::now();
+        let id = self.next_entry_id;
+        self.next_entry_id += 1;
         self.history.push(Entry {
+            id,
             time: chrono::Local::now().format("%H:%M:%S").to_string(),
             prompt,
             kind,
@@ -760,7 +772,21 @@ impl TuiApp {
             self.running += 1;
         }
         self.scroll = 0;
-        self.history.len() - 1
+        id
+    }
+
+    /// The entry with `id`.
+    fn entry_mut(&mut self, id: usize) -> Option<&mut Entry> {
+        self.history.iter_mut().rev().find(|e| e.id == id)
+    }
+
+    /// A finished entry placed right before entry `before` (else at the end).
+    fn insert_entry_before(&mut self, before: usize, prompt: String, kind: Kind, output: String) {
+        self.push_entry(prompt, kind, output);
+        if let Some(pos) = self.history.iter().position(|e| e.id == before) {
+            let e = self.history.pop().expect("just pushed");
+            self.history.insert(pos, e);
+        }
     }
 
     /// Runs the typed prompt on a background thread; its entry streams into the console.
@@ -950,9 +976,10 @@ impl TuiApp {
                     format!("{raw}  [attached: {}]", names.join(", "))
                 };
                 let idx = self.push_entry(shown, Kind::Running, String::new());
-                self.history[idx].cancel = cancel;
+                let e = self.history.last_mut().expect("just pushed");
+                e.cancel = cancel;
                 if is_chat {
-                    self.history[idx].chat_user = Some(body_str);
+                    e.chat_user = Some(body_str);
                 }
                 let tx = self.updates_tx.clone();
                 std::thread::spawn(move || {
@@ -1198,7 +1225,11 @@ impl TuiApp {
         std::thread::spawn(move || {
             let result = compact_turns(&sched, &system, &from, None, ctx_limit, &cfg, true)
                 .and_then(|r| r.ok_or_else(|| "it saves no tokens".to_string()));
-            let _ = tx.send(Update::Compacted { from, result });
+            let _ = tx.send(Update::Compacted {
+                from,
+                result,
+                before: None,
+            });
         });
         Ok(format!(
             "compacting {} messages ({} mode)…",
@@ -1492,12 +1523,20 @@ impl TuiApp {
                             Ok(None) => prior_turns,
                             Ok(Some((to, report))) => {
                                 let result = Ok((to.clone(), report));
-                                let _ = tx.send(Update::Compacted { from: prior_turns, result });
+                                let _ = tx.send(Update::Compacted {
+                                    from: prior_turns,
+                                    result,
+                                    before: Some(idx),
+                                });
                                 to
                             }
                             Err(e) => {
                                 let from = prior_turns.clone();
-                                let _ = tx.send(Update::Compacted { from, result: Err(e) });
+                                let _ = tx.send(Update::Compacted {
+                                    from,
+                                    result: Err(e),
+                                    before: Some(idx),
+                                });
                                 prior_turns
                             }
                         }
@@ -1973,7 +2012,9 @@ impl TuiApp {
             changed = true;
             match u {
                 Update::Partial { idx, text, tokens } => {
-                    let e = &mut self.history[idx];
+                    let Some(e) = self.entry_mut(idx) else {
+                        continue;
+                    };
                     // A cancelled chat keeps what it showed when cancelled.
                     if e.kind == Kind::Running {
                         (e.output, e.stats) = (text, format!("{tokens} tokens"));
@@ -2029,28 +2070,38 @@ impl TuiApp {
                     };
                     self.push_entry("/bench".into(), kind, text);
                 }
-                Update::Compacted { from, result } => match result {
-                    Ok((to, r)) => {
-                        // Turns committed meanwhile stay after the compacted ones; a history
-                        // cleared or popped meanwhile is left alone.
-                        if self.chat_history.starts_with(&from) {
-                            self.chat_history.splice(..from.len(), to);
+                Update::Compacted {
+                    from,
+                    result,
+                    before,
+                } => {
+                    let (kind, line) = match result {
+                        Ok((to, r)) => {
+                            // Turns committed meanwhile stay after the compacted ones; a history
+                            // cleared or popped meanwhile is left alone.
+                            if !from.is_empty() && self.chat_history.starts_with(&from) {
+                                self.chat_history.splice(..from.len(), to);
+                            }
+                            let line = format!(
+                                "compacted {} → {} tokens (tier1 {}, tier2 {}, tier3 {} turns)",
+                                r.before_tokens,
+                                r.after_tokens,
+                                r.tier1_chars_elided,
+                                r.tier2_chars_shaken,
+                                r.tier3_turns_summarized
+                            );
+                            self.telemetry.log_info(&format!("TUI: {line}"));
+                            (Kind::Text, line)
                         }
-                        let line = format!(
-                            "compacted {} → {} tokens (tier1 {}, tier2 {}, tier3 {} turns)",
-                            r.before_tokens,
-                            r.after_tokens,
-                            r.tier1_chars_elided,
-                            r.tier2_chars_shaken,
-                            r.tier3_turns_summarized
-                        );
-                        self.telemetry.log_info(&format!("TUI: {line}"));
-                        self.push_entry("/compact".into(), Kind::Text, line);
+                        Err(e) => (Kind::Error, format!("not compacted: {e}")),
+                    };
+                    match before {
+                        Some(id) => self.insert_entry_before(id, "/compact".into(), kind, line),
+                        None => {
+                            self.push_entry("/compact".into(), kind, line);
+                        }
                     }
-                    Err(e) => {
-                        self.push_entry("/compact".into(), Kind::Error, format!("not compacted: {e}"));
-                    }
-                },
+                }
                 Update::Probe(res) => {
                     self.roofline_probe_result = res.as_ref().ok().cloned();
                     match &res {
@@ -2069,7 +2120,9 @@ impl TuiApp {
 
     /// Final state of a running entry; entries already finished (e.g. cancelled) stay as they are.
     fn finish(&mut self, idx: usize, kind: Kind, text: String, stats: String) {
-        let e = &mut self.history[idx];
+        let Some(e) = self.history.iter_mut().rev().find(|e| e.id == idx) else {
+            return;
+        };
         if e.kind != Kind::Running {
             return;
         }
@@ -2197,7 +2250,7 @@ impl TuiApp {
                 l.sample = (Instant::now(), done);
             }
             let text = l.progress_text();
-            if let Some(e) = self.history.get_mut(l.idx) {
+            if let Some(e) = self.history.iter_mut().rev().find(|e| e.id == l.idx) {
                 if e.output != text {
                     e.output = text;
                     dirty = true;
