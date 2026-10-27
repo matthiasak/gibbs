@@ -147,6 +147,11 @@ struct Cli {
     #[arg(long)]
     ctx: Option<usize>,
 
+    /// KV cache memory budget in GiB across every model's page pool (default: 25% of RAM).
+    /// Past it, unused cached prefixes are evicted; then requests fail with `KV memory exhausted`.
+    #[arg(long)]
+    kv_mem: Option<f64>,
+
     /// GPU weight re-encode policy: max-speed | low-bit-native | bit-exact (default: settings.json, else max-speed).
     #[arg(long)]
     reencode: Option<String>,
@@ -265,6 +270,12 @@ fn run_video(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Some(gib) = cli.kv_mem {
+        if !(gib > 0.0) {
+            return Err(format!("--kv-mem {gib}: needs a positive number of GiB").into());
+        }
+        gibbs_engine::kv::set_kv_mem_budget((gib * (1u64 << 30) as f64) as usize);
+    }
     if let Some(v) = &cli.variant {
         gibbs_engine::model::variant::set_policy_override(Some(v.parse()?));
     }
