@@ -1168,6 +1168,8 @@ fn every_kernel_source_compiles() {
 /// (which dequantizes through `dequantize_*_block`), with and without a bias epilogue.
 #[test]
 fn gemv_matches_cpu_for_every_packed_format() {
+    // The CPU executor is the exact reference.
+    let _exact = crate::model::qdot::exact();
     use crate::model::layers::gguf_block_codec;
     let formats = [
         QuantFormat::GGUF_Q4_1,
@@ -1288,6 +1290,8 @@ fn gemv_matches_cpu_for_every_packed_format() {
 
 #[test]
 fn megakernel_mlp_matches_cpu_for_every_variant() {
+    // The CPU executor is the exact reference.
+    let _exact = crate::model::qdot::exact();
     use crate::model::layers::gguf_block_codec;
     for f in [
         QuantFormat::GGUF_Q4_0,
@@ -1418,6 +1422,8 @@ fn megakernel_mlp_matches_cpu_for_every_variant() {
 /// not a multiple of 8.
 #[test]
 fn tq2_0_planar_layout_matches_cpu() {
+    // The CPU executor is the exact reference.
+    let _exact = crate::model::qdot::exact();
     let f = QuantFormat::GGUF_TQ2_0;
     let mut seed = 0x2545F4914F6CDD1Du64;
     let mut next = move || {
@@ -1610,6 +1616,8 @@ fn packed_linear_activation_epilogues_match_cpu_at_every_m() {
 
 #[test]
 fn gemv_q8_0_matches_cpu() {
+    // The CPU executor is the exact reference.
+    let _exact = crate::model::qdot::exact();
     let (m, n, k) = (3, 37, 32 * 40);
     let mut g = Graph::new();
     let x = g.input("x", vec![m, k], DType::F32);
@@ -1657,6 +1665,8 @@ fn gemv_q8_0_matches_cpu() {
 
 #[test]
 fn gemv_q4_0_matches_cpu() {
+    // The CPU executor is the exact reference.
+    let _exact = crate::model::qdot::exact();
     let (m, n, k) = (2, 37, 32 * 40);
     let mut g = Graph::new();
     let x = g.input("x", vec![m, k], DType::F32);
@@ -1704,6 +1714,8 @@ fn gemv_q4_0_matches_cpu() {
 }
 #[test]
 fn gemv_q4_0_residual_matches_cpu() {
+    // The CPU executor is the exact reference.
+    let _exact = crate::model::qdot::exact();
     let (m, n, k) = (1, 37, 32 * 40);
     let mut g = Graph::new();
     let x = g.input("x", vec![m, k], DType::F32);
@@ -1987,6 +1999,8 @@ fn test_tiled_gemv_roofline_saturation() {
 
 #[test]
 fn gemm_batched_packed_matches_cpu() {
+    // The CPU executor is the exact reference.
+    let _exact = crate::model::qdot::exact();
     let (m, n, k) = (32, 64, 64);
     // 1. BF16
     {
@@ -3861,6 +3875,8 @@ fn moe_subgraph_fusions_match_cpu() {
 
 #[test]
 fn gemv_packed_pair_small_rows_matches_cpu() {
+    // The CPU executor is the exact reference.
+    let _exact = crate::model::qdot::exact();
     use crate::model::layers::gguf_block_codec;
     for f in [
         QuantFormat::GGUF_Q4_K_M,

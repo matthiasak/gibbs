@@ -1,13 +1,38 @@
 //! Direct quantized linears for the CPU executor. Activations are quantized once per call into
 //! ggml's `Q8_0` (32 × i8, f32 `d`) or `Q8_K` (256 × i8, f32 `d`, 16 × i16 `bsums`) layout and
 //! dotted against the packed weight blocks with `sdot`; every other format decodes each weight
-//! block once per task and FMAs it against every activation row.
+//! block once per task and FMAs it against every activation row. CPU runs that serve as a
+//! numerical reference hold [`exact`], which keeps activations in f32.
 
 use crate::hardware::QuantFormat as Q;
 use crate::model::nn;
 use crate::model::par::OutPtr;
 use crate::model::weights::Mat;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static EXACT: AtomicUsize = AtomicUsize::new(0);
+
+/// While held (by any thread), linears keep activations in f32 instead of quantizing them to
+/// int8: load-time constant evaluation, parity checks and kernel tests use the CPU as an exact
+/// reference.
+#[must_use]
+pub fn exact() -> ExactGuard {
+    EXACT.fetch_add(1, Ordering::SeqCst);
+    ExactGuard(())
+}
+
+pub struct ExactGuard(());
+
+impl Drop for ExactGuard {
+    fn drop(&mut self) {
+        EXACT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn quantize_activations() -> bool {
+    EXACT.load(Ordering::SeqCst) == 0
+}
 
 /// Output rows per task.
 const TASK_ROWS: usize = 64;
@@ -58,9 +83,10 @@ fn i8mm() -> bool {
     false
 }
 
-/// `linear_q` runs `smmla` kernels for `f` when the activation has two or more rows.
+/// `linear_q` runs `smmla` kernels for `f` when the activation has two or more rows (never under
+/// [`exact`]).
 pub fn i8mm_format(f: Q) -> bool {
-    i8mm() && kernel(Path::I8mm, f).is_some()
+    quantize_activations() && i8mm() && kernel(Path::I8mm, f).is_some()
 }
 
 /// Quantized activations: `qs` [rows, cols], `d` one scale per block, `bs` per-16 sums (`Q8_K`).
@@ -218,7 +244,7 @@ fn quant_kernel(m: &Mat, path: Path) -> Option<(Kernel, Act)> {
 fn path_for(m: &Mat, rows: usize) -> Path {
     match m.packed() {
         Some(p) if rows >= 2 && i8mm_format(p.format) => Path::I8mm,
-        _ if dotprod() => Path::Dot,
+        _ if dotprod() && quantize_activations() => Path::Dot,
         _ => Path::Generic,
     }
 }
@@ -274,6 +300,66 @@ fn bind<'a>(job: &mut Job<'a>, act: Act, a: &'a QAct, r0: usize) {
     job.w = &p.map[p.off..p.off + job.m.rows * job.row_bytes];
     job.a = a.view(act, job.cols, r0);
     assert!(job.a.qs.len() >= job.rows * job.cols);
+}
+
+/// `Op::MoeLinear` rows: `out[s * n + j] = m[w_row[s] + j] · x[x_row[s]]` for every slot `s` and
+/// `j < n`; each `x` row is quantized once however many slots read it.
+pub(crate) fn gather_linear(
+    m: &Mat,
+    x: &[f32],
+    slots: &[(usize, usize)],
+    n: usize,
+    out: &mut [f32],
+) {
+    let cols = m.cols;
+    assert_eq!(x.len() % cols, 0, "gather_linear: x is not rows * cols");
+    assert_eq!(out.len(), slots.len() * n, "gather_linear: out is not slots * n");
+    assert!(
+        slots
+            .iter()
+            .all(|&(xr, wr)| (xr + 1) * cols <= x.len() && wr + n <= m.rows),
+        "gather_linear: slot out of range"
+    );
+    let o = OutPtr::new(out);
+    let blocks = n.div_ceil(TASK_ROWS);
+    let parallel = slots.len() * n * cols >= nn::PAR_MIN_FLOPS;
+    let quant = quant_kernel(m, path_for(m, 1));
+    let go = |a: Option<&QAct>| {
+        nn::par_tasks::<()>(slots.len() * blocks, parallel, |_, t| {
+            let (s, b) = (t / blocks, t % blocks);
+            let (xr, wr) = slots[s];
+            let mut job = Job {
+                m,
+                w: &[],
+                row_bytes: 0,
+                wrow0: wr,
+                cols,
+                rows: 1,
+                x: &x[xr * cols..][..cols],
+                a: ActRef { qs: &[], d: &[], bs: &[] },
+                out: o,
+                out_off: s * n,
+                ldo: n,
+                bias: None,
+            };
+            let k = match (quant, a) {
+                (Some((k, act)), Some(a)) => {
+                    bind(&mut job, act, a, xr);
+                    k
+                }
+                _ => generic,
+            };
+            // SAFETY: task `t` owns cells `(s, b * TASK_ROWS..)`; `bind` checked the inputs.
+            unsafe { k(&job, b * TASK_ROWS, ((b + 1) * TASK_ROWS).min(n)) }
+        });
+    };
+    match quant {
+        Some((_, act)) => SCRATCH.with_borrow_mut(|a| {
+            quantize(act, x, cols, a);
+            go(Some(a));
+        }),
+        None => go(None),
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

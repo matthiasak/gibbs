@@ -780,6 +780,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
             }
         };
         let _lock = crate::hardware::gpu_lock()?;
+        let _exact = crate::model::qdot::exact();
 
         // Load Native Metal and CPU models for bit-parity verification
         // The CPU leg is the deliberate reference: only its load and forwards run under `allow`, so the

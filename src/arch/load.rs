@@ -2323,6 +2323,7 @@ fn precompute(
     // A load-time weight transform like `transforms`, not inference: allowed under the GPU-only
     // tripwire.
     let _load_time = crate::hardware::cpu_compute::allow();
+    let _exact = crate::model::qdot::exact();
     let mut p = crate::graph::program::GraphProgram::compile(
         inst.graph,
         w,

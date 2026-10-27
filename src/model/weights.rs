@@ -94,55 +94,16 @@ impl Mat {
     pub fn row(&self, r: usize) -> &[u16] {
         &self.data()[r * self.cols..(r + 1) * self.cols]
     }
+    /// Decodes the first `out.len()` (at most `cols`) values of row `r` into `out`.
     pub fn decode_row_f32(&self, r: usize, out: &mut [f32]) {
-        if let Buf::Packed(p) = &self.buf {
-            let row_bytes = p.format.tensor_bytes(self.cols);
-            let off = p.off + r * row_bytes;
-            if off + row_bytes <= p.map.len() {
-                let slice = &p.map[off..off + row_bytes];
-                if p.format == crate::hardware::QuantFormat::FP16 {
-                    for (o, c) in out.iter_mut().zip(slice.chunks_exact(2)) {
-                        *o = crate::model::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
-                    }
-                    return;
-                }
-                if p.format == crate::hardware::QuantFormat::BF16 {
-                    for (o, c) in out.iter_mut().zip(slice.chunks_exact(2)) {
-                        *o = crate::model::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]));
-                    }
-                    return;
-                }
-                if p.format == crate::hardware::QuantFormat::FP32 {
-                    for (o, c) in out.iter_mut().zip(slice.chunks_exact(4)) {
-                        *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                    }
-                    return;
-                }
-                if let Some(v) = crate::model::layers::dequantize_gguf_blocks(p.format, slice) {
-                    let n = out.len().min(v.len());
-                    out[..n].copy_from_slice(&v[..n]);
-                    return;
-                }
-            }
-            let full = self.to_f32();
-            let start = r * self.cols;
-            let end = (start + self.cols).min(full.len());
-            if start < end {
-                let n = out.len().min(end - start);
-                out[..n].copy_from_slice(&full[start..start + n]);
-            }
-            return;
-        }
-        for (o, &v) in out.iter_mut().zip(self.row(r)) {
-            *o = bf16_to_f32(v);
-        }
+        let n = out.len().min(self.cols);
+        self.decode_slice_f32(r, 0, &mut out[..n]);
     }
-    /// Decodes `dst.len()` values starting at column `p0` of row `r` into `dst`.
-    /// `p0` must be a multiple of the packed format's block size (e.g. 256 in [`crate::model::nn::matmul_rows`]).
+    /// Decodes `dst.len()` values starting at column `p0` of row `r` into `dst`, block by block
+    /// straight from the stored encoding (blocks straddling the range decode on the stack).
     pub fn decode_slice_f32(&self, r: usize, p0: usize, dst: &mut [f32]) {
         if let Buf::Packed(p) = &self.buf {
-            let row_bytes = p.format.tensor_bytes(self.cols);
-            let row_off = p.off + r * row_bytes;
+            let row_off = p.off + r * p.format.tensor_bytes(self.cols);
             let n = dst.len();
             if p.format == crate::hardware::QuantFormat::FP16 {
                 let start = row_off + p0 * 2;
@@ -174,61 +135,33 @@ impl Mat {
                 }
                 return;
             }
-            if let Some((elems, block_bytes, decode)) =
+            let Some((elems, block_bytes, decode)) =
                 crate::model::layers::gguf_block_codec(p.format)
-            {
-                if p0 % elems == 0 && n % elems == 0 {
-                    let start = row_off + (p0 / elems) * block_bytes;
-                    let bytes = (n / elems) * block_bytes;
-                    if start + bytes <= p.map.len() {
-                        for (b, out_blk) in p.map[start..start + bytes]
-                            .chunks_exact(block_bytes)
-                            .zip(dst.chunks_exact_mut(elems))
-                        {
-                            decode(b, out_blk);
-                        }
-                        return;
-                    }
+            else {
+                panic!("cannot decode {:?} blocks", p.format);
+            };
+            let (b0, b1) = (p0 / elems, (p0 + n).div_ceil(elems));
+            let blocks = &p.map[row_off + b0 * block_bytes..row_off + b1 * block_bytes];
+            if p0 % elems == 0 && n % elems == 0 {
+                for (b, out_blk) in blocks
+                    .chunks_exact(block_bytes)
+                    .zip(dst.chunks_exact_mut(elems))
+                {
+                    decode(b, out_blk);
                 }
+                return;
             }
-            let mut full_row = vec![0.0f32; self.cols];
-            self.decode_row_f32(r, &mut full_row);
-            dst.copy_from_slice(&full_row[p0..p0 + n]);
+            let mut t = [0.0f32; 256];
+            for (i, b) in blocks.chunks_exact(block_bytes).enumerate() {
+                let s = (b0 + i) * elems;
+                decode(b, &mut t[..elems]);
+                let (lo, hi) = (s.max(p0), (s + elems).min(p0 + n));
+                dst[lo - p0..hi - p0].copy_from_slice(&t[lo - s..hi - s]);
+            }
             return;
         }
         for (o, &v) in dst.iter_mut().zip(&self.row(r)[p0..]) {
             *o = bf16_to_f32(v);
-        }
-    }
-    /// Vector-matrix product `x` [k] · `self`^T [k x n] -> `out` [n] for decode (single-row GEMV).
-    /// If self is packed Q4_0, executes vector GEMV directly on the packed blocks without dequantization allocations.
-    pub fn gemv_f32(&self, x: &[f32], out: &mut [f32]) {
-        let (k, n) = (self.cols, self.rows);
-        assert_eq!(x.len(), k);
-        assert_eq!(out.len(), n);
-        if let Some(p) = self.packed() {
-            if p.format == crate::hardware::QuantFormat::GGUF_Q4_0 {
-                let len = p.format.tensor_bytes(n * k);
-                let slice = &p.map[p.off..p.off + len];
-                crate::model::simd::vector_gemv_q4_0_f32_nobias(slice, k, n, x, out);
-                return;
-            }
-            let per = n.div_ceil(crate::model::par::threads() * 4).max(16);
-            let o = OutPtr::new(out);
-            par_for(n.div_ceil(per), &|t| {
-                let (j0, j1) = (t * per, ((t + 1) * per).min(n));
-                let mut row_buf = vec![0.0f32; k];
-                // SAFETY: columns j0..j1 belong to task t.
-                let dst = unsafe { o.slice(j0, j1 - j0) };
-                for (d, j) in dst.iter_mut().zip(j0..j1) {
-                    self.decode_row_f32(j, &mut row_buf);
-                    *d = crate::model::simd::vector_dot_product(&row_buf, x);
-                }
-            });
-            return;
-        }
-        for (j, o) in out.iter_mut().enumerate() {
-            *o = crate::model::par::dot_bf16(self.row(j), x);
         }
     }
     pub fn to_f32(&self) -> Vec<f32> {
@@ -1038,14 +971,17 @@ mod tests {
         // Test GEMV
         let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.1).sin()).collect();
         let mut out_gemv = vec![0.0f32; rows];
-        mat.gemv_f32(&x, &mut out_gemv);
+        crate::model::qdot::linear_q(&mat, &x, 1, None, &mut out_gemv);
 
         // Reference GEMV using full to_f32
+        let w = mat.to_f32();
         let mut ref_out = vec![0.0f32; rows];
-        crate::model::nn::matmul_nt(&x, &mat.to_f32(), None, 1, cols, rows, &mut ref_out);
+        crate::model::nn::matmul_nt(&x, &w, None, 1, cols, rows, &mut ref_out);
 
-        for (a, b) in out_gemv.iter().zip(&ref_out) {
-            assert!((a - b).abs() < 1e-4, "gemv {a} vs ref {b}");
+        for (j, (a, b)) in out_gemv.iter().zip(&ref_out).enumerate() {
+            // Int8 activations err by at most half a step (max|x| / 254 <= 1 / 254) per element.
+            let tol = w[j * cols..][..cols].iter().map(|v| v.abs()).sum::<f32>() / 250.0 + 1e-4;
+            assert!((a - b).abs() < tol, "gemv {a} vs ref {b}");
         }
     }
 }
