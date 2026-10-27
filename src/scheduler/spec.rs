@@ -4,6 +4,9 @@
 //! outputs are identical to plain decoding; sampling uses standard rejection sampling (accept a
 //! draft `x` with probability `min(1, p(x)/q(x))`, else draw from `max(0, p - q)`), so the output
 //! distribution is the target's. Rejected positions are rewound with [`NativeLm::truncate`].
+//! A drafter that [`Drafter::overlaps`] proposes the next step's drafts on a fork of its state
+//! while the target verifies; they replace the next propose when every draft was accepted and
+//! the target's bonus token is the one they assumed.
 //!
 //! [`NativeLm::forward_all`]: crate::model::native::NativeLm::forward_all
 //! [`NativeLm::truncate`]: crate::model::native::NativeLm::truncate
@@ -78,6 +81,19 @@ pub struct SpecSeq {
     /// prompt or a run of plain steps make the next step's time unrepresentative).
     synced: bool,
     rng: Rng,
+    prefetched: Option<Prefetch>,
+}
+
+/// Drafts an overlapping drafter proposed during the previous verify, assuming it accepted every
+/// draft and emitted the bonus token they start after.
+struct Prefetch {
+    /// The sequence length they follow.
+    len: usize,
+    drafts: Vec<u32>,
+    /// Their draft distributions (sampled picks only).
+    qs: Vec<Vec<(u32, f32)>>,
+    /// The drafter state that proposed them.
+    state: DraftState,
 }
 
 impl SpecSeq {
@@ -95,6 +111,7 @@ impl SpecSeq {
             pending: Vec::new(),
             synced: false,
             rng: Rng::new(seed),
+            prefetched: None,
         })
     }
 
@@ -165,7 +182,14 @@ pub(super) fn decode(
     let valid = |n: usize| if vocab > 0 { n.min(vocab) } else { n };
     let greedy = temp <= 1e-4;
     let mut qs = Vec::new();
-    let drafts = if k == 0 {
+    let prefetched = spec.prefetched.take().filter(|p| p.len == all.len());
+    let drafts = if let Some(p) = prefetched {
+        spec.draft = p.state;
+        let n = p.drafts.len().min(k);
+        qs = p.qs;
+        qs.truncate(n);
+        p.drafts[..n].to_vec()
+    } else if k == 0 {
         let _ = spec
             .drafter
             .propose(&mut spec.draft, all, &spec.pending, 0, &mut |_| 0);
@@ -207,7 +231,11 @@ pub(super) fn decode(
     let mut input = Vec::with_capacity(drafts.len() + 1);
     input.push(last);
     input.extend_from_slice(&drafts);
-    let logits = m.forward_all(&input, start, kv)?;
+    let (logits, ahead) = if spec.drafter.overlaps() {
+        verify_overlapped(m, spec, all, &drafts, &input, kv, (temp, top_p, vocab))?
+    } else {
+        (m.forward_all(&input, start, kv)?, None)
+    };
     if logits.is_empty() || logits.len() % input.len() != 0 {
         return Err(format!(
             "verify returned {} logits for {} positions",
@@ -249,8 +277,23 @@ pub(super) fn decode(
             break;
         }
     }
+    // The drafts proposed during the verify stand when it accepted every draft and its bonus
+    // token is the one they assumed.
+    let kept = ahead.filter(|(d, ..)| {
+        out.len() == drafts.len() + 1 && d.len() > 1 && d.first() == out.last()
+    });
+    spec.prefetched = kept.map(|(d, state, qs)| Prefetch {
+        len: all.len() + out.len(),
+        drafts: d[1..].to_vec(),
+        qs: qs.into_iter().skip(1).collect(),
+        state,
+    });
+    let st = match &mut spec.prefetched {
+        Some(p) => &mut p.state,
+        None => &mut spec.draft,
+    };
     spec.drafter
-        .observe(&mut spec.draft, &out, &logits[..out.len() * width], width);
+        .observe(st, &out, &logits[..out.len() * width], width);
     // The target keeps `last` and the accepted drafts; the final token has not run yet.
     m.truncate(kv, start + out.len())?;
     let taps = m.take_taps(kv);
@@ -263,6 +306,46 @@ pub(super) fn decode(
         synced,
         logprobs,
     })
+}
+
+/// Next-step drafts proposed during a verify, the state that proposed them and their picks.
+type Ahead = (Vec<u32>, DraftState, Vec<Vec<(u32, f32)>>);
+
+/// The verify forward of `input`, while a scoped thread brings the drafter up to `all` (a
+/// prefetched step proposed nothing yet) and proposes on a fork of its state the bonus token
+/// and the next step's `drafts.len()` drafts, assuming every draft is accepted.
+fn verify_overlapped(
+    m: &ExecutableModel,
+    spec: &mut SpecSeq,
+    all: &[u32],
+    drafts: &[u32],
+    input: &[u32],
+    kv: &mut Option<SeqState>,
+    (temp, top_p, vocab): (f32, f32, usize),
+) -> Result<(Vec<f32>, Option<Ahead>), String> {
+    let seed = spec.rng.next_u64();
+    let mut st = std::mem::replace(&mut spec.draft, Box::new(()));
+    let drafter = &*spec.drafter;
+    let toks = [all, drafts].concat();
+    let (logits, joined) = std::thread::scope(|sc| {
+        let h = sc.spawn(move || {
+            let _ = drafter.propose(&mut st, all, &[], 0, &mut |_| 0);
+            let ahead = drafter.fork_state(&st).and_then(|mut fork| {
+                let (mut rng, mut qs) = (Rng::new(seed), Vec::new());
+                let d = drafter
+                    .propose(&mut fork, &toks, &[], drafts.len() + 1, &mut |l| {
+                        pick(l, temp, top_p, vocab, &mut rng, &mut qs)
+                    })
+                    .ok()?;
+                Some((d, fork, qs))
+            });
+            (st, ahead)
+        });
+        (m.forward_all(input, all.len() - 1, kv), h.join())
+    });
+    let (st, ahead) = joined.map_err(|_| "the overlapped drafter panicked".to_string())?;
+    spec.draft = st;
+    Ok((logits?, ahead))
 }
 
 /// Chooses a draft token from `l` the way the scheduler samples (`vocab`: the tokenizer's size, 0 =
@@ -685,6 +768,96 @@ impl KTuner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An overlapping drafter that drafts `script` (wrong at the indices in `bad`) and counts the
+    /// proposals that draft.
+    struct Oracle {
+        script: Vec<u32>,
+        bad: Vec<usize>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Drafter for Oracle {
+        fn label(&self) -> String {
+            "oracle".into()
+        }
+        fn tap_layers(&self) -> Vec<usize> {
+            Vec::new()
+        }
+        fn new_state(&self) -> DraftState {
+            Box::new(())
+        }
+        fn overlaps(&self) -> bool {
+            true
+        }
+        fn fork_state(&self, _: &DraftState) -> Option<DraftState> {
+            Some(Box::new(()))
+        }
+        fn propose(
+            &self,
+            _: &mut DraftState,
+            tokens: &[u32],
+            _: &[f32],
+            k: usize,
+            pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
+        ) -> Result<Vec<u32>, String> {
+            if k > 0 {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let end = (tokens.len() + k).min(self.script.len());
+            Ok((tokens.len()..end)
+                .map(|i| {
+                    let t = self.script[i] ^ u32::from(self.bad.contains(&i));
+                    pick(DraftLogits::Sparse {
+                        ids: &[t],
+                        logits: &[0.0],
+                    })
+                })
+                .collect())
+        }
+    }
+
+    /// Drafts proposed during a verify replace the next propose only after that verify accepted
+    /// every draft and emitted the bonus token they assumed; greedy output is unchanged.
+    #[test]
+    fn prefetched_drafts_used_only_after_full_accept() {
+        use crate::model::native::PrepareCtx;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = serde_json::json!({"max_position_embeddings": 512});
+        let m = crate::arch::testing::synthetic_lm(dir.path(), cfg, crate::hardware::Device::Cpu);
+        let prompt = vec![5u32, 9, 13, 2];
+        let fresh = || {
+            let (ids, mut st) = m.prepare(prompt.clone(), &[], &PrepareCtx::default()).unwrap();
+            m.prefill_logits(&ids[..ids.len() - 1], 0, &mut st).unwrap();
+            st
+        };
+        let (mut script, mut st) = (prompt.clone(), fresh());
+        while script.len() < 20 {
+            let last = *script.last().unwrap();
+            let (t, _) = m
+                .step_token_with_kv(&script, last, script.len(), 0.0, 1.0, None, &mut st)
+                .unwrap();
+            script.push(t);
+        }
+        let oracle = Arc::new(Oracle {
+            script: script.clone(),
+            bad: vec![8, 11],
+            calls: Default::default(),
+        });
+        let mut kv = fresh();
+        let mut spec = SpecSeq::start(&m, oracle.clone(), &mut kv, 7).unwrap();
+        let (mut all, mut calls) = (prompt.clone(), Vec::new());
+        for _ in 0..4 {
+            let s = decode(&m, &mut spec, &all, &mut kv, 0.0, 1.0, 256, 2, None).unwrap();
+            all.extend(s.tokens);
+            calls.push(oracle.calls.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        assert_eq!(all, script[..all.len()], "greedy output changed");
+        // 1: propose + run ahead (accepted, bonus as assumed). 2: the prefetch, no propose; its
+        // wrong draft at 8 drops the next one. 3: propose + run ahead; the bonus at 11 is not the
+        // one assumed. 4: propose again.
+        assert_eq!(calls, [2, 3, 5, 7]);
+    }
 
     /// A sparse draft (candidate ids only, over a support that misses target tokens and adds one
     /// the target excludes) verified by rejection sampling emits exactly the target's
