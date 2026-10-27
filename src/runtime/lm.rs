@@ -56,6 +56,9 @@ struct Runtime {
     bidir_media_blocks: bool,
     #[serde(default)]
     media: Option<serde_json::Value>,
+    /// Thinking delimiters, consecutive elements forming `(open, close)` pairs.
+    #[serde(default)]
+    thinking_delimiters: Vec<String>,
 }
 
 fn prefill_rows() -> usize {
@@ -291,6 +294,11 @@ impl SpecLm {
         crate::arch::load::check(&model)?;
         let fam = model.spec.family.clone();
         let rt: Runtime = model.spec.runtime_as()?;
+        if rt.thinking_delimiters.len() % 2 != 0 {
+            return Err(format!(
+                "{fam}: runtime.thinking_delimiters needs open/close pairs"
+            ));
+        }
         let tok = match (&model.tokenizer, model.ckpt.synthetic) {
             (Some(t), _) => t.clone(),
             // Synthetic (random-weight) ids ship no tokenizer.
@@ -977,6 +985,18 @@ impl NativeLm for SpecLm {
         Some(crate::runtime::noise_draft::OnlineNoiseDrafter::new(
             layers, hidden, vocab, knobs,
         ))
+    }
+
+    fn thinking_delimiters(&self) -> Vec<(String, String)> {
+        self.rt
+            .thinking_delimiters
+            .chunks_exact(2)
+            .map(|p| (p[0].clone(), p[1].clone()))
+            .collect()
+    }
+
+    fn has_vision(&self) -> bool {
+        self.media.contains_key("image") && !self.off.contains_key("image")
     }
 
     fn export_kv_snapshot(

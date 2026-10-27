@@ -267,6 +267,16 @@ impl ExecutableModel {
         };
         self.0.restore_kv_prefix(st, snap, prefix_len)
     }
+
+    /// [`NativeLm::thinking_delimiters`].
+    pub fn thinking_delimiters(&self) -> Vec<(String, String)> {
+        self.0.thinking_delimiters()
+    }
+
+    /// [`NativeLm::has_vision`].
+    pub fn has_vision(&self) -> bool {
+        self.0.has_vision()
+    }
 }
 
 /// `chosen`'s probability, the top `top_k` candidates and the exact entropy of `logits`.

@@ -157,6 +157,12 @@ pub struct ReencodeConfig {
     /// The feed-forward weights `ffn_only` keeps (`arch::glob` patterns over canonical names),
     /// from an active spec's `runtime.ffn_weights`; `None` = the built-in name test.
     pub ffn_weights: Option<Arc<Vec<String>>>,
+    /// Weights held to the LM head's re-encode error floor (`arch::glob` patterns over canonical
+    /// names), from an active spec's `runtime.sensitive_weights`.
+    pub sensitive_weights: Option<Arc<Vec<String>>>,
+    /// The checkpoint's layer count (one past the highest layer index in its tensor names), so
+    /// the last layer's attention counts as a boundary layer.
+    pub total_layers: Option<usize>,
     /// `--quant <fmt>`: every spec-loaded weight matrix is stored as this format (f32/f16/bf16
     /// or an encodable `graph::codec` block format) instead of its checkpoint encoding.
     pub force: Option<crate::hardware::QuantFormat>,
