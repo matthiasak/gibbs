@@ -10,8 +10,8 @@
 //!   `ceil((w + m - 1) / 64) + 1` pages (`m` = most rows one run writes, so 1 for decode), logical
 //!   page `p` maps to `ring[p % len]`, and rings are never shared. Each class has its own page-id
 //!   space and refcounts, and per paged name slabs of [`SLAB_PAGES`] × [`PAGE_TOKENS`] rows. Growth
-//!   adds a slab per name and never moves a page, so in-flight work stays valid. Elements are f16
-//!   on Metal (f32 with `GIBBS_KV_DTYPE=f32`) and f32 on the CPU.
+//!   adds a slab per name and never moves a page, so in-flight work stays valid. Elements are f32
+//!   (f16 on Metal with `GIBBS_KV_DTYPE=f16`).
 //! - **Row address**: stored row `t` of a name with row width `stride` lives at `kv_row(t)`:
 //!   `lp = t >> 6; if ring { lp %= ring }; pg = table[lp];
 //!   addr = slabs[pg >> 8] + ((pg & 255) * 64 + (t & 63)) * stride`.
@@ -36,9 +36,9 @@
 // objc 0.2's `msg_send!` expands a `cfg(feature = "cargo-clippy")` check.
 #![allow(unexpected_cfgs)]
 
+use crate::graph::PagedState;
 #[cfg(target_os = "macos")]
 use metal::objc::{msg_send, sel, sel_impl};
-use crate::graph::PagedState;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -372,14 +372,22 @@ impl KvPool {
     pub fn add_evictor(&self, cache: &Arc<RadixPrefixCache>) {
         let mut e = self.evictors.lock();
         e.retain(|w| w.strong_count() > 0);
-        if !e.iter().any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(cache))) {
+        if !e
+            .iter()
+            .any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(cache)))
+        {
             e.push(Arc::downgrade(cache));
         }
     }
 
     /// Evicts one cached prefix of any registered cache; false when none is evictable.
     fn evict_cached(&self) -> bool {
-        let caches: Vec<_> = self.evictors.lock().iter().filter_map(|w| w.upgrade()).collect();
+        let caches: Vec<_> = self
+            .evictors
+            .lock()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
         caches.iter().any(|c| c.evict_one())
     }
 
@@ -548,7 +556,8 @@ fn residency_set(
     use metal::objc::runtime::{Class, Object, BOOL, NO};
     // SAFETY: Objective-C calls on live Metal objects; selectors checked before use.
     unsafe {
-        let ok: BOOL = msg_send![device, respondsToSelector: sel!(newResidencySetWithDescriptor:error:)];
+        let ok: BOOL =
+            msg_send![device, respondsToSelector: sel!(newResidencySetWithDescriptor:error:)];
         let desc_class = Class::get("MTLResidencySetDescriptor")?;
         if ok == NO {
             return None;
@@ -576,10 +585,7 @@ fn track(set: Option<*mut metal::objc::runtime::Object>, pool: &KvPool, buf: &me
             let () = msg_send![set, addAllocation: buf];
         },
         None => {
-            UNTRACKED
-                .lock()
-                .unwrap()
-                .push((pool.id, buf.to_owned()));
+            UNTRACKED.lock().unwrap().push((pool.id, buf.to_owned()));
             ANY_UNTRACKED.store(true, Ordering::Relaxed);
         }
     }
@@ -593,7 +599,10 @@ pub fn use_untracked(enc: &metal::ComputeCommandEncoderRef) {
         return;
     }
     let list = UNTRACKED.lock().unwrap();
-    let refs: Vec<&metal::ResourceRef> = list.iter().map(|(_, b)| -> &metal::ResourceRef { b }).collect();
+    let refs: Vec<&metal::ResourceRef> = list
+        .iter()
+        .map(|(_, b)| -> &metal::ResourceRef { b })
+        .collect();
     enc.use_resources(
         &refs,
         metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write,
@@ -769,11 +778,8 @@ impl KvView {
         let old = std::mem::replace(&mut self.tables[class], fresh);
         if !old.is_empty() && at > 0 {
             for lp in at.saturating_sub(w) / PAGE_TOKENS..=(at - 1) / PAGE_TOKENS {
-                self.pool.copy_page(
-                    class,
-                    old[lp % old.len()],
-                    self.tables[class][lp % want],
-                )?;
+                self.pool
+                    .copy_page(class, old[lp % old.len()], self.tables[class][lp % want])?;
             }
         }
         self.pool.release(class, &old);
@@ -814,7 +820,11 @@ impl KvView {
         recurrent: Option<HashMap<String, crate::graph::Tensor>>,
     ) -> Result<KvExport, String> {
         let mut f = self.fork(len)?;
-        let pages = self.pool.full.map(|c| std::mem::take(&mut f.tables[c])).unwrap_or_default();
+        let pages = self
+            .pool
+            .full
+            .map(|c| std::mem::take(&mut f.tables[c]))
+            .unwrap_or_default();
         let full = self.pool.full;
         let boundary = recurrent.map(|recurrent| Boundary {
             len,
@@ -886,7 +896,11 @@ impl KvView {
             return;
         };
         let old = std::mem::take(&mut self.tables[c]);
-        assert_eq!(keep.last(), old.len().checked_sub(1).as_ref(), "the last page stays");
+        assert_eq!(
+            keep.last(),
+            old.len().checked_sub(1).as_ref(),
+            "the last page stays"
+        );
         let (mut kept, mut dropped) = (Vec::with_capacity(keep.len()), Vec::new());
         let mut want = keep.iter().peekable();
         for (lp, pg) in old.into_iter().enumerate() {
@@ -1477,8 +1491,14 @@ mod tests {
             assert_eq!(pool.refcount(0, p), 2);
         }
         b.reserve(101, 100..101).unwrap();
-        assert_eq!(b.tables[0][0], a.tables[0][0], "page 0 is not written: stays shared");
-        assert_ne!(b.tables[0][1], a.tables[0][1], "the written partial page is copied");
+        assert_eq!(
+            b.tables[0][0], a.tables[0][0],
+            "page 0 is not written: stays shared"
+        );
+        assert_ne!(
+            b.tables[0][1], a.tables[0][1],
+            "the written partial page is copied"
+        );
         assert_eq!(pool.refcount(0, a.tables[0][0]), 2);
         assert_eq!(pool.refcount(0, a.tables[0][1]), 1);
         assert_eq!(pool.used_pages(), used + 1);
