@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
     name = "gibbs",
     author = "Gibbs Systems <engineering@gibbs.ai>",
     version = "0.1.0",
-    about = "Gibbs: local inference engine (CPU + Apple Metal)"
+    about = "Gibbs: local inference engine (Metal, CUDA, ROCm, XLA, Intel XPU, CPU)"
 )]
 struct Cli {
     #[arg(short, long, default_value = "HuggingFaceTB/SmolLM2-135M-Instruct")]
@@ -39,8 +39,9 @@ struct Cli {
     #[arg(long)]
     quant: Option<String>,
 
-    /// Compute backend: auto (Metal on Apple Silicon, CPU only where no GPU exists), metal, or
-    /// cpu. `cpu` is the explicit opt-in to the CPU executor.
+    /// Compute backend: auto (the first available of metal, cuda, rocm, xla, intel-xpu; cpu only
+    /// when none is), cpu, metal, ane, cuda, rocm, xla, or intel-xpu. `cpu` is the explicit
+    /// opt-in to the CPU executor; `ane` is not placeable yet and fails as unavailable.
     #[arg(long, default_value = "auto")]
     backend: String,
 
@@ -79,7 +80,7 @@ struct Cli {
     #[arg(long)]
     draft_suffix_min: Option<usize>,
 
-    /// Online learning rate for the forward-only `qlabs.sh/noise` block drafter.
+    /// Online learning rate (0.0..=0.10) for the forward-only `qlabs.sh/noise` block drafter.
     #[arg(long)]
     draft_noise_lr: Option<f32>,
 
@@ -184,7 +185,8 @@ struct Cli {
     #[arg(long)]
     kv_mem: Option<f64>,
 
-    /// GPU weight re-encode policy: max-speed | low-bit-native | bit-exact (default: settings.json, else max-speed).
+    /// GPU weight re-encode policy: max-speed | low-bit-native | min-size | bit-exact (default:
+    /// settings.json, else max-speed).
     #[arg(long)]
     reencode: Option<String>,
 
