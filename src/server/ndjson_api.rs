@@ -219,6 +219,7 @@ pub async fn chat(
                         .expect("compat.ndjson_api.label"),
                     &headers,
                 ),
+                compact: None,
             },
         )
         .await?;
@@ -283,6 +284,7 @@ pub async fn generate(
                         .expect("compat.ndjson_api.label"),
                     &headers,
                 ),
+                compact: None,
             },
         )
         .await?;

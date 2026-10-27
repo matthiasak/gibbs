@@ -155,8 +155,14 @@ pub trait NativeLm: Send + Sync {
         None
     }
 
-    /// An online forward-only (`qlabs.sh/noise`) + suffix-lattice drafter attached to this model's
-    /// hidden-state taps and vocabulary.
+    /// Writes row `id` of the token-embedding table the model's first layer reads into `out` (the
+    /// table's width); `false` when the model has none or `id` is out of range.
+    fn embed_row(&self, _id: u32, _out: &mut [f32]) -> bool {
+        false
+    }
+
+    /// An online drafter ([`crate::runtime::noise_draft::OnlineNoiseDrafter`]) over this model's
+    /// token embeddings ([`Self::embed_row`]) and vocabulary.
     fn online_drafter(
         &self,
         _knobs: Arc<crate::runtime::noise_draft::LiveDraftKnobs>,
@@ -180,6 +186,17 @@ pub trait NativeLm: Send + Sync {
         _snap: &crate::kv::CachedKvSnapshot,
         _prefix_len: usize,
     ) -> bool {
+        false
+    }
+
+    /// The chat template's thinking delimiters as `(open, close)` pairs
+    /// (`runtime.thinking_delimiters`).
+    fn thinking_delimiters(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Whether prompts may attach images (an `image` media encoder that loaded).
+    fn has_vision(&self) -> bool {
         false
     }
 }

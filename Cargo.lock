@@ -1163,6 +1163,7 @@ dependencies = [
  "metal",
  "minijinja",
  "minijinja-contrib",
+ "objc",
  "parking_lot",
  "pytorch-reader",
  "ratatui",

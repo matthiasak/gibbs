@@ -538,6 +538,19 @@ impl TuiApp {
                     dim,
                 ),
             ]),
+            Line::from(vec![
+                Span::styled(" [9] Spec Objective:     ", label),
+                Span::styled(self.draft_knobs.objective.name().to_uppercase(), value),
+                Span::styled(
+                    " — what KTuner maximizes: tok/s or tokens per verify forward  (9: speed / tokens)",
+                    dim,
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" [0] Draft Denoise Steps:", label),
+                Span::styled(format!(" {}", self.draft_knobs.denoise_steps), value),
+                Span::styled("  (0: cycle 1 / 2 / 3 / 4)", dim),
+            ]),
             Line::from(""),
             Line::from(Span::styled(
                 " Esc / F4: Close modal | Enter: Save settings",
