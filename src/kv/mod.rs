@@ -249,6 +249,21 @@ impl KvPool {
         self.index.get(name).copied()
     }
 
+    /// Whether this pool pages every state `other` pages, with the same window, row width and
+    /// element size: separately compiled instances of one network may then share a state.
+    pub fn covers(&self, other: &KvPool) -> bool {
+        other.classes.iter().all(|oc| {
+            oc.names.iter().all(|on| {
+                self.locate(&on.name).is_some_and(|(c, i)| {
+                    let n = &self.classes[c].names[i];
+                    self.classes[c].window == oc.window
+                        && n.row_width == on.row_width
+                        && n.elem == on.elem
+                })
+            })
+        })
+    }
+
     /// Pages some sequence or cache entry references, over every class.
     pub fn used_pages(&self) -> usize {
         let mem = self.mem.lock();

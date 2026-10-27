@@ -723,12 +723,12 @@ pub fn paged_states(graph: &Graph) -> Vec<PagedState> {
             Op::CachedAttention { window, .. } if node.inputs.len() >= 6 => Some(window),
             _ => None,
         };
-        if let (Some(_), Some((k, _)), Some((v, _))) = (
-            attn,
-            state_name(node.inputs[3]),
-            state_name(node.inputs[4]),
-        ) {
-            pairs.push((k, v));
+        if attn.is_some() {
+            if let (Some((k, _)), Some((v, _))) =
+                (state_name(node.inputs[3]), state_name(node.inputs[4]))
+            {
+                pairs.push((k, v));
+            }
         }
         for (i, &x) in node.inputs.iter().enumerate() {
             let Some((name, recurrent)) = state_name(x) else {
