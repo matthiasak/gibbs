@@ -127,6 +127,60 @@ pub fn summarizer_id(s: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Settings a request gives over the saved ones: a chat request's `compact` object, the
+/// `/v1/compact` body and the TUI's `/compact key=value` arguments.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CompactionOverride {
+    pub mode: Option<CompactionMode>,
+    /// [`CompactionConfig::trigger_ratio`].
+    pub trigger: Option<f32>,
+    /// [`CompactionConfig::target_ratio`].
+    pub target: Option<f32>,
+    /// [`CompactionConfig::keep_recent_turns`].
+    #[serde(alias = "keep_recent_turns")]
+    pub keep_turns: Option<usize>,
+    /// `active` or a model id ([`CompactionConfig::summarizer`]).
+    pub summarizer: Option<String>,
+}
+
+impl CompactionOverride {
+    pub fn apply(&self, cfg: &mut CompactionConfig) {
+        if let Some(m) = self.mode {
+            cfg.mode = m;
+        }
+        if let Some(t) = self.trigger {
+            cfg.trigger_ratio = t;
+        }
+        if let Some(t) = self.target {
+            cfg.target_ratio = t;
+        }
+        if let Some(k) = self.keep_turns {
+            cfg.keep_recent_turns = k;
+        }
+        if let Some(s) = &self.summarizer {
+            cfg.summarizer = summarizer_id(s);
+        }
+    }
+
+    /// A summarizer named over HTTP must already be in the local model cache: a request never
+    /// starts a download.
+    pub fn check_local(&self) -> Result<(), String> {
+        match self.summarizer.as_deref().and_then(summarizer_id) {
+            Some(id)
+                if crate::model::hub::HuggingFaceHub::new()
+                    .locate_model(&id)
+                    .weights_path
+                    .is_none() =>
+            {
+                Err(format!(
+                    "compact.summarizer '{id}' is not in the local model cache"
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Telemetry report from a compaction pass.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompactionReport {
