@@ -196,14 +196,13 @@ pub(crate) fn profile_requested() -> bool {
     PROFILE_NEXT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A sampled fed stream's sampler: top-`top_k` at `1 / inv_temp`, nucleus `top_p`, repetition penalty.
+/// A sampled fed stream's sampler: top-`top_k` at `1 / inv_temp`, nucleus `top_p`.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleGpuSpec {
     pub vocab: u32,
     pub top_k: u32,
     pub inv_temp: f32,
     pub top_p: f32,
-    pub rep_penalty: f32,
     pub rng_seed: u64,
 }
 
@@ -214,8 +213,6 @@ struct SampleGpuParams {
     top_k: u32,
     inv_temp: f32,
     top_p: f32,
-    rep_penalty: f32,
-    n_recent: u32,
     rng_seed: u64,
 }
 
@@ -241,8 +238,6 @@ pub struct FedStream {
     /// When the last [`Session::wait_fed`] returned.
     last_wait: Option<Instant>,
     pub(crate) sample_spec: Option<SampleGpuSpec>,
-    pub(crate) recent_buf: Option<Buffer>,
-    pub(crate) recent_len: u32,
 }
 impl FedStream {
     pub(crate) fn in_flight(&self) -> usize {
@@ -312,8 +307,8 @@ use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     BinaryArchiveDescriptor, Buffer, BufferRef, CommandBufferRef, CommandQueue, CompileOptions,
     ComputeCommandEncoderRef, ComputePipelineDescriptor, ComputePipelineDescriptorRef,
-    ComputePipelineState, ComputePipelineStateRef, Device, DeviceRef, Library, MTLComputePipelineState, MTLPipelineOption,
-    MTLResourceOptions, MTLSize, URL,
+    ComputePipelineState, ComputePipelineStateRef, Device, DeviceRef, Library,
+    MTLComputePipelineState, MTLPipelineOption, MTLResourceOptions, MTLSize, URL,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -2008,12 +2003,9 @@ impl Session {
                 *v = match self.variant_override {
                     Some(o) if allowed.contains(&o) => o,
                     Some(_) => f.default_variant(),
-                    None if tune::enabled() && allowed.len() > 1 =>
-                    {
-                        *chosen
-                            .entry((f, rows, cols))
-                            .or_insert_with(|| self.rt.tuned_variant(f, rows, cols))
-                    }
+                    None if tune::enabled() && allowed.len() > 1 => *chosen
+                        .entry((f, rows, cols))
+                        .or_insert_with(|| self.rt.tuned_variant(f, rows, cols)),
                     None => f.default_variant(),
                 };
             }
@@ -2362,7 +2354,11 @@ impl Session {
         write: std::ops::Range<usize>,
     ) -> Result<Vec<Arc<Buffer>>, String> {
         let mut state_bufs: Vec<Arc<Buffer>> = Vec::with_capacity(plan.state_vars.len());
-        if plan.state_vars.iter().any(|(_, n)| self.kv_paged.contains(n)) {
+        if plan
+            .state_vars
+            .iter()
+            .any(|(_, n)| self.kv_paged.contains(n))
+        {
             let view = state
                 .as_mut()
                 .and_then(|st| st.kv.as_mut())
@@ -2536,8 +2532,13 @@ impl Session {
                 _ => None,
             })
             .fold((usize::MAX, 0), |(s, e), (a, b)| (s.min(a), e.max(b)));
-        let state_bufs =
-            self.resolve_state_bufs(graph, plan, state, need_rows, start.min(need_rows)..need_rows)?;
+        let state_bufs = self.resolve_state_bufs(
+            graph,
+            plan,
+            state,
+            need_rows,
+            start.min(need_rows)..need_rows,
+        )?;
 
         let size = plan.arena_size;
         let mut arena = self.arena.lock();
@@ -2698,7 +2699,7 @@ impl Session {
         pos: u32,
         budget: usize,
     ) -> Result<FedStream, String> {
-        self.new_fed_stream_with_sample(graph, plan, state, last, pos, budget, None, &[])
+        self.new_fed_stream_with_sample(graph, plan, state, last, pos, budget, None)
     }
 
     pub(crate) fn new_fed_stream_with_sample(
@@ -2710,7 +2711,6 @@ impl Session {
         pos: u32,
         budget: usize,
         sample_spec: Option<SampleGpuSpec>,
-        recent: &[u32],
     ) -> Result<FedStream, String> {
         // Greedy streams bind output 0 to the ring word, so a step must write it (not a view of it).
         let out = graph.outputs.first();
@@ -2720,22 +2720,6 @@ impl Session {
         let ring = new_shared_buffer(&self.rt.device, 128)?;
         // SAFETY: a fresh 128-byte shared buffer no command buffer uses yet.
         unsafe { *(ring.contents() as *mut u32).add(16) = last };
-        let (recent_buf, recent_len) = if sample_spec.is_some() {
-            let buf = new_shared_buffer(&self.rt.device, 64 * 4)?;
-            let n = recent.len().min(64);
-            if n > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        recent[recent.len() - n..].as_ptr(),
-                        buf.contents() as *mut u32,
-                        n,
-                    );
-                }
-            }
-            (Some(buf), n as u32)
-        } else {
-            (None, 0)
-        };
         let at = pos as usize;
         let state_bufs =
             self.resolve_state_bufs(graph, plan, Some(state), at + budget, at..at + 1)?;
@@ -2750,8 +2734,6 @@ impl Session {
             last,
             last_wait: None,
             sample_spec,
-            recent_buf,
-            recent_len,
         })
     }
 
@@ -2805,7 +2787,7 @@ impl Session {
                 }
             };
             let sample = |enc: &Counted| -> Result<(), String> {
-                let (Some(sp), Some(rb)) = (s.sample_spec, s.recent_buf.as_ref()) else {
+                let Some(sp) = s.sample_spec else {
                     return Ok(());
                 };
                 let p = SampleGpuParams {
@@ -2813,13 +2795,11 @@ impl Session {
                     top_k: sp.top_k,
                     inv_temp: sp.inv_temp,
                     top_p: sp.top_p,
-                    rep_penalty: sp.rep_penalty,
-                    n_recent: s.recent_len.clamp(1, 64),
                     rng_seed: sp
                         .rng_seed
                         .wrapping_add((t as u64).wrapping_mul(0x9E3779B97F4A7C15)),
                 };
-                self.encode_sample(enc, loc(out), (ring, 16 * slot + 4), rb, &p)
+                self.encode_sample(enc, loc(out), (ring, 16 * slot + 4), &p)
             };
             metal::objc::rc::autoreleasepool(|| {
                 use std::sync::atomic::Ordering::Relaxed;
@@ -2851,13 +2831,12 @@ impl Session {
 
     /// Encodes the exact top-k sampler over `p.vocab` f32 `logits`: `sample_topk_part` writes each
     /// 4096-wide span's top-k to `argmax_scratch`, `sample_topk_final` draws from their top-k and
-    /// writes the id to `out`, the `recent` slot, and the kept `(id, prob)` list to scratch offset 0.
+    /// writes the id to `out` and the kept `(id, prob)` list to scratch offset 0.
     fn encode_sample(
         &self,
         enc: &Counted,
         logits: (&Buffer, usize),
         out: (&Buffer, usize),
-        recent: &Buffer,
         p: &SampleGpuParams,
     ) -> Result<(), String> {
         let parts = (p.vocab as usize).div_ceil(SAMPLE_SPAN);
@@ -2870,10 +2849,9 @@ impl Session {
         enc.set_compute_pipeline_state(self.rt.pso("sample_topk_part")?);
         enc.set_buffer(0, Some(logits.0), logits.1 as u64);
         enc.set_buffer(1, Some(scratch), 0);
-        enc.set_buffer(2, Some(recent), 0);
-        set_bytes(enc, 3, p);
+        set_bytes(enc, 2, p);
         enc.dispatch_thread_groups(MTLSize::new(parts as u64, 1, 1), MTLSize::new(256, 1, 1));
-        // Slots 2 (recent ids) and 3 (params) stay bound.
+        // Slot 2 (params) stays bound.
         enc.set_compute_pipeline_state(self.rt.pso("sample_topk_final")?);
         enc.set_buffer(0, Some(scratch), 0);
         enc.set_buffer(1, Some(out.0), out.1 as u64);
@@ -4523,8 +4501,7 @@ fn assign_kv_dtypes(graph: &Graph, steps: &mut [Planned]) -> HashSet<String> {
             ..
         } = &mut s.op
         {
-            *kv_f16 =
-                matches!(&graph.value(*k).kind, ValueKind::State { name, .. } if f16.contains(name));
+            *kv_f16 = matches!(&graph.value(*k).kind, ValueKind::State { name, .. } if f16.contains(name));
         }
     }
     f16
@@ -4622,7 +4599,10 @@ fn fuse_moe_down_wsum(
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
     let range_of = |v: ValueId| -> Option<(usize, usize)> {
         let off = *offsets.get(&v)?;
-        Some((off, off + graph.value(v).shape.iter().product::<usize>() * 4))
+        Some((
+            off,
+            off + graph.value(v).shape.iter().product::<usize>() * 4,
+        ))
     };
     let overlaps = |(a0, a1): (usize, usize), (b0, b1): (usize, usize)| a0 < b1 && b0 < a1;
     let mut i = 0;
@@ -4652,10 +4632,9 @@ fn fuse_moe_down_wsum(
                 && *slots < MOE_GEMM_MIN_SLOTS
                 && el.extra_outs.is_empty()
                 && !graph.outputs.iter().any(|&o| root(o) == root(el.out))
-                && steps
-                    .iter()
-                    .enumerate()
-                    .all(|(j, s)| j == i + 1 || !s.reads.iter().any(|&r| root(r) == root(el.out)))
+                && steps.iter().enumerate().all(|(j, s)| {
+                    j == i + 1 || !s.reads.iter().any(|&r| root(r) == root(el.out))
+                })
                 && range_of(sum.out).is_some_and(|o| {
                     el.reads
                         .iter()

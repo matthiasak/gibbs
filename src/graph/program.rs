@@ -577,9 +577,8 @@ impl GraphProgram {
     }
 
     /// Like [`Self::stream_next`], supporting both greedy (`temp <= 1e-4`) and device-side
-    /// stochastic (`temp > 1e-4`, `top_p`, `rep_penalty`) decoding via the device top-k sampler.
+    /// stochastic (`temp > 1e-4`, `top_p`) decoding via the device top-k sampler.
     #[cfg(target_os = "macos")]
-    #[allow(clippy::too_many_arguments)]
     pub fn stream_next_sampled(
         &mut self,
         last: u32,
@@ -588,8 +587,6 @@ impl GraphProgram {
         valid: usize,
         temp: f32,
         top_p: f32,
-        rep_penalty: f32,
-        recent: &[u32],
     ) -> Result<Option<u32>, String> {
         if temp <= 1e-4 {
             return self.stream_next(last, pos, max_new, valid);
@@ -663,7 +660,6 @@ impl GraphProgram {
                 top_k: crate::scheduler::SAMPLE_TOP_K as u32,
                 inv_temp: 1.0 / temp.max(1e-4),
                 top_p: top_p.clamp(1e-4, 1.0),
-                rep_penalty,
                 rng_seed: seed,
             };
             let s = session.new_fed_stream_with_sample(
@@ -674,7 +670,6 @@ impl GraphProgram {
                 pos,
                 budget,
                 Some(sp),
-                recent,
             )?;
             self.state.stream.0 = Some(Box::new(s));
         }
@@ -722,7 +717,6 @@ impl GraphProgram {
     }
 
     #[cfg(not(target_os = "macos"))]
-    #[allow(clippy::too_many_arguments)]
     pub fn stream_next_sampled(
         &mut self,
         _last: u32,
@@ -731,8 +725,6 @@ impl GraphProgram {
         _valid: usize,
         _temp: f32,
         _top_p: f32,
-        _rep_penalty: f32,
-        _recent: &[u32],
     ) -> Result<Option<u32>, String> {
         Ok(None)
     }
@@ -911,7 +903,7 @@ mod tests {
                     let inputs = vec![Tensor::F32(row.clone()), Tensor::F32(vec![1.0, 2.0, 3.0])];
                     let out = cpu::run_stateless(&head, &Weights::new(), inputs).unwrap();
                     let v = if valid == 0 { n } else { valid.min(n) };
-                    let want = crate::runtime::lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0, 1.0);
+                    let want = crate::runtime::lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0);
                     assert_eq!(
                         out[0],
                         Tensor::U32(vec![want]),
@@ -1028,7 +1020,7 @@ mod tests {
         for pos in 0..10 {
             let last = if pos == 0 { 1 } else { sampled[pos - 1] };
             let tok = prog
-                .stream_next_sampled(last, pos as u32, 10 - pos, vocab, 0.7, 0.9, 1.1, &sampled)
+                .stream_next_sampled(last, pos as u32, 10 - pos, vocab, 0.7, 0.9)
                 .unwrap()
                 .expect("the decode program streams stochastically");
             assert!((tok as usize) < vocab);

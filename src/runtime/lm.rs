@@ -933,7 +933,6 @@ impl NativeLm for SpecLm {
         max_new: usize,
         temp: f32,
         top_p: f32,
-        recent: &[u32],
         state: &mut SeqState,
     ) -> Result<Option<u32>, String> {
         if temp <= 1e-4 {
@@ -957,8 +956,6 @@ impl NativeLm for SpecLm {
             self.tok.vocab_size(),
             temp,
             top_p,
-            1.1,
-            recent,
         );
         std::mem::swap(&mut p.state, &mut seq.state);
         if let Ok(Some(_)) = out {
@@ -1153,68 +1150,24 @@ fn argmax_first(slice: &[f32]) -> usize {
     slice.iter().position(|&v| v == max).unwrap_or(0)
 }
 
-/// Samples a token id from `slice` (logits over the tokenizer's vocabulary) with repetition
-/// penalty, top-k, and nucleus top-p; `temperature <= 1e-4` is greedy argmax. Shared by every
-/// causal LM the scheduler runs.
+/// Samples a token id from `slice` (logits over the tokenizer's vocabulary) with top-k and nucleus
+/// top-p, the draw seeded by `recent_tokens`; `temperature <= 1e-4` is greedy argmax. Shared by
+/// every causal LM the scheduler runs.
 pub fn sample_logits(
     slice: &[f32],
     recent_tokens: &[u32],
     temperature: f32,
     top_k: usize,
     top_p: f32,
-    repetition_penalty: f32,
 ) -> u32 {
     if slice.is_empty() {
         return 0;
     }
     if temperature <= 1e-4 {
-        if repetition_penalty <= 1.0 || recent_tokens.is_empty() {
-            return argmax_first(slice) as u32;
-        }
-
-        // When repetition penalty > 1.0, find global unpenalized argmax first.
-        let best_idx = argmax_first(slice);
-
-        // Penalty strictly decreases/non-increases logits. If the unpenalized max
-        // is not among recent tokens, it is guaranteed to remain the global max.
-        if !recent_tokens.contains(&(best_idx as u32)) {
-            return best_idx as u32;
-        }
-
-        let mut penalized_best_idx = 0;
-        let mut penalized_best_val = f32::NEG_INFINITY;
-        for (i, &raw_val) in slice.iter().enumerate() {
-            let tok_id = i as u32;
-            let count = recent_tokens.iter().filter(|&&t| t == tok_id).count();
-            let val = if count > 0 {
-                let mut v = raw_val;
-                for _ in 0..count {
-                    if v > 0.0 {
-                        v /= repetition_penalty;
-                    } else {
-                        v *= repetition_penalty;
-                    }
-                }
-                v - (count as f32 * 1.5)
-            } else {
-                raw_val
-            };
-            if val > penalized_best_val {
-                penalized_best_val = val;
-                penalized_best_idx = i;
-            }
-        }
-        return penalized_best_idx as u32;
+        return argmax_first(slice) as u32;
     }
 
-    let (active_candidates, active_probs, n) = nucleus(
-        slice,
-        recent_tokens,
-        temperature,
-        top_k,
-        top_p,
-        repetition_penalty,
-    );
+    let (active_candidates, active_probs, n) = nucleus(slice, temperature, top_k, top_p);
     let active_candidates = &active_candidates[..n];
     let active_probs = &active_probs[..n];
     let active_sum: f32 = active_probs.iter().sum();
@@ -1244,45 +1197,21 @@ pub fn sample_logits(
     active_candidates[0].0 as u32
 }
 
-/// The candidates [`sample_logits`] draws from at `temperature > 1e-4` (applying `repetition_penalty`
-/// on the fly for `recent_tokens`): top-k (`<= 64`) by `(logit desc, id asc)`, softmax at
-/// `temperature`, cut at cumulative `top_p`. Returns `(candidates, probs, count)`.
+/// The candidates [`sample_logits`] draws from at `temperature > 1e-4`: top-k (`<= 64`) by
+/// `(logit desc, id asc)`, softmax at `temperature`, cut at cumulative `top_p`. Returns
+/// `(candidates, probs, count)`.
 pub(crate) fn nucleus(
     logits: &[f32],
-    recent_tokens: &[u32],
     temperature: f32,
     top_k: usize,
     top_p: f32,
-    repetition_penalty: f32,
 ) -> ([(usize, f32); 64], [f32; 64], usize) {
     assert!(top_k <= 64, "top_k ({top_k}) must be <= 64");
     let k = top_k.max(1).min(logits.len());
-    let counts = if repetition_penalty > 1.0 && !recent_tokens.is_empty() {
-        let mut m = HashMap::with_capacity(recent_tokens.len());
-        for &tok in recent_tokens {
-            *m.entry(tok).or_insert(0u32) += 1;
-        }
-        Some(m)
-    } else {
-        None
-    };
 
     let mut cands = [(0usize, f32::NEG_INFINITY); 64];
     let mut len = 0usize;
-    for (i, &raw) in logits.iter().enumerate() {
-        let mut val = raw;
-        if let Some(m) = &counts {
-            if let Some(&c) = m.get(&(i as u32)) {
-                for _ in 0..c {
-                    if val > 0.0 {
-                        val /= repetition_penalty;
-                    } else {
-                        val *= repetition_penalty;
-                    }
-                    val -= 1.5;
-                }
-            }
-        }
+    for (i, &val) in logits.iter().enumerate() {
         if len == k && val <= cands[k - 1].1 {
             continue;
         }
@@ -1367,7 +1296,7 @@ mod tests {
 
     /// Allocation-free `sample_logits` / `nucleus` matches the brute-force full-sort reference
     /// across 200 seeded logit vectors (vocab 1,000 and 262,144; temperatures 0.3/0.7/1.2;
-    /// top-p 0.5/0.9/1.0; with and without repetition penalty, including exact tie-breaking).
+    /// top-p 0.5/0.9/1.0; with and without recent tokens, including exact tie-breaking).
     #[test]
     fn sample_logits_matches_brute_force_reference() {
         fn brute_force(
@@ -1376,25 +1305,9 @@ mod tests {
             temperature: f32,
             top_k: usize,
             top_p: f32,
-            repetition_penalty: f32,
         ) -> u32 {
-            let mut working_logits = slice.to_vec();
-            if repetition_penalty > 1.0 && !recent_tokens.is_empty() {
-                for &tok in recent_tokens {
-                    let idx = tok as usize;
-                    if idx < working_logits.len() {
-                        if working_logits[idx] > 0.0 {
-                            working_logits[idx] /= repetition_penalty;
-                        } else {
-                            working_logits[idx] *= repetition_penalty;
-                        }
-                        working_logits[idx] -= 1.5;
-                    }
-                }
-            }
-            let k = top_k.max(1).min(working_logits.len());
-            let mut indexed: Vec<(usize, f32)> =
-                working_logits.iter().copied().enumerate().collect();
+            let k = top_k.max(1).min(slice.len());
+            let mut indexed: Vec<(usize, f32)> = slice.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| {
                 b.1.partial_cmp(&a.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -1453,7 +1366,6 @@ mod tests {
         };
         let temps = [0.3f32, 0.7, 1.2];
         let top_ps = [0.5f32, 0.9, 1.0];
-        let penalties = [1.0f32, 1.15];
         for i in 0..200 {
             let vocab = if i >= 192 { 262_144 } else { 1_000 };
             let ties = i % 5 == 0;
@@ -1486,12 +1398,11 @@ mod tests {
             let temp = temps[i % temps.len()];
             let top_p = top_ps[(i / 3) % top_ps.len()];
             let top_k = [1usize, 10, 50, 64][i % 4];
-            let pen = penalties[(i / 2) % penalties.len()];
-            let got = sample_logits(&logits, &recent, temp, top_k, top_p, pen);
-            let want = brute_force(&logits, &recent, temp, top_k, top_p, pen);
+            let got = sample_logits(&logits, &recent, temp, top_k, top_p);
+            let want = brute_force(&logits, &recent, temp, top_k, top_p);
             assert_eq!(
                 got, want,
-                "case {i} (vocab={vocab}, temp={temp}, top_p={top_p}, top_k={top_k}, pen={pen})"
+                "case {i} (vocab={vocab}, temp={temp}, top_p={top_p}, top_k={top_k})"
             );
         }
     }
@@ -1633,8 +1544,8 @@ mod tests {
             let mut s = fresh(&chunked, &PROMPT);
             chunked.forward(&PROMPT[..11], 0, &mut s).unwrap();
             let l = chunked.forward(&PROMPT[11..], 11, &mut s).unwrap();
-            let t = sample_logits(&l, &[], 0.0, 50, 1.0, 1.0);
-            assert_eq!(t, sample_logits(&b, &[], 0.0, 50, 1.0, 1.0), "{dev:?}");
+            let t = sample_logits(&l, &[], 0.0, 50, 1.0);
+            assert_eq!(t, sample_logits(&b, &[], 0.0, 50, 1.0), "{dev:?}");
             assert!(chunked.forward(&PROMPT[..1], 3, &mut s).is_err());
         }
     }

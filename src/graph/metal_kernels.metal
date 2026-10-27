@@ -2392,8 +2392,6 @@ struct SampleGpuParams {
     uint top_k;
     float inv_temp;
     float top_p;
-    float rep_penalty;
-    uint n_recent;
     ulong rng_seed;
 };
 
@@ -2426,25 +2424,18 @@ static inline void sample_tg_best(float v, uint i, threadgroup float* sv, thread
     }
 }
 
-/// Exact top-`k` (`k = clamp(top_k, 1, 64)`) of each 4096-wide logit span after the repetition
-/// penalty (NaN as -inf), in sampling order: `cand[part * k + j] = (value bits, id)`.
+/// Exact top-`k` (`k = clamp(top_k, 1, 64)`) of each 4096-wide logit span (NaN as -inf), in
+/// sampling order: `cand[part * k + j] = (value bits, id)`.
 /// Grid `ceil(vocab / 4096)` threadgroups of 256 threads.
 kernel void sample_topk_part(device const float* logits [[buffer(0)]],
                              device uint2* cand [[buffer(1)]],
-                             device const uint* recent_ids [[buffer(2)]],
-                             constant SampleGpuParams& p [[buffer(3)]],
+                             constant SampleGpuParams& p [[buffer(2)]],
                              uint part [[threadgroup_position_in_grid]],
                              uint tid [[thread_index_in_threadgroup]],
                              uint sg [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup uint sh_recent[64];
     threadgroup float sv[2][8];
     threadgroup uint si[2][8];
-    if (tid < 64) {
-        sh_recent[tid] = (tid < p.n_recent) ? recent_ids[tid] : 0xFFFFFFFFu;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const bool has_rep = (p.rep_penalty > 0.0f && p.rep_penalty != 1.0f && p.n_recent > 0);
     const uint base = part * SAMPLE_SPAN + tid;
     float v[16];
 #pragma unroll
@@ -2454,14 +2445,6 @@ kernel void sample_topk_part(device const float* logits [[buffer(0)]],
         if (i < p.vocab) {
             x = logits[i];
             if (isnan(x)) x = -INFINITY;
-            if (has_rep) {
-                for (uint r = 0; r < p.n_recent && r < 64; ++r) {
-                    if (sh_recent[r] == i) {
-                        x = (x > 0.0f) ? (x / p.rep_penalty) : (x * p.rep_penalty);
-                        break;
-                    }
-                }
-            }
         }
         v[j] = x;
     }
@@ -2503,12 +2486,11 @@ kernel void sample_topk_part(device const float* logits [[buffer(0)]],
 
 /// Exact top-`k` of the `ceil(vocab / 4096) * k` part candidates, then the draw: softmax at
 /// `inv_temp` over the top `k`, the top-`p` nucleus, one splitmix64 uniform from `rng_seed`.
-/// Writes the token to `out_token[0]` and the `recent_ids` slot, and the kept `(id, prob bits)`
-/// list to `cand[0..k]` (`(0xFFFFFFFF, 0)` past the nucleus). One threadgroup of 256 threads.
+/// Writes the token to `out_token[0]` and the kept `(id, prob bits)` list to `cand[0..k]`
+/// (`(0xFFFFFFFF, 0)` past the nucleus). One threadgroup of 256 threads.
 kernel void sample_topk_final(device uint2* cand [[buffer(0)]],
                               device uint* out_token [[buffer(1)]],
-                              device uint* recent_ids [[buffer(2)]],
-                              constant SampleGpuParams& p [[buffer(3)]],
+                              constant SampleGpuParams& p [[buffer(2)]],
                               uint tid [[thread_index_in_threadgroup]],
                               uint sg [[simdgroup_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
@@ -2582,9 +2564,6 @@ kernel void sample_topk_final(device uint2* cand [[buffer(0)]],
         }
     }
     out_token[0] = chosen;
-    if (p.n_recent > 0) {
-        recent_ids[uint(p.rng_seed) % min(p.n_recent, 64u)] = chosen;
-    }
     for (uint j = 0; j < k; ++j) {
         cand[j] = j < kept_k ? uint2(top_i[j], as_type<uint>(top_v[j] / total)) : uint2(0xFFFFFFFFu, 0u);
     }

@@ -444,7 +444,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-
 fn moe_rows_per_sg(_c: &Codec) -> usize {
     #[cfg(test)]
     {
@@ -485,7 +484,10 @@ fn moe_gemv_pso(
         ..Default::default()
     };
     let (body, name) = if wsum {
-        (gemv_indexed_wsum(c, params), gemv_indexed_wsum_name(c, params))
+        (
+            gemv_indexed_wsum(c, params),
+            gemv_indexed_wsum_name(c, params),
+        )
     } else {
         (gemv_indexed(c, params), gemv_indexed_name(c, params))
     };
@@ -1022,8 +1024,7 @@ mod tests {
                         .remove(0)
                         .as_u32()
                         .unwrap()[0];
-                    let want =
-                        crate::runtime::lm::sample_logits(&x[..valid], &[], 0.0, 50, 1.0, 1.0);
+                    let want = crate::runtime::lm::sample_logits(&x[..valid], &[], 0.0, 50, 1.0);
                     assert_eq!(got, want, "head {name} cols={cols} valid={valid}");
                 }
             }

@@ -96,7 +96,6 @@ pub trait NativeLm: Send + Sync {
     }
 
     /// Device decode stream supporting both greedy (`temp <= 1e-4`) and stochastic (`temp > 1e-4`) sampling.
-    #[allow(clippy::too_many_arguments)]
     fn stream_token(
         &self,
         last: u32,
@@ -104,7 +103,6 @@ pub trait NativeLm: Send + Sync {
         max_new: usize,
         temp: f32,
         _top_p: f32,
-        _recent: &[u32],
         state: &mut SeqState,
     ) -> Result<Option<u32>, String> {
         if temp <= 1e-4 {

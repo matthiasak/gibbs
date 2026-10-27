@@ -560,8 +560,7 @@ fn allocate_gives_extra_outs_distinct_live_ranges() {
     ];
     let (offsets, _) = allocate(&g, &steps, &HashMap::new()).unwrap();
     let range = |v: ValueId| (offsets[&v], offsets[&v] + 2 * 4 * 4);
-    let disjoint =
-        |p: ValueId, q: ValueId| range(p).1 <= range(q).0 || range(q).1 <= range(p).0;
+    let disjoint = |p: ValueId, q: ValueId| range(p).1 <= range(q).0 || range(q).1 <= range(p).0;
     // a is read by step 1, b by step 2, c by step 2, d is the graph output.
     for (p, q) in [(a, b), (a, c), (b, c), (b, d), (c, d)] {
         assert!(
@@ -1141,13 +1140,19 @@ fn every_kernel_source_compiles() {
         }
         for epi in [0, 1, 2] {
             build(
-                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi, false)),
+                &format!(
+                    "{head_mpp}{gemm_common}{}",
+                    codegen::gemm_packed(c, epi, false)
+                ),
                 &codegen::gemm_packed_name(c, epi, false),
             );
         }
         for epi in [0, 1, 3] {
             build(
-                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi, true)),
+                &format!(
+                    "{head_mpp}{gemm_common}{}",
+                    codegen::gemm_packed(c, epi, true)
+                ),
                 &codegen::gemm_packed_name(c, epi, true),
             );
         }
@@ -1155,13 +1160,19 @@ fn every_kernel_source_compiles() {
     for c in [&codegen::CODEC_F16, &codegen::CODEC_BF16] {
         for epi in [0, 1, 2] {
             build(
-                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi, false)),
+                &format!(
+                    "{head_mpp}{gemm_common}{}",
+                    codegen::gemm_packed(c, epi, false)
+                ),
                 &codegen::gemm_packed_name(c, epi, false),
             );
         }
         for epi in [0, 1, 3] {
             build(
-                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi, true)),
+                &format!(
+                    "{head_mpp}{gemm_common}{}",
+                    codegen::gemm_packed(c, epi, true)
+                ),
                 &codegen::gemm_packed_name(c, epi, true),
             );
         }
@@ -1321,8 +1332,7 @@ fn megakernel_mlp_matches_cpu_for_every_variant() {
                 for blk in raw.chunks_exact_mut(bb) {
                     for &o in scale_at {
                         let exp = 9 + (next() % 14) as u16;
-                        let d =
-                            ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                        let d = ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
                         blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
                     }
                 }
@@ -1764,7 +1774,6 @@ fn gemv_q4_0_residual_matches_cpu() {
     );
 }
 
-
 #[test]
 fn gemv_bf16_matches_cpu() {
     let (m, n, k) = (4, 37, 1000);
@@ -2084,12 +2093,20 @@ fn gemm_packed_in_tile_dequant_matches_cpu() {
             let w_f32 = rand(n * k, 100 + fmt as u64);
             let w_dtype = match fmt {
                 QuantFormat::BF16 => {
-                    let raw_w: Vec<u16> = w_f32.iter().copied().map(crate::model::f32_to_bf16).collect();
+                    let raw_w: Vec<u16> = w_f32
+                        .iter()
+                        .copied()
+                        .map(crate::model::f32_to_bf16)
+                        .collect();
                     w.insert("w", Tensor::BF16(raw_w));
                     DType::BF16
                 }
                 QuantFormat::FP16 => {
-                    let raw_w: Vec<u16> = w_f32.iter().copied().map(crate::model::f32_to_f16).collect();
+                    let raw_w: Vec<u16> = w_f32
+                        .iter()
+                        .copied()
+                        .map(crate::model::f32_to_f16)
+                        .collect();
                     w.insert("w", Tensor::F16(raw_w));
                     DType::F16
                 }
@@ -2101,13 +2118,19 @@ fn gemm_packed_in_tile_dequant_matches_cpu() {
                     let raw = encode_rows(&w_f32, k, fmt).expect("encode_rows");
                     w.insert(
                         "w",
-                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(fmt, raw, n, k)),
+                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                            fmt, raw, n, k,
+                        )),
                     );
                     DType::Quant(fmt)
                 }
                 _ => {
                     let (be, bb, dequant) = gguf_block_codec(fmt).expect("CPU dequantizer");
-                    let scale_off = if fmt == QuantFormat::GGUF_TQ2_0 { 64 } else { 0 };
+                    let scale_off = if fmt == QuantFormat::GGUF_TQ2_0 {
+                        64
+                    } else {
+                        0
+                    };
                     let mut raw: Vec<u8> = (0..n * (k / be) * bb)
                         .map(|_| (next_u32() >> 4) as u8)
                         .collect();
@@ -2121,7 +2144,9 @@ fn gemm_packed_in_tile_dequant_matches_cpu() {
                     }
                     w.insert(
                         "w",
-                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(fmt, raw, n, k)),
+                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                            fmt, raw, n, k,
+                        )),
                     );
                     DType::Quant(fmt)
                 }
@@ -2184,12 +2209,7 @@ fn gemm_packed_in_tile_dequant_matches_cpu() {
                         Tensor::F32(x_512[..m * k].to_vec()),
                         Tensor::F32(r_512[..m * n].to_vec()),
                     ];
-                    let got = session
-                        .run(&g, inp)
-                        .unwrap()
-                        .remove(0)
-                        .into_f32()
-                        .unwrap();
+                    let got = session.run(&g, inp).unwrap().remove(0).into_f32().unwrap();
                     let want = &want_512[..m * n];
                     let err = rel_err(want, &got);
                     assert!(
@@ -2398,8 +2418,7 @@ fn test_attention_and_state_ops_match_cpu() {
         );
         g.output(y);
         let inp = vec![Tensor::F32(vec![
-            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
-            17.0,
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0,
         ])];
         let (want, got) = both(&g, &Weights::new(), inp, None);
         assert_eq!(want, got);
@@ -2474,7 +2493,6 @@ fn test_attention_and_state_ops_match_cpu() {
         let (want, got) = both(&g, &Weights::new(), inp, None);
         assert!(rel_err(&want, &got) < 1e-4, "CachedAttention mismatch");
     }
-
 
     // 4. CausalConv1dCached
     {
@@ -2873,8 +2891,7 @@ fn stateful_cached_attention_parity(kv_f16: bool, tol: f32) {
             Tensor::U32(pos_data),
         ];
 
-        let cpu_out =
-            cpu::run(&decode_g, &Weights::new(), &mut cpu_state, inputs.clone()).unwrap();
+        let cpu_out = cpu::run(&decode_g, &Weights::new(), &mut cpu_state, inputs.clone()).unwrap();
         let metal_out = session
             .run_with_state(&decode_g, Some(&mut metal_state), inputs)
             .unwrap();
@@ -2915,9 +2932,8 @@ fn min_head_cosine(want: &[f32], got: &[f32], hd: usize) -> f32 {
     want.chunks(hd)
         .zip(got.chunks(hd))
         .map(|(a, b)| {
-            let dot = |x: &[f32], y: &[f32]| {
-                x.iter().zip(y).map(|(&p, &q)| (p * q) as f64).sum::<f64>()
-            };
+            let dot =
+                |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(&p, &q)| (p * q) as f64).sum::<f64>();
             (dot(a, b) / (dot(a, a).sqrt() * dot(b, b).sqrt()).max(1e-30)) as f32
         })
         .fold(1.0, f32::min)
@@ -3323,7 +3339,11 @@ fn cached_attention_visible_end_matches_cpu() {
                 .run_with_state(&g, Some(&mut StateStore::new()), inputs.clone())
                 .unwrap();
             let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-            let max_tol = if m >= 8 && hd > 64 { tol.max(2e-3) } else { tol };
+            let max_tol = if m >= 8 && hd > 64 {
+                tol.max(2e-3)
+            } else {
+                tol
+            };
             assert!(
                 err <= max_tol,
                 "visible_end mismatch m={m} hd={hd} (f16 KV {kv_f16}): {err}"
@@ -3615,14 +3635,15 @@ fn kernel_rows_group_steps_by_innermost_kind_slowest_first() {
     assert_eq!(kernel_kind("?"), "?");
     // Field values never name the kind: `ValueId(..)`, `Some(ValueId(..))` and `Gen(..)` follow it.
     assert_eq!(
-        kernel_kind("GemmBatchedPacked { x: ValueId(1), res: Some(ValueId(4)), format: Gen(GGUF_Q4_K_M) }"),
+        kernel_kind(
+            "GemmBatchedPacked { x: ValueId(1), res: Some(ValueId(4)), format: Gen(GGUF_Q4_K_M) }"
+        ),
         "GemmBatchedPacked"
     );
     assert_eq!(kernel_kind("Ext(Moe(Embed))"), "Embed");
     assert_eq!(kernel_kind("Softmax(3)"), "Softmax");
-    let t = |name: &str, desc: &str, s: f64, bytes: u64| {
-        (name.to_string(), desc.to_string(), s, bytes)
-    };
+    let t =
+        |name: &str, desc: &str, s: f64, bytes: u64| (name.to_string(), desc.to_string(), s, bytes);
     let rows = kernel_rows(
         &[
             t("a", "Ext(Norm(RmsNorm { eps: 1e-6 }))", 1e-6, 1_000),
@@ -3703,7 +3724,6 @@ fn requested_kernel_profile_samples_a_decode_token_and_keeps_its_output() {
         "{rows:?}"
     );
 }
-
 
 #[test]
 fn moe_subgraph_fusions_match_cpu() {
@@ -3895,8 +3915,7 @@ fn gemv_packed_pair_small_rows_matches_cpu() {
                 for blk in raw.chunks_exact_mut(bb) {
                     for &o in scale_at {
                         let exp = 9 + (next() % 14) as u16;
-                        let d =
-                            ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                        let d = ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
                         blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
                     }
                 }
@@ -4077,7 +4096,6 @@ fn plan_value_locs_resolve_without_per_token_hashmap() {
         assert!(err < 1e-4, "step {step_pos}: rel_err {err}");
     }
 }
-
 
 /// CPU only: `plan_dump` groups steps by layer and describes a materialized strided slice.
 #[test]
@@ -4583,11 +4601,11 @@ fn paged_attention_matches_contiguous() {
                     let mut paged = Session::new(rt(), &Weights::new()).unwrap();
                     plain.set_kv_f16(kv_f16);
                     paged.set_kv_f16(kv_f16);
-                    let pool = paged
-                        .new_kv_pool(&crate::graph::paged_states(&g))
-                        .unwrap();
-                    let (plan_plain, plan_paged) =
-                        (plain.prepare_plan(&g).unwrap(), paged.prepare_plan(&g).unwrap());
+                    let pool = paged.new_kv_pool(&crate::graph::paged_states(&g)).unwrap();
+                    let (plan_plain, plan_paged) = (
+                        plain.prepare_plan(&g).unwrap(),
+                        paged.prepare_plan(&g).unwrap(),
+                    );
                     paged_vs_contiguous(
                         &g,
                         m,
@@ -4626,7 +4644,7 @@ fn sample_topk_matches_cpu_nucleus() {
     logits[556] = 8.5;
     let (temp, top_p) = (0.8f32, 0.95f32);
     let buf = |bytes: usize| new_shared_buffer(&s.rt.device, bytes).unwrap();
-    let (lb, ob, rb) = (buf(vocab * 4), buf(4), buf(64 * 4));
+    let (lb, ob) = (buf(vocab * 4), buf(4));
     // SAFETY: fresh shared buffers no command buffer uses yet.
     unsafe { std::ptr::copy_nonoverlapping(logits.as_ptr(), lb.contents() as *mut f32, vocab) };
     let p = SampleGpuParams {
@@ -4634,13 +4652,11 @@ fn sample_topk_matches_cpu_nucleus() {
         top_k: crate::scheduler::SAMPLE_TOP_K as u32,
         inv_temp: 1.0 / temp,
         top_p,
-        rep_penalty: 1.0,
-        n_recent: 1,
         rng_seed: 42,
     };
     let cb = s.rt.queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
-    s.encode_sample(&Counted::new(enc), (&lb, 0), (&ob, 0), &rb, &p)
+    s.encode_sample(&Counted::new(enc), (&lb, 0), (&ob, 0), &p)
         .unwrap();
     enc.end_encoding();
     cb.commit();
@@ -4654,7 +4670,7 @@ fn sample_topk_matches_cpu_nucleus() {
         .take_while(|e| e[0] != u32::MAX)
         .map(|e| (e[0], f32::from_bits(e[1])))
         .collect();
-    let (cands, probs, n) = crate::runtime::lm::nucleus(&logits, &[], temp, k, top_p, 1.0);
+    let (cands, probs, n) = crate::runtime::lm::nucleus(&logits, temp, k, top_p);
     assert!(n > 2, "the nucleus keeps more than the two planted logits");
     assert_eq!(
         got.iter().map(|e| e.0).collect::<Vec<_>>(),

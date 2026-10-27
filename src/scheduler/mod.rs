@@ -107,7 +107,6 @@ impl ExecutableModel {
     }
 
     /// Device decode stream supporting both greedy (`temp <= 1e-4`) and stochastic (`temp > 1e-4`) sampling.
-    #[allow(clippy::too_many_arguments)]
     pub fn stream_token(
         &self,
         last: u32,
@@ -115,14 +114,10 @@ impl ExecutableModel {
         max_new: usize,
         temp: f32,
         top_p: f32,
-        all_tokens: &[u32],
         state: &mut Option<SeqState>,
     ) -> Result<Option<u32>, String> {
         match state {
-            Some(st) => {
-                self.0
-                    .stream_token(last, pos - 1, max_new, temp, top_p, recent(all_tokens), st)
-            }
+            Some(st) => self.0.stream_token(last, pos - 1, max_new, temp, top_p, st),
             None => Ok(None),
         }
     }
@@ -183,7 +178,7 @@ impl ExecutableModel {
         } else {
             logits.len()
         };
-        sample_logits(&logits[..valid], recent, temp, SAMPLE_TOP_K, top_p, 1.0)
+        sample_logits(&logits[..valid], recent, temp, SAMPLE_TOP_K, top_p)
     }
 
     /// One-shot generation through a private [`ContinuousBatchScheduler`]: (text, decode-step
@@ -1481,7 +1476,6 @@ impl ContinuousBatchScheduler {
                                     .min(context_len.saturating_sub(all.len())),
                                 temp,
                                 top_p,
-                                &all,
                                 &mut seq.kv_cache,
                             )
                         } else {
