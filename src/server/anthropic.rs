@@ -250,6 +250,7 @@ async fn run(
             },
             stop: req.stop_sequences.unwrap_or_default(),
             label: label("anthropic", &headers),
+            compact: None,
         },
     )
     .await?;

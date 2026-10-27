@@ -150,6 +150,7 @@ async fn respond(
             },
             stop: Vec::new(),
             label: label("responses", &headers),
+            compact: None,
         },
     )
     .await?;

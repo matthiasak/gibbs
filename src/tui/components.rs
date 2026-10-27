@@ -965,6 +965,22 @@ impl TuiApp {
                 th.fg(Token::Cyanotype),
             )),
         ];
+        #[cfg(target_os = "macos")]
+        if let Some(a) = crate::graph::ane::probed() {
+            lines.push(Line::from(Span::styled(
+                trunc(
+                    &format!(
+                        "ANE {}-core {} · programs {}/{}",
+                        a.cores,
+                        a.arch,
+                        crate::graph::ane::programs_compiled(),
+                        crate::graph::ane::ANE_MAX_PROGRAMS
+                    ),
+                    iw,
+                ),
+                th.fg(Token::Dim),
+            )));
+        }
         if let Some(a) = self.http_addr {
             lines.push(Line::from(Span::styled(
                 trunc(&format!("http {a}"), iw),
