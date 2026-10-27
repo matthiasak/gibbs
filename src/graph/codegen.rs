@@ -911,8 +911,8 @@ pub fn mlp_megakernel_msl(codec: &Codec, is_geglu: bool) -> String {
     let dec = format!("decode8_{:?}", codec.format);
     let codec_msl = device_msl(codec).replace("decode8", &dec);
     let (be, subs) = (codec.block_elems, codec.block_elems / 8);
-    let gate_br = block_ref(codec, "gate_w", "row * blocks_per_row + b");
-    let up_br = block_ref(codec, "up_w", "row * blocks_per_row + b");
+    let gate_br = block_ref(codec, "gate_w", "(ulong)row * blocks_per_row + bk");
+    let up_br = block_ref(codec, "up_w", "(ulong)row * blocks_per_row + bk");
     let act_expr = if is_geglu {
         "u * (0.5f * g * (1.0f + tanh(0.7978845608f * (g + 0.044715f * g * g * g))))"
     } else {
@@ -964,9 +964,9 @@ kernel void {name}(
     float g = 0.0f;
     float u = 0.0f;
     for (uint s = lane; s < blocks_per_row * {subs}; s += 32) {{
-        const ulong b = s / {subs};
+        const ulong bk = s / {subs};
         const uint sub = s % {subs};
-        const uint col = b * {be} + sub * 8;
+        const uint col = bk * {be} + sub * 8;
         float gw[8], uw[8];
         {{ {gate_decl} {dec}(b, {gate_sub}sub, gw); }}
         {{ {up_decl} {dec}(b, {up_sub}sub, uw); }}
