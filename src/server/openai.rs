@@ -33,6 +33,11 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<Value>,
     /// vLLM/SGLang extension: extra chat-template variables (`{"enable_thinking": false}`).
     pub chat_template_kwargs: Option<Value>,
+    /// Compaction settings for this request, over the saved ones.
+    pub compact: Option<crate::compact::CompactionOverride>,
+    /// Return the compacted history as `gibbs_compacted_messages` (when compaction ran).
+    #[serde(default)]
+    pub compact_return_messages: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,8 +146,11 @@ async fn chat(
             "response_format (JSON mode / json_schema) is not supported; only {\"type\": \"text\"}",
         )),
     }
+    if let Some(o) = &req.compact {
+        o.check_local().map_err(ApiError::bad)?;
+    }
     let (messages, media) = prepare_messages(req.messages).await?;
-    let gen = core::start(
+    let mut gen = core::start(
         &state,
         GenRequest {
             prompt: Prompt::Chat {
@@ -161,12 +169,15 @@ async fn chat(
             },
             stop: strings(req.stop.as_ref()),
             label: label("openai", &headers),
+            compact: req.compact,
         },
     )
     .await?;
+    let compaction = gen.compaction.take();
     let model = req.model.unwrap_or_else(|| state.scheduler.model_id());
     let id = format!("chatcmpl-{}", gen.id);
     let prompt_tokens = gen.prompt_tokens;
+    let report = compaction.as_ref().map(|c| json!(c.report));
     if req.stream.unwrap_or(false) {
         let wire = ChatWire {
             id,
@@ -175,8 +186,11 @@ async fn chat(
             calls: 0,
             include_usage: include_usage(req.stream_options.as_ref()),
             prompt_tokens,
+            compaction: report,
         };
-        return Ok(stream_response(gen, wire, Framing::SseDone));
+        let mut resp = stream_response(gen, wire, Framing::SseDone);
+        resp.headers_mut().extend(compaction.as_ref().map(|c| c.header()));
+        return Ok(resp);
     }
     let out = collect(gen).await?;
     let mut message = json!({"role": "assistant", "content": out.text});
@@ -186,15 +200,23 @@ async fn chat(
         }
         message["tool_calls"] = out.calls.iter().map(call_json).collect();
     }
-    Ok(Json(json!({
+    let mut body = json!({
         "id": id,
         "object": "chat.completion",
         "created": unix_now(),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(&out.finish)}],
         "usage": usage(prompt_tokens, out.completion_tokens),
-    }))
-    .into_response())
+    });
+    if let Some(c) = &compaction {
+        body["usage"]["compaction"] = json!(c.report);
+        if req.compact_return_messages {
+            body["gibbs_compacted_messages"] = c.wire_messages();
+        }
+    }
+    let mut resp = Json(body).into_response();
+    resp.headers_mut().extend(compaction.as_ref().map(|c| c.header()));
+    Ok(resp)
 }
 
 fn call_json(c: &super::tools::ToolCall) -> Value {
@@ -209,6 +231,8 @@ pub struct ChatWire {
     pub calls: usize,
     pub include_usage: bool,
     pub prompt_tokens: usize,
+    /// `usage.compaction` of the final usage chunk.
+    pub compaction: Option<Value>,
 }
 
 impl ChatWire {
@@ -244,6 +268,9 @@ impl Wire for ChatWire {
                 if self.include_usage {
                     let mut last = self.chunk(json!([]));
                     last["usage"] = usage(self.prompt_tokens, completion_tokens);
+                    if let Some(c) = &self.compaction {
+                        last["usage"]["compaction"] = c.clone();
+                    }
                     out.push(last);
                 }
                 out
@@ -346,6 +373,7 @@ async fn completion(
             },
             stop: strings(req.stop.as_ref()),
             label: label("openai", &headers),
+            compact: None,
         },
     )
     .await?;
@@ -428,6 +456,7 @@ mod tests {
             calls: 0,
             include_usage: true,
             prompt_tokens: 7,
+            compaction: None,
         };
         let call = |name: &str| {
             Event::Call(ToolCall {

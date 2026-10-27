@@ -99,6 +99,10 @@ struct Cli {
     #[arg(long)]
     compact_keep_turns: Option<usize>,
 
+    /// Tier 3 summarizer: `active` (the loaded model) or a model id loaded beside it.
+    #[arg(long)]
+    compact_summarizer: Option<String>,
+
     #[arg(long)]
     image: Option<String>,
 
@@ -720,6 +724,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || cli.compact_threshold.is_some()
         || cli.compact_target.is_some()
         || cli.compact_keep_turns.is_some()
+        || cli.compact_summarizer.is_some()
     {
         let mut s = gibbs_engine::tui::settings::load_settings();
         if let Some(m) = &cli.compact_mode {
@@ -734,7 +739,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(kt) = cli.compact_keep_turns {
             s.compact.keep_recent_turns = kt;
         }
-        s.compact = s.compact.sanitized();
+        if let Some(id) = &cli.compact_summarizer {
+            s.compact.summarizer = gibbs_engine::compact::summarizer_id(id);
+        }
+        s.compact = s.compact.clone().sanitized();
         let _ = gibbs_engine::tui::settings::save_settings(&s);
     }
 

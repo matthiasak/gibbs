@@ -182,4 +182,15 @@ pub trait NativeLm: Send + Sync {
     ) -> bool {
         false
     }
+
+    /// The chat template's thinking delimiters as `(open, close)` pairs
+    /// (`runtime.thinking_delimiters`).
+    fn thinking_delimiters(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Whether prompts may attach images (an `image` media encoder that loaded).
+    fn has_vision(&self) -> bool {
+        false
+    }
 }

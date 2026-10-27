@@ -68,6 +68,8 @@ pub struct GenRequest {
     pub stop: Vec<String>,
     /// Requests panel label, e.g. `anthropic · claude-cli/2.0`.
     pub label: String,
+    /// A chat request's `compact` object, over the saved compaction settings.
+    pub compact: Option<crate::compact::CompactionOverride>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +96,55 @@ pub struct Generation {
     pub id: u64,
     pub prompt_tokens: usize,
     pub events: UnboundedReceiver<Event>,
+    /// Set when the chat history was compacted before it was queued.
+    pub compaction: Option<Compaction>,
+}
+
+/// A compaction applied to a request: its report and the history the model saw.
+pub struct Compaction {
+    pub report: crate::compact::CompactionReport,
+    pub messages: Vec<ChatMessage>,
+    pub media: Vec<MediaInput>,
+}
+
+impl Compaction {
+    /// `x-gibbs-compacted: {before}->{after}` (prompt tokens).
+    pub fn header(&self) -> (axum::http::HeaderName, axum::http::HeaderValue) {
+        let r = &self.report;
+        let v = format!("{}->{}", r.before_tokens, r.after_tokens);
+        (
+            axum::http::HeaderName::from_static("x-gibbs-compacted"),
+            axum::http::HeaderValue::from_str(&v).expect("digits and an arrow"),
+        )
+    }
+
+    /// The compacted messages as a client resends them: media parts become `image_url` /
+    /// `input_audio` data parts holding their bytes.
+    pub fn wire_messages(&self) -> Value {
+        let mut media = self.media.iter();
+        let mut out = serde_json::to_value(&self.messages).unwrap_or_default();
+        for m in out.as_array_mut().into_iter().flatten() {
+            for p in m["content"].as_array_mut().into_iter().flatten() {
+                if p["type"] == "text" {
+                    continue;
+                }
+                *p = match media.next() {
+                    Some(MediaInput::Image(b)) => {
+                        let mime = if b.starts_with(b"\x89PNG") { "png" } else { "jpeg" };
+                        let url = format!(
+                            "data:image/{mime};base64,{}",
+                            crate::model::image::base64_encode(b)
+                        );
+                        serde_json::json!({"type": "image_url", "image_url": {"url": url}})
+                    }
+                    Some(MediaInput::Audio(b)) => serde_json::json!({"type": "input_audio",
+                        "input_audio": {"data": crate::model::image::base64_encode(b), "format": "wav"}}),
+                    None => continue,
+                };
+            }
+        }
+        out
+    }
 }
 
 /// A finished generation, for non-streaming responses.
@@ -460,29 +511,49 @@ pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, 
     if !text_model_active(state) {
         return Err(no_text_model(state));
     }
+    let mut compaction = None;
     if let Prompt::Chat { messages, .. } = &mut req.prompt {
-        let cfg = crate::tui::settings::load_settings().compact;
+        let mut cfg = crate::tui::settings::load_settings().compact;
+        if let Some(o) = &req.compact {
+            o.apply(&mut cfg);
+        }
         if cfg.mode != crate::compact::CompactionMode::Off {
-            let tok = state.scheduler.tokenizer();
-            let ctx = state
-                .scheduler
-                .model()
-                .and_then(|m| m.context_len())
-                .unwrap_or(8192);
-            let (compacted, extra_media, report) =
-                crate::compact::compact_chat_session(messages, &tok, ctx, &cfg, &[], false);
-            if report.saved_tokens() > 0 {
-                state.telemetry.log_info(&format!(
-                    "compact: {} -> {} tokens (-{} tok; tier1={}B, tier2={}B, tier3={} turns)",
-                    report.before_tokens,
-                    report.after_tokens,
-                    report.saved_tokens(),
-                    report.tier1_chars_elided,
-                    report.tier2_chars_shaken,
-                    report.tier3_turns_summarized,
-                ));
-                *messages = compacted;
-                req.media.extend(extra_media);
+            let sched = state.scheduler.clone();
+            let (mut msgs, mut media) = (std::mem::take(messages), std::mem::take(&mut req.media));
+            // The summarizer generates on the scheduler: never on an async worker.
+            let (msgs, media, result) = tokio::task::spawn_blocking(move || {
+                let r = crate::compact::compact_for_scheduler(
+                    &sched, &mut msgs, &mut media, None, &cfg, false,
+                );
+                (msgs, media, r)
+            })
+            .await
+            .map_err(|e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("compaction failed: {e}"),
+            })?;
+            (*messages, req.media) = (msgs, media);
+            match result {
+                Ok(report) if report.saved_tokens() > 0 => {
+                    state.telemetry.log_info(&format!(
+                        "compact: {} -> {} tokens (-{} tok; tier1={}B, tier2={}B, tier3={} turns)",
+                        report.before_tokens,
+                        report.after_tokens,
+                        report.saved_tokens(),
+                        report.tier1_chars_elided,
+                        report.tier2_chars_shaken,
+                        report.tier3_turns_summarized,
+                    ));
+                    compaction = Some(Compaction {
+                        report,
+                        messages: messages.clone(),
+                        media: req.media.clone(),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => state
+                    .telemetry
+                    .log_warn(&format!("compact: {e}; the request proceeds uncompacted")),
             }
         }
     }
@@ -547,6 +618,7 @@ pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, 
         id,
         prompt_tokens,
         events,
+        compaction,
     })
 }
 
@@ -820,6 +892,7 @@ mod tests {
             id: 0,
             prompt_tokens: 0,
             events: rx,
+            compaction: None,
         };
         let Err(err) = futures::executor::block_on(collect(gen)) else {
             panic!("a swap abort is an error");

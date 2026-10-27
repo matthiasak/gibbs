@@ -161,6 +161,7 @@ pub fn create_router(state: AppState) -> Router {
             get(handle_get_draft_config).post(handle_set_draft_config),
         )
         .route("/v1/compact", post(handle_compact))
+        .route("/v1/artifacts/:hex", get(handle_artifact))
         // Agent requests carry whole conversations and base64 images; axum's default is 2 MB.
         .layer(axum::extract::DefaultBodyLimit::max(64 << 20))
         .with_state(state)
@@ -752,54 +753,74 @@ async fn handle_set_draft_config(
     Json(draft_status_json(&state))
 }
 
+/// `/v1/compact`: chat messages (OpenAI parts allowed) plus the chat request's `compact` fields.
 #[derive(Debug, Deserialize)]
 pub struct CompactRequest {
     pub messages: Vec<ChatMessage>,
-    #[serde(default)]
-    pub mode: Option<crate::compact::CompactionMode>,
+    #[serde(flatten)]
+    pub compact: crate::compact::CompactionOverride,
+    /// Context to compact for; default the active model's.
     #[serde(default)]
     pub context_limit: Option<usize>,
-    #[serde(default)]
-    pub keep_recent_turns: Option<usize>,
     #[serde(default)]
     pub enable_snapcompact_vision: Option<bool>,
 }
 
+/// Compacts now (mode default `aggressive`); with `trigger`, only once the history is over it.
 async fn handle_compact(
     State(state): State<AppState>,
     Json(req): Json<CompactRequest>,
-) -> Json<serde_json::Value> {
-    let mut cfg = crate::tui::settings::load_settings().compact;
-    cfg.mode = req
-        .mode
-        .unwrap_or(crate::compact::CompactionMode::Aggressive);
-    if let Some(k) = req.keep_recent_turns {
-        cfg.keep_recent_turns = k;
+) -> axum::response::Response {
+    match compact_now(state, req).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => api_error(e.status, format!("compaction failed: {}", e.message)),
     }
+}
+
+async fn compact_now(
+    state: AppState,
+    req: CompactRequest,
+) -> Result<serde_json::Value, core::ApiError> {
+    req.compact.check_local().map_err(core::ApiError::bad)?;
+    let mut cfg = crate::tui::settings::load_settings().compact;
+    cfg.mode = crate::compact::CompactionMode::Aggressive;
+    req.compact.apply(&mut cfg);
     if let Some(v) = req.enable_snapcompact_vision {
         cfg.enable_snapcompact_vision = v;
     }
-    let ctx = req.context_limit.unwrap_or_else(|| {
-        state
-            .scheduler
-            .model()
-            .and_then(|m| m.context_len())
-            .unwrap_or(8192)
-    });
-    let tok = state.scheduler.tokenizer();
-    let (messages, media, report) = crate::compact::compact_chat_session(
-        &req.messages,
-        &tok,
-        ctx,
-        &cfg,
-        &[],
-        cfg.enable_snapcompact_vision,
-    );
-    Json(serde_json::json!({
-        "messages": messages,
-        "media_count": media.len(),
-        "report": report,
+    let force = req.compact.trigger.is_none();
+    let (mut messages, mut media) = core::prepare_messages(req.messages).await?;
+    let sched = state.scheduler.clone();
+    let ctx = req.context_limit;
+    let c = tokio::task::spawn_blocking(move || {
+        crate::compact::compact_for_scheduler(&sched, &mut messages, &mut media, ctx, &cfg, force)
+            .map(|report| core::Compaction {
+                report,
+                messages,
+                media,
+            })
+    })
+    .await
+    .map_err(|e| core::ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: e.to_string(),
+    })?
+    .map_err(core::ApiError::bad)?;
+    Ok(serde_json::json!({
+        "messages": c.wire_messages(),
+        "media_count": c.media.len(),
+        "report": c.report,
     }))
+}
+
+/// `GET /v1/artifacts/{hex}`: a block compaction spilled (`[… artifact {hex} …]`), as text.
+async fn handle_artifact(
+    axum::extract::Path(hex): axum::extract::Path<String>,
+) -> axum::response::Response {
+    match crate::compact::read_artifact(&hex) {
+        Some(text) => text.into_response(),
+        None => api_error(StatusCode::NOT_FOUND, format!("no artifact '{hex}'")),
+    }
 }
 
 #[cfg(test)]
@@ -965,8 +986,33 @@ mod tests {
         assert_eq!(v["knobs"]["suffix_min_match"], 3);
     }
 
+    /// A served synthetic model (one token per character, never stops before `max_tokens`) with
+    /// a thread stepping its scheduler while the state lives.
+    fn model_state(dir: &std::path::Path) -> AppState {
+        let cfg = serde_json::json!({"max_position_embeddings": 16384});
+        let model = crate::arch::testing::synthetic_lm(dir, cfg, crate::hardware::Device::Cpu);
+        let scheduler = Arc::new(ContinuousBatchScheduler::new(
+            "gibbs/test-llama",
+            Arc::new(PagedKVPool::new(1024)),
+            Some(model),
+        ));
+        let weak = Arc::downgrade(&scheduler);
+        std::thread::spawn(move || {
+            while let Some(s) = weak.upgrade() {
+                if s.step().active_sequences_count == 0 {
+                    s.wait_for_work(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+        AppState {
+            scheduler,
+            ..create_test_state()
+        }
+    }
+
     #[tokio::test]
     async fn compact_endpoint_elides_thinking_and_folds_turns() {
+        let dir = tempfile::tempdir().unwrap();
         let payload = serde_json::json!({
             "messages": [
                 {"role": "user", "content": "Turn 1 user question"},
@@ -977,15 +1023,111 @@ mod tests {
                 {"role": "assistant", "content": "Turn 3 answer"}
             ],
             "mode": "aggressive",
-            "keep_recent_turns": 1,
-            "context_limit": 32
+            "keep_recent_turns": 1
         });
-        let body = post_body("/v1/compact", payload).await;
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["report"]["tier1_chars_elided"].as_u64().unwrap() > 0);
-        assert!(
-            v["report"]["after_tokens"].as_u64().unwrap()
-                < v["report"]["before_tokens"].as_u64().unwrap()
-        );
+        let app = create_router(model_state(dir.path()));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/compact")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["report"]["tier1_chars_elided"].as_u64().unwrap() > 0, "{v}");
+        assert_eq!(v["report"]["tier3_turns_summarized"], 2, "{v}");
+        let m = v["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 4, "{v}");
+        assert!(m[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Compacted session summary of 4 earlier messages]\n"));
+        assert_eq!(m[3]["content"], "Turn 3 answer");
+        // Without a model there is nothing to summarize with (a transcript with no cached summary).
+        let fresh = payload.to_string().replace("Turn 1 user", "Turn 1 other");
+        let body = post_body("/v1/compact", serde_json::from_str(&fresh).unwrap()).await;
+        assert!(body.contains("no text model is loaded"), "{body}");
+    }
+
+    /// A chat request's `compact` object compacts its long history before generation: the
+    /// response carries the `x-gibbs-compacted` header, `usage.compaction` and (asked for) the
+    /// compacted history; spilled blocks are served from `/v1/artifacts`.
+    #[tokio::test]
+    async fn chat_compact_field_sets_usage_and_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let log: String = (0..30)
+            .map(|i| format!("chat_compact build step {i}: ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut messages = vec![serde_json::json!({"role": "system", "content": "Be terse."})];
+        for i in 0..20 {
+            let user = match i {
+                0 => format!("Here is the log:\n\n{log}"),
+                _ => format!("Turn {i}: {}", "explain the second law in detail. ".repeat(4)),
+            };
+            let answer = format!(
+                "<think>reasoning {i}</think>Answer {i}: {}",
+                "entropy of an isolated system never decreases. ".repeat(3)
+            );
+            messages.push(serde_json::json!({"role": "user", "content": user}));
+            messages.push(serde_json::json!({"role": "assistant", "content": answer}));
+        }
+        messages.push(serde_json::json!({"role": "user", "content": "And the third law?"}));
+        let payload = serde_json::json!({
+            "messages": messages,
+            "max_tokens": 4,
+            "compact": {"mode": "aggressive", "trigger": 0.3},
+            "compact_return_messages": true
+        });
+        let app = create_router(model_state(dir.path()));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let header = resp.headers()["x-gibbs-compacted"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let report = &v["usage"]["compaction"];
+        let (before, after) = (report["before_tokens"].as_u64().unwrap(), report["after_tokens"].as_u64().unwrap());
+        assert_eq!(header, format!("{before}->{after}"));
+        assert!(after < before, "{report}");
+        assert!(report["tier1_chars_elided"].as_u64().unwrap() > 0, "{report}");
+        assert!(report["tier3_turns_summarized"].as_u64().unwrap() > 0, "{report}");
+        let m = v["gibbs_compacted_messages"].as_array().unwrap();
+        assert_eq!(m[0]["role"], "system");
+        assert!(m[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Compacted session summary of "));
+        assert_eq!(m.last().unwrap()["content"], "And the third law?");
+        // The 30-line log was spilled whole before its turn was folded.
+        let hex = report["artifacts"][0].as_str().unwrap();
+        let req = Request::builder()
+            .uri(format!("/v1/artifacts/{hex}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), log);
+        let req = Request::builder()
+            .uri("/v1/artifacts/..%2Fsettings")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 }

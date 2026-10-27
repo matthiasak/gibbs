@@ -211,7 +211,7 @@ impl ExecutableModel {
 
     /// A private scheduler for one-shot generation: its KV pool holds the model's whole context
     /// (at least [`ONE_SHOT_POOL_BLOCKS`]).
-    fn one_shot_scheduler(&self) -> ContinuousBatchScheduler {
+    pub(crate) fn one_shot_scheduler(&self) -> ContinuousBatchScheduler {
         // ponytail: block ids are bookkeeping only; the 4M-token cap bounds that list.
         let blocks = self
             .context_len()
@@ -266,6 +266,16 @@ impl ExecutableModel {
             return false;
         };
         self.0.restore_kv_prefix(st, snap, prefix_len)
+    }
+
+    /// [`NativeLm::thinking_delimiters`].
+    pub fn thinking_delimiters(&self) -> Vec<(String, String)> {
+        self.0.thinking_delimiters()
+    }
+
+    /// [`NativeLm::has_vision`].
+    pub fn has_vision(&self) -> bool {
+        self.0.has_vision()
     }
 }
 

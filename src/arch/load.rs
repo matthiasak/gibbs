@@ -2194,13 +2194,27 @@ fn load_from(
     if spec.pipeline != super::Pipeline::CausalLm {
         reencode.policy = ReencodePolicy::BitExact;
     }
-    if let Some(pats) = spec.runtime.get("ffn_weights").and_then(J::as_array) {
-        reencode.ffn_weights = Some(Arc::new(
-            pats.iter()
-                .filter_map(|p| p.as_str().map(String::from))
-                .collect(),
-        ));
+    let globs = |key: &str| {
+        spec.runtime.get(key).and_then(J::as_array).map(|pats| {
+            Arc::new(
+                pats.iter()
+                    .filter_map(|p| p.as_str().map(String::from))
+                    .collect::<Vec<_>>(),
+            )
+        })
+    };
+    if let Some(pats) = globs("ffn_weights") {
+        reencode.ffn_weights = Some(pats);
     }
+    if let Some(pats) = globs("sensitive_weights") {
+        reencode.sensitive_weights = Some(pats);
+    }
+    reencode.total_layers = ckpt
+        .raw
+        .keys()
+        .filter_map(|n| crate::model::reencode::parse_layer_idx(n))
+        .max()
+        .map(|l| l + 1);
     if let Some(f) = reencode.force {
         if !crate::model::reencode::encodable(f) {
             return Err(format!(
