@@ -22,7 +22,7 @@ const NC: usize = 192;
 /// Query rows per attention task: scores scratch is QB x nk.
 const QB: usize = 64;
 /// Below this many multiply-adds a GEMM runs on the calling thread.
-const PAR_MIN_FLOPS: usize = 1 << 18;
+pub(crate) const PAR_MIN_FLOPS: usize = 1 << 18;
 /// Below this many elements an elementwise/normalisation pass runs on the calling thread.
 const PAR_MIN_ELEMS: usize = 1 << 15;
 /// Elementwise task granularity.
@@ -64,7 +64,7 @@ impl Out {
 /// Runs `tasks` independent tasks, pulling indices from a shared counter so the
 /// slower efficiency cores simply take fewer tasks. `S` is per-worker scratch.
 // ponytail: spawns scoped threads per call (~tens of µs); a persistent pool if small-op overhead shows in profiles.
-fn par_tasks<S: Default>(tasks: usize, parallel: bool, f: impl Fn(&mut S, usize) + Sync) {
+pub(crate) fn par_tasks<S: Default>(tasks: usize, parallel: bool, f: impl Fn(&mut S, usize) + Sync) {
     let limit = PAR_LIMIT.load(Ordering::Relaxed);
     let max_t = if limit > 0 {
         (*THREADS).min(limit)

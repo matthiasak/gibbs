@@ -58,6 +58,7 @@ pub mod nn;
 pub mod par;
 pub mod peft;
 pub mod prequant;
+pub mod qdot;
 pub mod reencode;
 pub mod variant;
 pub mod video_repo;
