@@ -1,0 +1,148 @@
+
+// ---- norm.gpk: row normalizations and reductions (256-thread workgroups) ----
+
+// Sum of `v` over the workgroup (LSZ(0) == 256); every thread gets the result.
+DEVFN float wg_sum(LPTR float* red, float v) {
+    u32 t = LID(0);
+    BARRIER();
+    red[t] = v;
+    BARRIER();
+    for (u32 s = 128u; s > 0u; s >>= 1) {
+        if (t < s) red[t] += red[t + s];
+        BARRIER();
+    }
+    return red[0];
+}
+
+DEVFN float wg_max(LPTR float* red, float v) {
+    u32 t = LID(0);
+    BARRIER();
+    red[t] = v;
+    BARRIER();
+    for (u32 s = 128u; s > 0u; s >>= 1) {
+        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        BARRIER();
+    }
+    return red[0];
+}
+
+// y = x * (1 / sqrt(mean(x^2) + eps)) * g per row of d (unit g when has_g == 0).
+KERNEL rmsnorm(GLOBAL const float* x, u32 xo, GLOBAL const float* g, u32 go, u32 has_g,
+               GLOBAL float* y, u32 yo, u32 d, float eps) {
+    LOCAL float red[256];
+    u32 row = GRP(0), t = LID(0);
+    GLOBAL const float* xr = x + xo + row * d;
+    float s = 0.0f;
+    for (u32 i = t; i < d; i += 256u) s += xr[i] * xr[i];
+    float scale = 1.0f / sqrtf(wg_sum(red, s) / (float)d + eps);
+    for (u32 i = t; i < d; i += 256u) y[yo + row * d + i] = xr[i] * scale * (has_g ? g[go + i] : 1.0f);
+}
+
+// (x - mean) * (1 / sqrt(var + eps)) * g + b per row of d (biased variance).
+KERNEL layernorm(GLOBAL const float* x, u32 xo, GLOBAL const float* g, u32 go,
+                 GLOBAL const float* b, u32 bo, u32 has_b, GLOBAL float* y, u32 yo, u32 d,
+                 float eps) {
+    LOCAL float red[256];
+    u32 row = GRP(0), t = LID(0);
+    GLOBAL const float* xr = x + xo + row * d;
+    float s = 0.0f;
+    for (u32 i = t; i < d; i += 256u) s += xr[i];
+    float mean = wg_sum(red, s) / (float)d;
+    float q = 0.0f;
+    for (u32 i = t; i < d; i += 256u) q += (xr[i] - mean) * (xr[i] - mean);
+    float inv = 1.0f / sqrtf(wg_sum(red, q) / (float)d + eps);
+    for (u32 i = t; i < d; i += 256u)
+        y[yo + row * d + i] = (xr[i] - mean) * inv * g[go + i] + (has_b ? b[bo + i] : 0.0f);
+}
+
+// GroupNorm over sample GRP(1) of [c, hw], group GRP(0) (c / groups contiguous channels).
+KERNEL groupnorm(GLOBAL const float* x, u32 xo, GLOBAL const float* g, u32 go,
+                 GLOBAL const float* b, u32 bo, GLOBAL float* y, u32 yo, u32 c, u32 hw,
+                 u32 groups, float eps) {
+    LOCAL float red[256];
+    u32 grp = GRP(0), smp = GRP(1), t = LID(0), cg = c / groups;
+    u32 base = smp * c * hw + grp * cg * hw, n = cg * hw;
+    float s = 0.0f;
+    for (u32 i = t; i < n; i += 256u) s += x[xo + base + i];
+    float mean = wg_sum(red, s) / (float)n;
+    float q = 0.0f;
+    for (u32 i = t; i < n; i += 256u) {
+        float v = x[xo + base + i] - mean;
+        q += v * v;
+    }
+    float inv = 1.0f / sqrtf(wg_sum(red, q) / (float)n + eps);
+    for (u32 i = t; i < n; i += 256u) {
+        u32 ch = grp * cg + i / hw;
+        float sc = g[go + ch] * inv;
+        float sh = b[bo + ch] - mean * sc;
+        y[yo + base + i] = x[xo + base + i] * sc + sh;
+    }
+}
+
+// Softmax along an axis of n with element stride `inner`: workgroup per (outer, inner) line.
+KERNEL softmax(GLOBAL const float* x, u32 xo, GLOBAL float* y, u32 yo, u32 n, u32 inner) {
+    LOCAL float red[256];
+    u32 line = GRP(0), t = LID(0);
+    u32 base = (line / inner) * n * inner + line % inner;
+    float m = GPK_NEG_INF;
+    for (u32 k = t; k < n; k += 256u) m = fmaxf(m, x[xo + base + k * inner]);
+    m = wg_max(red, m);
+    float s = 0.0f;
+    for (u32 k = t; k < n; k += 256u) s += expf(x[xo + base + k * inner] - m);
+    float inv = 1.0f / fmaxf(wg_sum(red, s), 1e-12f);
+    for (u32 k = t; k < n; k += 256u) y[yo + base + k * inner] = expf(x[xo + base + k * inner] - m) * inv;
+}
+
+// x / max(|x|_2, 1e-12) over the whole tensor (one workgroup).
+KERNEL l2_normalize(GLOBAL const float* x, u32 xo, GLOBAL float* y, u32 yo, u32 n) {
+    LOCAL float red[256];
+    u32 t = LID(0);
+    float s = 0.0f;
+    for (u32 i = t; i < n; i += 256u) s += x[xo + i] * x[xo + i];
+    float nrm = fmaxf(sqrtf(wg_sum(red, s)), 1e-12f);
+    for (u32 i = t; i < n; i += 256u) y[yo + i] = x[xo + i] / nrm;
+}
+
+// Mean of the rows of x [n, d] whose mask entry is non-zero (thread per column).
+KERNEL mean_pool(GLOBAL const float* x, u32 xo, GLOBAL const u32* mask, u32 mo, GLOBAL float* y,
+                 u32 yo, u32 n, u32 d) {
+    u32 j = GID(0);
+    if (j >= d) return;
+    float s = 0.0f;
+    u32 count = 0u;
+    for (u32 r = 0; r < n; r++) {
+        if (mask[mo + r] != 0u) {
+            s += x[xo + r * d + j];
+            count++;
+        }
+    }
+    y[yo + j] = s / (float)(count > 0u ? count : 1u);
+}
+
+// Reduce over the axes in meta = [nk, kept dims.., kept strides.., nr, red dims.., red strides..]
+// (kind 0 sum, 1 mean, 2 max, 3 min), thread per output element of `count` reduced values.
+KERNEL reduce(GLOBAL const float* x, u32 xo, GLOBAL float* y, u32 yo, GLOBAL const u32* meta,
+              u32 mo, u32 n_out, u32 count, u32 kind) {
+    u32 o = GID(0);
+    if (o >= n_out) return;
+    GLOBAL const u32* m = meta + mo;
+    u32 nk = m[0];
+    GLOBAL const u32* r = m + 1u + 2u * nk;
+    u32 nr = r[0];
+    u32 base = 0u, rem = o;
+    for (u32 d = nk; d > 0u; d--) {
+        base += (rem % m[d]) * m[nk + d];
+        rem /= m[d];
+    }
+    float acc = kind == 2u ? GPK_NEG_INF : (kind == 3u ? GPK_INF : 0.0f);
+    for (u32 j = 0; j < count; j++) {
+        u32 off = base, q = j;
+        for (u32 d = nr; d > 0u; d--) {
+            off += (q % r[d]) * r[nr + d];
+            q /= r[d];
+        }
+        float v = x[xo + off];
+        acc = kind == 2u ? fmaxf(acc, v) : (kind == 3u ? fminf(acc, v) : acc + v);
+    }
+    y[yo + o] = kind == 1u ? acc / (float)count : acc;
+}

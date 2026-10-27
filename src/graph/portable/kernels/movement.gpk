@@ -1,0 +1,152 @@
+
+// ---- movement.gpk: data movement (bit copies, so f32 and u32 tensors alike) and MatMul ----
+
+// meta = [r, out dims.., input stride of each out dim..].
+KERNEL transpose(GLOBAL const u32* x, u32 xo, GLOBAL u32* y, u32 yo, GLOBAL const u32* meta,
+                 u32 mo, u32 n) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    GLOBAL const u32* m = meta + mo;
+    u32 r = m[0], rem = i, src = 0u;
+    for (u32 d = r; d > 0u; d--) {
+        src += (rem % m[d]) * m[r + d];
+        rem /= m[d];
+    }
+    y[yo + i] = x[xo + src];
+}
+
+// meta = [r, out dims.., in dims.., in strides..]: out index modulo the input dims.
+KERNEL tile(GLOBAL const u32* x, u32 xo, GLOBAL u32* y, u32 yo, GLOBAL const u32* meta, u32 mo,
+            u32 n) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    GLOBAL const u32* m = meta + mo;
+    u32 r = m[0], rem = i, src = 0u;
+    for (u32 d = r; d > 0u; d--) {
+        u32 c = rem % m[d];
+        rem /= m[d];
+        src += (c % m[r + d]) * m[2u * r + d];
+    }
+    y[yo + i] = x[xo + src];
+}
+
+// meta = [r, out dims.., in dims.., pad before..]; positions outside the input take `value`.
+KERNEL pad(GLOBAL const u32* x, u32 xo, GLOBAL u32* y, u32 yo, GLOBAL const u32* meta, u32 mo,
+           u32 n, float value) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    GLOBAL const u32* m = meta + mo;
+    u32 r = m[0], rem = i, src = 0u, stride = 1u, inside = 1u;
+    for (u32 d = r; d > 0u; d--) {
+        u32 c = rem % m[d];
+        rem /= m[d];
+        u32 b = m[2u * r + d], dim = m[r + d];
+        if (c < b || c - b >= dim) inside = 0u;
+        else src += (c - b) * stride;
+        stride *= dim;
+    }
+    y[yo + i] = inside ? x[xo + src] : AS_UINT(value);
+}
+
+// out [outer, len] from rows of `dim` elements starting at `start` (all in elements).
+KERNEL slice(GLOBAL const u32* x, u32 xo, GLOBAL u32* y, u32 yo, u32 n, u32 len, u32 dim,
+             u32 start) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    y[yo + i] = x[xo + (i / len) * dim + start + i % len];
+}
+
+// Copies one Concat operand (chunk elements per outer index) into the output at `at`.
+KERNEL concat_part(GLOBAL const u32* x, u32 xo, GLOBAL u32* y, u32 yo, u32 n, u32 chunk,
+                   u32 total, u32 at) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    y[yo + (i / chunk) * total + at + i % chunk] = x[xo + i];
+}
+
+// out [outer, nidx, inner] = x[outer, idx, inner]; indices >= dim give zeros.
+KERNEL gather(GLOBAL const u32* x, u32 xo, GLOBAL const u32* idx, u32 io, GLOBAL u32* y, u32 yo,
+              u32 n, u32 nidx, u32 dim, u32 inner) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    u32 k = i % inner, j = (i / inner) % nidx, o = i / (inner * nidx);
+    u32 id = idx[io + j];
+    y[yo + i] = id < dim ? x[xo + (o * dim + id) * inner + k] : 0u;
+}
+
+// y (a copy of the base) [outer, dim, inner] takes updates [outer, nidx, inner] at the indices;
+// thread per (outer, inner) walks the indices in order (later duplicates win).
+KERNEL scatter(GLOBAL const u32* idx, u32 io, GLOBAL const u32* upd, u32 uo, GLOBAL u32* y, u32 yo,
+               u32 n, u32 nidx, u32 dim, u32 inner, u32 n_upd, u32 n_base) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    u32 k = i % inner, o = i / inner;
+    for (u32 j = 0; j < nidx; j++) {
+        u32 id = idx[io + j];
+        u32 up = (o * nidx + j) * inner;
+        u32 dst = (o * dim + id) * inner;
+        if (id < dim && up + inner <= n_upd && dst + inner <= n_base) y[yo + dst + k] = upd[uo + up + k];
+    }
+}
+
+// out[r, j] = x[shared ? 0 : r, idx[r, j]]; out-of-range columns give zeros.
+KERNEL gather_cols(GLOBAL const u32* x, u32 xo, GLOBAL const u32* idx, u32 io, GLOBAL u32* y,
+                   u32 yo, u32 n, u32 cols, u32 k, u32 shared) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    u32 c = idx[io + i];
+    u32 row = shared ? 0u : i / k;
+    y[yo + i] = c < cols ? x[xo + row * cols + c] : 0u;
+}
+
+// out[b] = x[parent[b]] rows of row_len (zeros when the parent is out of range).
+KERNEL state_reorder(GLOBAL const u32* x, u32 xo, GLOBAL const u32* parent, u32 po, GLOBAL u32* y,
+                     u32 yo, u32 batch, u32 row_len, u32 n) {
+    u32 i = GID(0);
+    if (i >= n || row_len == 0u) return;
+    u32 b = i / row_len, p = parent[po + b];
+    y[yo + i] = p < batch ? x[xo + p * row_len + i % row_len] : 0u;
+}
+
+// HF `_relative_position_bucket` bias [heads, n, m]: thread per (key GID(0), query GRP(1)).
+// nb is the per-direction bucket count, lscale = ln(max_distance / exact) (computed in f64).
+KERNEL rel_pos_bias(GLOBAL const float* table, u32 to, GLOBAL const u32* qpos, u32 qo,
+                    GLOBAL const u32* kpos, u32 ko, GLOBAL float* y, u32 yo, u32 n, u32 m,
+                    u32 heads, u32 nb, u32 bidir, float lscale) {
+    u32 ki = GID(0), qi = GRP(1);
+    if (ki >= m || qi >= n) return;
+    i64 rel = (i64)kpos[ko + ki] - (i64)qpos[qo + qi];
+    i64 ret = 0, dist;
+    if (bidir) {
+        if (rel > 0) ret += nb;
+        dist = rel < 0 ? -rel : rel;
+    } else {
+        dist = rel < 0 ? -rel : 0;
+    }
+    i64 exact = nb / 2;
+    i64 bucket;
+    if (dist < exact) {
+        bucket = ret + dist;
+    } else {
+        i64 large = exact + (i64)(logf((float)dist / (float)exact) / lscale * (float)(nb - exact));
+        bucket = ret + (large < (i64)nb - 1 ? large : (i64)nb - 1);
+    }
+    for (u32 h = 0; h < heads; h++) y[yo + (h * n + qi) * m + ki] = table[to + (u32)bucket * heads + h];
+}
+
+// op(a) . op(b) per batch (meta = per-batch [a offset, b offset]): thread per output element.
+KERNEL matmul(GLOBAL const float* a, u32 ao, GLOBAL const float* b, u32 bo, GLOBAL float* y,
+              u32 yo, GLOBAL const u32* meta, u32 mo, u32 m, u32 n, u32 k, u32 ta, u32 tb,
+              u32 nb) {
+    u32 j = GID(0), i = GID(1), bi = GRP(2);
+    if (i >= m || j >= n || bi >= nb) return;
+    GLOBAL const float* A = a + ao + meta[mo + 2u * bi];
+    GLOBAL const float* B = b + bo + meta[mo + 2u * bi + 1u];
+    float acc = 0.0f;
+    for (u32 kk = 0; kk < k; kk++) {
+        float av = ta ? A[kk * m + i] : A[i * k + kk];
+        float bv = tb ? B[j * k + kk] : B[kk * n + j];
+        acc += av * bv;
+    }
+    y[yo + (bi * m + i) * n + j] = acc;
+}

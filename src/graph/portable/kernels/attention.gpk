@@ -1,0 +1,154 @@
+
+// ---- attention.gpk: Attention and CachedAttention (one 128-thread workgroup per (head, query),
+// keys in chunks of 128 with an online softmax; thread t owns output dims t, t+128, ...) ----
+
+#define ATT_T 128u
+
+DEVFN float att_sum(LPTR float* red, float v) {
+    u32 t = LID(0);
+    BARRIER();
+    red[t] = v;
+    BARRIER();
+    for (u32 s = ATT_T / 2u; s > 0u; s >>= 1) {
+        if (t < s) red[t] += red[t + s];
+        BARRIER();
+    }
+    return red[0];
+}
+
+DEVFN float att_max(LPTR float* red, float v) {
+    u32 t = LID(0);
+    BARRIER();
+    red[t] = v;
+    BARRIER();
+    for (u32 s = ATT_T / 2u; s > 0u; s >>= 1) {
+        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        BARRIER();
+    }
+    return red[0];
+}
+
+// Online-softmax attention of query vector qs over keys [lo, hi): row `key` of K is at
+// k + key * kstride, of V at v + key * vstride. score(key) = cap(q.k * scale) + bias(key) where
+// `bias_row` (or NULL-equivalent bias_mode 0) adds bias_row[key]. Writes y[0..vd).
+DEVFN void att_core(LPTR float* qs, LPTR float* ps, LPTR float* red, GLOBAL const float* k,
+                    u32 kstride, GLOBAL const float* v, u32 vstride, u32 d, u32 vd, u32 lo,
+                    u32 hi, float scale, float cap, GLOBAL const float* bias_row, u32 has_bias,
+                    GLOBAL float* y) {
+    u32 t = LID(0);
+    float m = GPK_NEG_INF, l = 0.0f;
+    float acc[4];
+    for (u32 i = 0; i < 4u; i++) acc[i] = 0.0f;
+    for (u32 c0 = lo; c0 < hi; c0 += ATT_T) {
+        u32 key = c0 + t;
+        float s = GPK_NEG_INF;
+        if (key < hi) {
+            GLOBAL const float* kr = k + (u64)key * kstride;
+            float dot = 0.0f;
+            for (u32 i = 0; i < d; i++) dot += qs[i] * kr[i];
+            s = dot * scale;
+            if (cap != 0.0f) s = cap * tanhf(s / cap);
+            if (has_bias) s += bias_row[key];
+        }
+        float cm = att_max(red, s);
+        float nm = fmaxf(m, cm);
+        if (nm == GPK_NEG_INF) continue;
+        float alpha = m == GPK_NEG_INF ? 0.0f : expf(m - nm);
+        float p = s == GPK_NEG_INF ? 0.0f : expf(s - nm);
+        ps[t] = p;
+        l = l * alpha + att_sum(red, p);
+        u32 n = hi - c0 < ATT_T ? hi - c0 : ATT_T;
+        for (u32 i = 0; i < 4u; i++) {
+            u32 j = t + i * ATT_T;
+            if (j < vd) {
+                float a = acc[i] * alpha;
+                for (u32 q = 0; q < n; q++) a += ps[q] * v[(u64)(c0 + q) * vstride + j];
+                acc[i] = a;
+            }
+        }
+        m = nm;
+    }
+    for (u32 i = 0; i < 4u; i++) {
+        u32 j = t + i * ATT_T;
+        if (j < vd) y[j] = l > 0.0f ? acc[i] / l : 0.0f;
+    }
+}
+
+// Op::Attention. meta = [nq, nk, heads, kv_heads, d, causal, has_window, window, bias_mode]
+// (bias_mode 0 none, 1 [nk], 2 [nq, nk], 3 [heads, nq, nk]).
+KERNEL attention(GLOBAL const float* q, u32 qo, GLOBAL const float* k, u32 ko, GLOBAL const float* v,
+                 u32 vo, GLOBAL const float* bias, u32 bo, GLOBAL float* y, u32 yo,
+                 GLOBAL const u32* meta, u32 mo, float scale, float cap) {
+    LOCAL float qs[512];
+    LOCAL float ps[ATT_T];
+    LOCAL float red[ATT_T];
+    GLOBAL const u32* m = meta + mo;
+    u32 nq = m[0], nk = m[1], heads = m[2], kvh = m[3], d = m[4];
+    u32 causal = m[5], has_w = m[6], w = m[7], bias_mode = m[8];
+    u32 h = GRP(0), qi = GRP(1), t = LID(0);
+    u32 kv = h / (heads / kvh);
+    GLOBAL const float* qr = q + qo + qi * heads * d + h * d;
+    for (u32 i = t; i < d; i += ATT_T) qs[i] = qr[i];
+    BARRIER();
+    u32 lo = 0u, hi = nk;
+    if (causal) {
+        hi = qi + 1u < nk ? qi + 1u : nk;
+        if (has_w) lo = qi + 1u > w ? qi + 1u - w : 0u;
+    } else if (has_w) {
+        lo = qi > w / 2u ? qi - w / 2u : 0u;
+        u32 e = qi + w / 2u + 1u;
+        hi = e < nk ? e : nk;
+    }
+    GLOBAL const float* brow = bias + bo;
+    if (bias_mode == 2u) brow += qi * nk;
+    if (bias_mode == 3u) brow += (h * nq + qi) * nk;
+    att_core(qs, ps, red, k + ko + kv * d, kvh * d, v + vo + kv * d, kvh * d, d, d, lo, hi, scale,
+             cap, brow, bias_mode != 0u, y + yo + qi * heads * d + h * d);
+}
+
+// Appends m rows of `width` (n = m * width values) at row pos[0] of a KV state of `cap` rows.
+KERNEL kv_append(GLOBAL const float* x, u32 xo, GLOBAL float* st, u32 so, GLOBAL const u32* pos,
+                 u32 po, u32 n, u32 width, u32 cap) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    u32 p = pos[po];
+    if (p + i / width < cap) st[so + p * width + i] = x[xo + i];
+}
+
+// Op::CachedAttention over KV rows of `kcap` / `vcap` capacity. meta = [nq, heads, kv_heads,
+// head_dim, v_head_dim, causal, has_window, window, has_visible_end, cached]. Row i of the
+// queries is at position pos[0] + i (0 when not cached); it sees keys < visible_end[i] (or
+// position + 1) when causal, every stored key otherwise, and with a window only keys after
+// position - window.
+KERNEL cached_attention(GLOBAL const float* q, u32 qo, GLOBAL const float* k, u32 ko,
+                        GLOBAL const float* v, u32 vo, GLOBAL const u32* pos, u32 po,
+                        GLOBAL const u32* vis, u32 vio, GLOBAL float* y, u32 yo,
+                        GLOBAL const u32* meta, u32 mo, float scale, float cap, u32 kcap,
+                        u32 vcap) {
+    LOCAL float qs[512];
+    LOCAL float ps[ATT_T];
+    LOCAL float red[ATT_T];
+    GLOBAL const u32* m = meta + mo;
+    u32 nq = m[0], heads = m[1], kvh = m[2], hd = m[3], vhd = m[4];
+    u32 causal = m[5], has_w = m[6], w = m[7], has_vis = m[8], cached = m[9];
+    u32 h = GRP(0), qi = GRP(1), t = LID(0);
+    u32 kv = h / (heads / kvh);
+    u32 p0 = cached ? pos[po] : 0u;
+    u32 rows = kcap < vcap ? kcap : vcap;
+    u32 nk = p0 + nq;
+    if (has_vis)
+        for (u32 i = 0; i < nq; i++) nk = vis[vio + i] > nk ? vis[vio + i] : nk;
+    nk = nk < rows ? nk : rows;
+    GLOBAL const float* qr = q + qo + qi * heads * hd + h * hd;
+    for (u32 i = t; i < hd; i += ATT_T) qs[i] = qr[i];
+    BARRIER();
+    u32 cur = p0 + qi;
+    u32 hi = nk;
+    if (causal) {
+        u32 e = has_vis ? vis[vio + qi] : cur + 1u;
+        hi = e < nk ? e : nk;
+    }
+    u32 lo = (has_w && cur + 1u > w) ? cur + 1u - w : 0u;
+    att_core(qs, ps, red, k + ko + kv * hd, kvh * hd, v + vo + kv * vhd, kvh * vhd, hd, vhd, lo,
+             hi, scale, cap, k, 0u, y + yo + qi * heads * vhd + h * vhd);
+}

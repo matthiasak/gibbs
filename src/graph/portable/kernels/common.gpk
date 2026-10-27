@@ -1,0 +1,50 @@
+
+// ---- common.gpk: helpers every kernel file shares ----
+
+#define GPK_INF AS_FLOAT(0x7f800000u)
+#define GPK_NEG_INF AS_FLOAT(0xff800000u)
+
+// Little-endian loads at any byte alignment.
+DEVFN u32 ld_u16(GLOBAL const u8* p) { return (u32)p[0] | ((u32)p[1] << 8); }
+DEVFN u32 ld_u32(GLOBAL const u8* p) { return ld_u16(p) | (ld_u16(p + 2) << 16); }
+
+// IEEE half bits -> float (subnormals, infinities and NaN included), without half arithmetic.
+DEVFN float f16_bits_to_f32(u32 h) {
+    u32 sign = (h & 0x8000u) << 16;
+    u32 exp = (h >> 10) & 0x1fu;
+    u32 man = h & 0x3ffu;
+    if (exp == 0u) {
+        // Zero or subnormal: man * 2^-24.
+        float v = (float)man * AS_FLOAT(0x33800000u);
+        return AS_FLOAT(AS_UINT(v) | sign);
+    }
+    if (exp == 31u) return AS_FLOAT(sign | 0x7f800000u | (man << 13));
+    return AS_FLOAT(sign | ((exp + 112u) << 23) | (man << 13));
+}
+
+DEVFN float bf16_bits_to_f32(u32 b) { return AS_FLOAT(b << 16); }
+
+DEVFN float ld_f16(GLOBAL const u8* p) { return f16_bits_to_f32(ld_u16(p)); }
+
+// Dense encodings as 8-element blocks (rows are padded to a multiple of 8 at upload).
+DEVFN void dec_F32(GLOBAL const u8* blk, u32 sub, float* out8) {
+    GLOBAL const u8* p = blk + sub * 32u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = AS_FLOAT(ld_u32(p + 4u * i));
+}
+DEVFN void dec_F16(GLOBAL const u8* blk, u32 sub, float* out8) {
+    GLOBAL const u8* p = blk + sub * 16u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = ld_f16(p + 2u * i);
+}
+DEVFN void dec_BF16(GLOBAL const u8* blk, u32 sub, float* out8) {
+    GLOBAL const u8* p = blk + sub * 16u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = bf16_bits_to_f32(ld_u16(p + 2u * i));
+}
+
+// Total order of f32::total_cmp as a signed key.
+DEVFN i32 total_key(float v) {
+    i32 b = (i32)AS_UINT(v);
+    return b ^ (i32)(((u32)(b >> 31)) >> 1);
+}
+
+// NaN ranks below every number (TopK order).
+DEVFN float nan_low(float v) { return v != v ? GPK_NEG_INF : v; }

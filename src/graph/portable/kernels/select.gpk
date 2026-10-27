@@ -1,0 +1,90 @@
+
+// ---- select.gpk: TopK and sparse block attention key selection ----
+
+// Whether (va, ia) ranks before (vb, ib): value descending, then index ascending.
+DEVFN u32 ranks_before(float va, u32 ia, float vb, u32 ib) {
+    return va > vb || (va == vb && ia < ib);
+}
+
+// Indices of the k largest of each row of `cols` (NaN lowest), sorted: workgroup per row, one
+// round per output, each round the best element ranking after the previous pick.
+KERNEL topk(GLOBAL const float* x, u32 xo, GLOBAL u32* y, u32 yo, u32 cols, u32 k) {
+    LOCAL float bv[256];
+    LOCAL u32 bi[256];
+    u32 row = GRP(0), t = LID(0);
+    GLOBAL const float* xr = x + xo + row * cols;
+    float pv = GPK_INF;
+    u32 pi = 0u, first = 1u;
+    for (u32 r = 0; r < k; r++) {
+        float best = GPK_NEG_INF;
+        u32 besti = 0xffffffffu;
+        for (u32 c = t; c < cols; c += 256u) {
+            float v = nan_low(xr[c]);
+            u32 after = first || ranks_before(pv, pi, v, c);
+            if (after && (besti == 0xffffffffu || ranks_before(v, c, best, besti))) {
+                best = v;
+                besti = c;
+            }
+        }
+        bv[t] = best;
+        bi[t] = besti;
+        BARRIER();
+        for (u32 s = 128u; s > 0u; s >>= 1) {
+            if (t < s && bi[t + s] != 0xffffffffu &&
+                (bi[t] == 0xffffffffu || ranks_before(bv[t + s], bi[t + s], bv[t], bi[t]))) {
+                bv[t] = bv[t + s];
+                bi[t] = bi[t + s];
+            }
+            BARRIER();
+        }
+        pv = bv[0];
+        pi = bi[0];
+        first = 0u;
+        if (t == 0u) y[yo + row * k + r] = pi;
+        BARRIER();
+    }
+}
+
+// Op::QsaSelect ids (bias == 0) or Op::QsaBias (bias == 1) [n, K], K = top * ratio + ratio - 1,
+// for score [n, b] at positions: thread per row. Blocks rank by f32 total order, then index.
+KERNEL qsa_select(GLOBAL const float* score, u32 so, GLOBAL const u32* pos, u32 po, GLOBAL u32* y,
+                  u32 yo, u32 n, u32 b, u32 ratio, u32 top, u32 bias) {
+    u32 t = GID(0);
+    if (t >= n) return;
+    u32 K = top * ratio + ratio - 1u;
+    u32 visible = pos[po + t] + 1u;
+    u32 blocks = visible / ratio;
+    blocks = blocks < b ? blocks : b;
+    GLOBAL const float* row = score + so + t * b;
+    GLOBAL u32* out = y + yo + t * K;
+    u32 neg_inf = AS_UINT(GPK_NEG_INF);
+    for (u32 j = 0; j < K; j++) out[j] = bias ? neg_inf : 0u;
+    u32 at = 0u;
+    if (blocks <= top) {
+        for (u32 key = 0; key < visible && at < K; key++) out[at++] = bias ? 0u : key;
+        return;
+    }
+    // The top-th best block (key, index): `top` rounds of "best ranking after the previous".
+    i32 pk = 0;
+    u32 pj = 0u;
+    for (u32 r = 0; r < top; r++) {
+        i32 bk = 0;
+        u32 bj = 0xffffffffu;
+        for (u32 j = 0; j < blocks; j++) {
+            i32 kj = total_key(row[j]);
+            u32 after = r == 0u || kj < pk || (kj == pk && j > pj);
+            if (after && (bj == 0xffffffffu || kj > bk || (kj == bk && j < bj))) {
+                bk = kj;
+                bj = j;
+            }
+        }
+        pk = bk;
+        pj = bj;
+    }
+    for (u32 j = 0; j < blocks; j++) {
+        i32 kj = total_key(row[j]);
+        if (kj > pk || (kj == pk && j <= pj))
+            for (u32 q = 0; q < ratio; q++) out[at++] = bias ? 0u : j * ratio + q;
+    }
+    for (u32 key = blocks * ratio; key < visible && at < K; key++) out[at++] = bias ? 0u : key;
+}

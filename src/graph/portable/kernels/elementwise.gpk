@@ -1,0 +1,97 @@
+
+// ---- elementwise.gpk: unary, binary, GLU, copy and fill (one thread per element) ----
+
+KERNEL copy_u32(GLOBAL const u32* x, u32 xo, GLOBAL u32* y, u32 yo, u32 n) {
+    u32 i = GID(0);
+    if (i < n) y[yo + i] = x[xo + i];
+}
+
+KERNEL fill_u32(GLOBAL u32* y, u32 yo, u32 n, u32 v) {
+    u32 i = GID(0);
+    if (i < n) y[yo + i] = v;
+}
+
+DEVFN float sigmoidf(float v) { return 1.0f / (1.0f + expf(-v)); }
+
+DEVFN float gelu_tanhf(float v) {
+    return 0.5f * v * (1.0f + tanhf(0.7978846f * (v + 0.044715f * v * v * v)));
+}
+
+// `kind` codes: 0 exp, 1 sigmoid, 2 tanh, 3 softplus, 4 neg, 5 sqrt, 6 rsqrt, 7 abs, 8 relu,
+// 9 relu2, 10 silu, 11 gelu (erf), 12 gelu (tanh), 13 scale p0, 14 clamp [p0, p1],
+// 15 soft cap p0, 16 ln, 17 round half even, 18 sign.
+KERNEL unary(GLOBAL const float* x, u32 xo, GLOBAL float* y, u32 yo, u32 n, u32 kind, float p0,
+             float p1) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    float v = x[xo + i], r = v;
+    switch (kind) {
+        case 0u: r = expf(v); break;
+        case 1u: r = sigmoidf(v); break;
+        case 2u: r = tanhf(v); break;
+        case 3u: r = v > 20.0f ? v : log1pf(expf(v)); break;
+        case 4u: r = -v; break;
+        case 5u: r = sqrtf(v); break;
+        case 6u: r = 1.0f / sqrtf(v); break;
+        case 7u: r = fabsf(v); break;
+        case 8u: r = fmaxf(v, 0.0f); break;
+        case 9u: { float m = fmaxf(v, 0.0f); r = m * m; break; }
+        case 10u: r = v / (1.0f + expf(-v)); break;
+        case 11u: r = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)); break;
+        case 12u: r = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); break;
+        case 13u: r = v * p0; break;
+        case 14u: r = v < p0 ? p0 : (v > p1 ? p1 : v); break;
+        case 15u: r = p0 * tanhf(v / p0); break;
+        case 16u: r = logf(v); break;
+        case 17u: r = rintf(v); break;
+        case 18u: r = v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f); break;
+        default: break;
+    }
+    y[yo + i] = r;
+}
+
+DEVFN float binop(u32 kind, float a, float b) {
+    switch (kind) {
+        case 0u: return a + b;
+        case 1u: return a - b;
+        case 2u: return a * b;
+        case 3u: return a / b;
+        case 4u: return fmaxf(a, b);
+        default: return fminf(a, b);
+    }
+}
+
+// mode 0: a[i % la] op b[i % lb] with meta = [la, lb] (equal lengths or one tiled over the
+// other); mode 1: strided over output dims, meta = [rank, dims.., a strides.., b strides..].
+KERNEL binary(GLOBAL const float* a, u32 ao, GLOBAL const float* b, u32 bo, GLOBAL float* y,
+              u32 yo, GLOBAL const u32* meta, u32 mo, u32 n, u32 kind, u32 mode) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    GLOBAL const u32* m = meta + mo;
+    u32 ia, ib;
+    if (mode == 0u) {
+        ia = i % m[0];
+        ib = i % m[1];
+    } else {
+        u32 r = m[0], rem = i;
+        ia = 0u;
+        ib = 0u;
+        for (u32 d = r; d > 0u; d--) {
+            u32 dim = m[d];
+            u32 c = rem % dim;
+            rem /= dim;
+            ia += c * m[r + d];
+            ib += c * m[2u * r + d];
+        }
+    }
+    y[yo + i] = binop(kind, a[ao + ia], b[bo + ib]);
+}
+
+// SwiGLU (silu(g) * u) or GeGLU (gelu_tanh(g) * u).
+KERNEL glu(GLOBAL const float* g, u32 go, GLOBAL const float* u, u32 uo, GLOBAL float* y, u32 yo,
+           u32 n, u32 geglu) {
+    u32 i = GID(0);
+    if (i >= n) return;
+    float gv = g[go + i];
+    y[yo + i] = geglu ? gelu_tanhf(gv) * u[uo + i] : (gv * sigmoidf(gv)) * u[uo + i];
+}

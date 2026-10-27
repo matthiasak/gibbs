@@ -18,21 +18,15 @@ pub enum CompiledSegment {
         session: crate::graph::metal::Session,
         plan: crate::graph::metal::PreparedPlan,
     },
-    Cuda {
+    /// CUDA, ROCm or Intel XPU: the portable executor.
+    Portable {
+        device: Device,
         graph: Graph,
-        session: crate::graph::cuda::CudaSession,
-    },
-    Rocm {
-        graph: Graph,
-        session: crate::graph::rocm::RocmSession,
+        session: crate::graph::portable::PortableSession,
     },
     Xla {
         graph: Graph,
         session: crate::graph::xla::XlaSession,
-    },
-    IntelXpu {
-        graph: Graph,
-        session: crate::graph::intel_xpu::IntelXpuSession,
     },
     Extropic {
         graph: Graph,
@@ -46,10 +40,8 @@ impl CompiledSegment {
             Self::Cpu { .. } => Device::Cpu,
             #[cfg(target_os = "macos")]
             Self::Metal { .. } => Device::Metal,
-            Self::Cuda { .. } => Device::Cuda,
-            Self::Rocm { .. } => Device::Rocm,
+            Self::Portable { device, .. } => *device,
             Self::Xla { .. } => Device::Xla,
-            Self::IntelXpu { .. } => Device::IntelXpu,
             Self::Extropic { .. } => Device::Extropic,
         }
     }
@@ -57,10 +49,8 @@ impl CompiledSegment {
     pub fn graph(&self) -> &Graph {
         match self {
             Self::Cpu { graph, .. }
-            | Self::Cuda { graph, .. }
-            | Self::Rocm { graph, .. }
+            | Self::Portable { graph, .. }
             | Self::Xla { graph, .. }
-            | Self::IntelXpu { graph, .. }
             | Self::Extropic { graph, .. } => graph,
             #[cfg(target_os = "macos")]
             Self::Metal { graph, .. } => graph,
@@ -231,21 +221,20 @@ impl GraphProgram {
                     plan: prepared_plan,
                 }
             }
-            Device::Cuda => {
-                let session = crate::graph::cuda::CudaSession::compile(&graph, weights)?;
-                CompiledSegment::Cuda { graph, session }
-            }
-            Device::Rocm => {
-                let session = crate::graph::rocm::RocmSession::compile(&graph, weights)?;
-                CompiledSegment::Rocm { graph, session }
+            d if crate::graph::portable::is_portable(d) => {
+                let api = crate::graph::portable::device_api(d)
+                    .ok_or_else(|| format!("--backend {d}: not available on this host"))?;
+                let session =
+                    crate::graph::portable::PortableSession::compile(api, &graph, weights)?;
+                CompiledSegment::Portable {
+                    device: d,
+                    graph,
+                    session,
+                }
             }
             Device::Xla => {
                 let session = crate::graph::xla::XlaSession::compile(&graph, weights)?;
                 CompiledSegment::Xla { graph, session }
-            }
-            Device::IntelXpu => {
-                let session = crate::graph::intel_xpu::IntelXpuSession::compile(&graph, weights)?;
-                CompiledSegment::IntelXpu { graph, session }
             }
             Device::Extropic => {
                 let session = crate::graph::extropic::ExtropicSession::compile(&graph, weights)?;
@@ -370,16 +359,14 @@ impl GraphProgram {
     ) -> Result<Vec<Tensor>, String> {
         #[cfg(test)]
         crate::graph::shape::note(graph);
-        match &self.segment {
+        match &mut self.segment {
             CompiledSegment::Cpu { weights, .. } => {
                 cpu::run(graph, weights, &mut self.state, inputs)
             }
-            CompiledSegment::Cuda { session, .. } => session.run(graph, &mut self.state, inputs),
-            CompiledSegment::Rocm { session, .. } => session.run(graph, &mut self.state, inputs),
-            CompiledSegment::Xla { session, .. } => session.run(graph, &mut self.state, inputs),
-            CompiledSegment::IntelXpu { session, .. } => {
-                session.run(graph, &mut self.state, inputs)
+            CompiledSegment::Portable { session, .. } => {
+                session.run_reshaped(graph, &mut self.state, inputs)
             }
+            CompiledSegment::Xla { session, .. } => session.run(graph, &mut self.state, inputs),
             CompiledSegment::Extropic { session, .. } => {
                 session.run(graph, &mut self.state, inputs)
             }
@@ -429,12 +416,8 @@ impl GraphProgram {
             CompiledSegment::Cpu { graph, weights } => {
                 cpu::run(graph, weights, &mut self.state, inputs)
             }
-            CompiledSegment::Cuda { graph, session } => session.run(graph, &mut self.state, inputs),
-            CompiledSegment::Rocm { graph, session } => session.run(graph, &mut self.state, inputs),
+            CompiledSegment::Portable { session, .. } => session.run(&mut self.state, inputs),
             CompiledSegment::Xla { graph, session } => session.run(graph, &mut self.state, inputs),
-            CompiledSegment::IntelXpu { graph, session } => {
-                session.run(graph, &mut self.state, inputs)
-            }
             CompiledSegment::Extropic { graph, session } => {
                 session.run(graph, &mut self.state, inputs)
             }
@@ -717,10 +700,11 @@ fn place_and_adapt(
         plan.segments.len() <= 1,
         "placement yields at most one segment"
     );
-    if plan.primary_device() == Device::Metal {
+    let device = plan.primary_device();
+    if device == Device::Metal || crate::graph::portable::is_portable(device) {
         crate::graph::passes::dtype_adapt::run(graph);
         crate::graph::passes::dtype_adapt::retype_uncoded_weights(graph, &|f| {
-            device_supports_op(Device::Metal, &Op::Linear, DType::Quant(f))
+            device_supports_op(device, &Op::Linear, DType::Quant(f))
         })?;
     }
     Ok(plan)
@@ -999,29 +983,938 @@ mod tests {
         assert_eq!(sampled.len(), 10);
     }
 
-    #[test]
-    fn multi_hardware_backends_compile_and_execute_matching_cpu() {
-        let (g, w) = two_linears();
-        let input = vec![Tensor::F32(
-            (0..4).map(|i| (i as f32) * 0.25 - 0.5).collect(),
-        )];
-        let mut cpu_prog =
-            GraphProgram::compile(g.clone(), w.clone(), PlacementMode::Pin(Device::Cpu)).unwrap();
-        let want = cpu_prog.run(input.clone()).unwrap();
+    /// One [`backends_match_cpu_on_every_op`] case: a graph, its weights, and its runs in order
+    /// (`Some(graph)` runs another instance shape through `run_reshaped`), sharing one state.
+    struct Case {
+        name: String,
+        graph: Graph,
+        weights: Weights,
+        runs: Vec<(Option<Graph>, Vec<Tensor>)>,
+    }
 
-        for dev in [
-            Device::Cuda,
-            Device::Rocm,
-            Device::Xla,
-            Device::IntelXpu,
-            Device::Extropic,
-        ] {
-            let mut prog =
-                GraphProgram::compile(g.clone(), w.clone(), PlacementMode::Pin(dev)).unwrap();
-            assert_eq!(prog.primary_device(), dev);
-            assert_eq!(prog.cpu_node_count(), 0);
-            let got = prog.run(input.clone()).unwrap();
-            assert_eq!(got, want, "backend {dev:?} output mismatch");
+    /// Builds a [`Case`] graph with deterministic pseudo-random data.
+    struct Fx {
+        g: Graph,
+        w: Weights,
+        ins: Vec<Tensor>,
+        seed: u64,
+    }
+
+    impl Fx {
+        fn new(seed: u64) -> Self {
+            Self {
+                g: Graph::new(),
+                w: Weights::new(),
+                ins: Vec::new(),
+                seed: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            }
         }
+        fn rnd(&mut self, n: usize) -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    self.seed = self
+                        .seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((self.seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect()
+        }
+        fn x(&mut self, name: &str, shape: &[usize]) -> ValueId {
+            let v = self.rnd(shape.iter().product());
+            self.ins.push(Tensor::F32(v));
+            self.g.input(name, shape.to_vec(), DType::F32)
+        }
+        fn u(&mut self, name: &str, data: &[u32]) -> ValueId {
+            self.u2(name, data, &[data.len()])
+        }
+        fn u2(&mut self, name: &str, data: &[u32], shape: &[usize]) -> ValueId {
+            self.ins.push(Tensor::U32(data.to_vec()));
+            self.g.input(name, shape.to_vec(), DType::U32)
+        }
+        fn w(&mut self, name: &str, shape: &[usize]) -> ValueId {
+            let v = self.rnd(shape.iter().product());
+            self.wt(name, shape, DType::F32, Tensor::F32(v))
+        }
+        fn wt(&mut self, name: &str, shape: &[usize], dtype: DType, t: Tensor) -> ValueId {
+            self.w.insert(name, t);
+            self.g.weight(name, shape.to_vec(), dtype)
+        }
+        fn op(&mut self, op: Op, ins: &[ValueId]) -> ValueId {
+            let name = format!("n{}", self.g.nodes.len());
+            self.g.push(name, op, ins).unwrap()
+        }
+        fn case(mut self, name: &str, outs: &[ValueId]) -> Case {
+            for &o in outs {
+                self.g.output(o);
+            }
+            Case {
+                name: name.into(),
+                graph: self.g,
+                weights: self.w,
+                runs: vec![(None, self.ins)],
+            }
+        }
+    }
+
+    /// `cols` (whole blocks) by `rows` of random `f` blocks whose CPU decode is finite and small.
+    fn quant_rows(f: crate::hardware::QuantFormat, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+        let (elems, bytes, dec) = crate::model::layers::gguf_block_codec(f).expect("block codec");
+        let mut s = seed | 1;
+        let mut out = Vec::new();
+        let mut vals = vec![0f32; elems];
+        for _ in 0..rows * cols / elems {
+            loop {
+                let blk: Vec<u8> = (0..bytes)
+                    .map(|_| {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (s >> 56) as u8
+                    })
+                    .collect();
+                dec(&blk, &mut vals);
+                if vals.iter().all(|v| v.is_finite() && v.abs() < 1e3) {
+                    out.extend(blk);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// A CachedAttention layer instance of `m` query rows: q/k/v inputs, a 64-row KV state pair,
+    /// positions `start..start + m`, optional per-row `visible_end`.
+    fn cached_attn(
+        op: &Op,
+        m: usize,
+        start: u32,
+        vis: Option<u32>,
+        seed: u64,
+    ) -> (Graph, Vec<Tensor>) {
+        let Op::CachedAttention {
+            heads,
+            kv_heads,
+            head_dim,
+            v_head_dim,
+            ..
+        } = *op
+        else {
+            unreachable!()
+        };
+        let mut f = Fx::new(seed);
+        let q = f.x("q", &[m, heads * head_dim]);
+        let k = f.x("k", &[m, kv_heads * head_dim]);
+        let v = f.x("v", &[m, kv_heads * v_head_dim]);
+        let ks =
+            f.g.state("kc", vec![64, kv_heads * head_dim], DType::F32, false);
+        let vs =
+            f.g.state("vc", vec![64, kv_heads * v_head_dim], DType::F32, false);
+        let pos: Vec<u32> = (start..start + m as u32).collect();
+        let p = f.u("pos", &pos);
+        let mut ins = vec![q, k, v, ks, vs, p];
+        if let Some(extra) = vis {
+            let ends: Vec<u32> = pos.iter().map(|&p| p + 1 + extra).collect();
+            ins.push(f.u("vis", &ends));
+        }
+        let o = f.op(op.clone(), &ins);
+        f.g.output(o);
+        (f.g, f.ins)
+    }
+
+    fn op_cases() -> Vec<Case> {
+        use crate::graph::{BinaryKind as B, ReduceKind, UnaryKind as U, UpsampleMode};
+        use crate::hardware::QuantFormat as Q;
+        let mut cases = Vec::new();
+        let mut seed = 0u64;
+        let mut fx = || {
+            seed += 1;
+            Fx::new(seed)
+        };
+        // Embedding: f32 table and a block-coded one.
+        let mut f = fx();
+        let t = f.w("table", &[10, 12]);
+        let ids = f.u("ids", &[1, 9, 4, 1]);
+        let o = f.op(Op::Embedding, &[t, ids]);
+        cases.push(f.case("Embedding f32", &[o]));
+        let mut f = fx();
+        let raw = quant_rows(Q::GGUF_Q8_0, 6, 64, 7);
+        let t = f.wt(
+            "table",
+            &[6, 64],
+            DType::Quant(Q::GGUF_Q8_0),
+            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                Q::GGUF_Q8_0,
+                raw,
+                6,
+                64,
+            )),
+        );
+        let ids = f.u("ids", &[5, 0, 3]);
+        let o = f.op(Op::Embedding, &[t, ids]);
+        cases.push(f.case("Embedding q8_0", &[o]));
+        // Linear: gemv and gemm paths, bias, a row width that is not a multiple of 8.
+        for rows in [1, 3, 12, 40] {
+            let mut f = fx();
+            let x = f.x("x", &[rows, 20]);
+            let w = f.w("w", &[37, 20]);
+            let b = f.w("b", &[37]);
+            let o = f.op(Op::Linear, &[x, w, b]);
+            cases.push(f.case(&format!("Linear f32 rows {rows}"), &[o]));
+        }
+        // Linear per weight encoding.
+        let dense = |rows: usize, cols: usize, f: &mut Fx| f.rnd(rows * cols);
+        for (label, dt) in [("F16", DType::F16), ("BF16", DType::BF16)] {
+            for rows in [2, 17] {
+                let mut f = fx();
+                let x = f.x("x", &[rows, 72]);
+                let v = dense(9, 72, &mut f);
+                let t = if dt == DType::F16 {
+                    Tensor::F16(v.iter().map(|&x| crate::model::f32_to_f16(x)).collect())
+                } else {
+                    Tensor::BF16(v.iter().map(|&x| crate::model::f32_to_bf16(x)).collect())
+                };
+                let w = f.wt("w", &[9, 72], dt, t);
+                let o = f.op(Op::Linear, &[x, w]);
+                cases.push(f.case(&format!("Linear {label} rows {rows}"), &[o]));
+            }
+        }
+        let mut f = fx();
+        let x = f.x("x", &[3, 48]);
+        let v: Vec<u16> = f
+            .rnd(5 * 48)
+            .iter()
+            .map(|&x| crate::model::f32_to_bf16(x))
+            .collect();
+        let w = f.wt(
+            "w",
+            &[5, 48],
+            DType::BF16,
+            Tensor::Mat(crate::model::weights::Mat::from_bf16(v, 5, 48)),
+        );
+        let o = f.op(Op::Linear, &[x, w]);
+        cases.push(f.case("Linear Mat bf16", &[o]));
+        for (i, q) in crate::graph::codec::formats().into_iter().enumerate() {
+            let elems = crate::graph::codec::codec(q).unwrap().block_elems as usize;
+            let cols = (2 * elems).max(64);
+            for rows in [3, 13] {
+                let mut f = fx();
+                let x = f.x("x", &[rows, cols]);
+                let raw = quant_rows(q, 6, cols, 100 + i as u64);
+                let mat = crate::model::weights::Mat::from_packed_bytes(q, raw, 6, cols);
+                let w = f.wt("w", &[6, cols], DType::Quant(q), Tensor::Mat(mat));
+                let o = f.op(Op::Linear, &[x, w]);
+                cases.push(f.case(&format!("Linear {q:?} rows {rows}"), &[o]));
+            }
+        }
+        // MatMul with batch broadcast and both transposes.
+        for (ta, tb, sa, sb) in [
+            (false, false, vec![2, 3, 5], vec![5, 4]),
+            (true, true, vec![2, 1, 5, 3], vec![3, 4, 5]),
+        ] {
+            let mut f = fx();
+            let a = f.x("a", &sa);
+            let b = f.x("b", &sb);
+            let o = f.op(
+                Op::MatMul {
+                    transpose_a: ta,
+                    transpose_b: tb,
+                },
+                &[a, b],
+            );
+            cases.push(f.case(&format!("MatMul ta={ta} tb={tb}"), &[o]));
+        }
+        // Norms.
+        let mut f = fx();
+        let x = f.x("x", &[4, 300]);
+        let (g, b) = (f.w("g", &[300]), f.w("b", &[300]));
+        let o1 = f.op(Op::LayerNorm { eps: 1e-5 }, &[x, g, b]);
+        let o2 = f.op(Op::LayerNorm { eps: 1e-5 }, &[x, g]);
+        let o3 = f.op(Op::RmsNorm { eps: 1e-6 }, &[x, g]);
+        let o4 = f.op(Op::RmsNorm { eps: 1e-6 }, &[x]);
+        cases.push(f.case("norms", &[o1, o2, o3, o4]));
+        let mut f = fx();
+        let x = f.x("x", &[2, 8, 3, 5]);
+        let (g, b) = (f.w("g", &[8]), f.w("b", &[8]));
+        let o1 = f.op(
+            Op::GroupNorm {
+                groups: 4,
+                eps: 1e-5,
+            },
+            &[x, g, b],
+        );
+        let o2 = f.op(Op::InstanceNorm { eps: 1e-5 }, &[x, g, b]);
+        cases.push(f.case("GroupNorm / InstanceNorm", &[o1, o2]));
+        // RoPE variants (one partial).
+        for (label, variant, rot, pos3) in [
+            (
+                "interleaved",
+                crate::graph::RopeVariant::Interleaved,
+                16,
+                false,
+            ),
+            (
+                "half split partial",
+                crate::graph::RopeVariant::HalfSplit,
+                8,
+                false,
+            ),
+            (
+                "mrope",
+                crate::graph::RopeVariant::MRope {
+                    sections: [3, 3, 2],
+                    interleaved: false,
+                    pairs: crate::graph::PairLayout::Half,
+                },
+                16,
+                true,
+            ),
+            (
+                "mrope interleaved",
+                crate::graph::RopeVariant::MRope {
+                    sections: [3, 3, 2],
+                    interleaved: true,
+                    pairs: crate::graph::PairLayout::Adjacent,
+                },
+                16,
+                true,
+            ),
+        ] {
+            let mut f = fx();
+            let x = f.x("x", &[4, 32]);
+            let pos: Vec<u32> = if pos3 {
+                (0..12).map(|i| 7 * i % 23).collect()
+            } else {
+                vec![0, 5, 9, 1000]
+            };
+            let p = f.u("pos", &pos);
+            let inv: Vec<f32> = (0..rot / 2)
+                .map(|j| 10000f32.powf(-((2 * j) as f32) / rot as f32))
+                .collect();
+            let inv = f.wt("inv", &[rot / 2], DType::F32, Tensor::F32(inv));
+            let o = f.op(
+                Op::Rope {
+                    head_dim: 16,
+                    rotary_dim: rot,
+                    variant,
+                    mscale: 1.0,
+                },
+                &[x, p, inv],
+            );
+            cases.push(f.case(&format!("Rope {label}"), &[o]));
+        }
+        // Attention: plain, GQA with window/soft cap/bias, non-causal window.
+        for (label, heads, kvh, causal, window, cap, bias) in [
+            ("plain", 2, 2, true, None, None, false),
+            ("gqa window cap bias", 4, 2, true, Some(3), Some(5.0), true),
+            ("bidirectional window", 2, 1, false, Some(4), None, false),
+        ] {
+            let mut f = fx();
+            let q = f.x("q", &[6, heads * 8]);
+            let k = f.x("k", &[6, kvh * 8]);
+            let v = f.x("v", &[6, kvh * 8]);
+            let mut ins = vec![q, k, v];
+            if bias {
+                ins.push(f.x("bias", &[6, 6]));
+            }
+            let o = f.op(
+                Op::Attention {
+                    heads,
+                    kv_heads: kvh,
+                    causal,
+                    window,
+                    soft_cap: cap,
+                    scale: None,
+                },
+                &ins,
+            );
+            cases.push(f.case(&format!("Attention {label}"), &[o]));
+        }
+        // GLUs, unary, binary.
+        let mut f = fx();
+        let (a, b) = (f.x("a", &[3, 10]), f.x("b", &[3, 10]));
+        let o1 = f.op(Op::SwiGlu, &[a, b]);
+        let o2 = f.op(Op::GeGlu, &[a, b]);
+        cases.push(f.case("GLU", &[o1, o2]));
+        let mut f = fx();
+        let x = f.x("x", &[200]);
+        let pos = f.op(Op::Unary { kind: U::Abs }, &[x]);
+        let pos = f.op(
+            Op::Unary {
+                kind: U::Clamp(0.05, 10.0),
+            },
+            &[pos],
+        );
+        let mut outs = Vec::new();
+        for kind in [
+            U::Exp,
+            U::Sigmoid,
+            U::Tanh,
+            U::Softplus,
+            U::Neg,
+            U::Relu,
+            U::Relu2,
+            U::Silu,
+            U::GeluErf,
+            U::GeluTanh,
+            U::Scale(1.5),
+            U::Clamp(-0.3, 0.4),
+            U::SoftCap(0.5),
+            U::RoundEven,
+            U::Sign,
+        ] {
+            outs.push(f.op(Op::Unary { kind }, &[x]));
+        }
+        for kind in [U::Sqrt, U::Rsqrt, U::Ln] {
+            outs.push(f.op(Op::Unary { kind }, &[pos]));
+        }
+        cases.push(f.case("Unary", &outs));
+        let mut f = fx();
+        let a = f.x("a", &[2, 3, 4]);
+        let b = f.x("b", &[2, 3, 4]);
+        let c = f.x("c", &[3, 1]);
+        let r = f.x("r", &[2, 1]);
+        let t = f.x("t", &[6]);
+        let mut outs = Vec::new();
+        for kind in [B::Add, B::Sub, B::Mul, B::Div, B::Max, B::Min] {
+            outs.push(f.op(Op::Binary { kind }, &[a, b]));
+            outs.push(f.op(Op::Binary { kind }, &[a, c]));
+        }
+        let o = f.g.add(
+            "row_scale",
+            Op::Binary { kind: B::Mul },
+            &[a, r],
+            vec![2, 3, 4],
+            DType::F32,
+        );
+        outs.push(o);
+        let o = f.g.add(
+            "tiled",
+            Op::Binary { kind: B::Add },
+            &[a, t],
+            vec![2, 3, 4],
+            DType::F32,
+        );
+        outs.push(o);
+        cases.push(f.case("Binary", &outs));
+        // CachedAttention prefill then decode on one state, several configurations.
+        for (label, h, kvh, window, cap, vis) in [
+            ("gqa", 4, 2, None, None, None),
+            ("window cap", 2, 1, Some(3), Some(20.0), None),
+            ("visible end", 2, 2, None, None, Some(1)),
+        ] {
+            let op = Op::CachedAttention {
+                heads: h,
+                kv_heads: kvh,
+                head_dim: 8,
+                v_head_dim: 8,
+                scale: 0.3,
+                causal: true,
+                window,
+                soft_cap: cap,
+                write: true,
+            };
+            let (g, ins) = cached_attn(&op, 5, 0, vis, 40);
+            let mut runs = vec![(None, ins)];
+            for (i, pos) in [5u32, 6].into_iter().enumerate() {
+                let (gd, ins) = cached_attn(&op, 1, pos, vis.map(|_| 0), 41 + i as u64);
+                runs.push((Some(gd), ins));
+            }
+            cases.push(Case {
+                name: format!("CachedAttention {label}"),
+                graph: g,
+                weights: Weights::new(),
+                runs,
+            });
+        }
+        // Recurrent states over two runs.
+        let conv = |seed| {
+            let mut f = Fx::new(seed);
+            let x = f.x("x", &[3, 6]);
+            let w = f.wt(
+                "w",
+                &[6, 4],
+                DType::F32,
+                Tensor::F32((0..24).map(|i| (i as f32 * 0.37).sin()).collect()),
+            );
+            let st = f.g.state("conv", vec![3, 6], DType::F32, true);
+            let o = f.op(
+                Op::CausalConv1dCached {
+                    kernel: 4,
+                    dilation: 1,
+                },
+                &[x, w, st],
+            );
+            f.case("CausalConv1dCached", &[o])
+        };
+        let (mut c, c2) = (conv(50), conv(51));
+        c.runs.extend(c2.runs);
+        cases.push(c);
+        let delta = |seed| {
+            let mut f = Fx::new(seed);
+            let (q, k) = (f.x("q", &[3, 16]), f.x("k", &[3, 16]));
+            let v = f.x("v", &[3, 32]);
+            let beta = f.x("beta", &[3, 4]);
+            let ld = f.x("ld", &[3, 4]);
+            let st = f.g.state("ssm", vec![4, 8, 8], DType::F32, true);
+            let o = f.op(
+                Op::DeltaRule {
+                    key_heads: 2,
+                    val_heads: 4,
+                    key_dim: 8,
+                    val_dim: 8,
+                },
+                &[q, k, v, beta, ld, st],
+            );
+            f.case("DeltaRule", &[o])
+        };
+        let (mut c, c2) = (delta(52), delta(53));
+        c.runs.extend(c2.runs);
+        cases.push(c);
+        // Indexing and data movement.
+        let mut f = fx();
+        let x = f.x("x", &[5, 4]);
+        let i0 = f.u("i0", &[4, 0, 2]);
+        let i1 = f.u("i1", &[3, 1]);
+        let upd = f.x("upd", &[2, 4]);
+        let o1 = f.op(Op::Gather { axis: 0 }, &[x, i0]);
+        let o2 = f.op(Op::Gather { axis: 1 }, &[x, i1]);
+        let o3 = f.op(Op::Scatter { axis: 0 }, &[x, i1, upd]);
+        cases.push(f.case("Gather / Scatter", &[o1, o2, o3]));
+        let mut f = fx();
+        let x = f.x("x", &[2, 3, 4]);
+        let o1 = f.op(
+            Op::Pad {
+                padding: vec![1, 2],
+                value: 0.5,
+            },
+            &[x],
+        );
+        let o2 = f.op(
+            Op::Pad {
+                padding: vec![0, 1, 2, 0],
+                value: -1.0,
+            },
+            &[x],
+        );
+        let o3 = f.op(
+            Op::Reshape {
+                shape: Some(vec![6, 4]),
+            },
+            &[x],
+        );
+        let o4 = f.op(
+            Op::Transpose {
+                perm: vec![2, 0, 1],
+            },
+            &[x],
+        );
+        let o5 = f.op(
+            Op::Slice {
+                axis: 1,
+                start: 1,
+                end: 3,
+            },
+            &[x],
+        );
+        let o6 = f.op(
+            Op::Slice {
+                axis: -1,
+                start: -3,
+                end: 100,
+            },
+            &[x],
+        );
+        let o7 = f.op(Op::Unsqueeze { axes: vec![0] }, &[x]);
+        let o8 = f.op(Op::Squeeze { axes: vec![0] }, &[o7]);
+        let o9 = f.op(
+            Op::Tile {
+                reps: vec![2, 1, 3],
+            },
+            &[x],
+        );
+        let y = f.x("y", &[2, 2, 4]);
+        let o10 = f.op(Op::Concat { axis: 1 }, &[x, y, x]);
+        cases.push(f.case("movement", &[o1, o2, o3, o4, o5, o6, o7, o8, o9, o10]));
+        let mut f = fx();
+        let x = f.x("x", &[2, 6, 7]);
+        let o1 = f.op(
+            Op::AvgPool2d {
+                kernel: [2, 2],
+                stride: [2, 2],
+            },
+            &[x],
+        );
+        let o2 = f.op(
+            Op::AvgPool2d {
+                kernel: [3, 2],
+                stride: [2, 1],
+            },
+            &[x],
+        );
+        let mut outs = vec![o1, o2];
+        for mode in [
+            UpsampleMode::Nearest,
+            UpsampleMode::Bilinear,
+            UpsampleMode::Bicubic,
+        ] {
+            outs.push(f.op(Op::Upsample { scale: 2, mode }, &[x]));
+        }
+        cases.push(f.case("AvgPool2d / Upsample", &outs));
+        // Convolutions with bias, stride, padding, dilation and groups.
+        let mut f = fx();
+        let x = f.x("x", &[4, 9]);
+        let w = f.w("w", &[6, 2, 3]);
+        let b = f.w("b", &[6]);
+        let o = f.op(
+            Op::Conv1d {
+                stride: 2,
+                padding: [1, 2],
+                dilation: 2,
+                groups: 2,
+            },
+            &[x, w, b],
+        );
+        cases.push(f.case("Conv1d", &[o]));
+        let mut f = fx();
+        let x = f.x("x", &[1, 4, 7, 6]);
+        let w = f.w("w", &[4, 2, 3, 3]);
+        let b = f.w("b", &[4]);
+        let o = f.op(
+            Op::Conv2d {
+                stride: [2, 1],
+                padding: [1, 1, 0, 2],
+                dilation: [1, 2],
+                groups: 2,
+            },
+            &[x, w, b],
+        );
+        cases.push(f.case("Conv2d", &[o]));
+        let mut f = fx();
+        let x = f.x("x", &[2, 3, 4, 5]);
+        let w = f.w("w", &[3, 2, 2, 3, 2]);
+        let o = f.op(
+            Op::Conv3d {
+                stride: [1, 2, 1],
+                padding: [0, 1, 1, 1, 0, 1],
+                dilation: [1, 1, 2],
+                groups: 1,
+            },
+            &[x, w],
+        );
+        cases.push(f.case("Conv3d", &[o]));
+        // Selection.
+        let mut f = fx();
+        let mut v = f.rnd(3 * 40);
+        v[7] = v[3];
+        v[50] = f32::NAN;
+        f.ins.push(Tensor::F32(v));
+        let x = f.g.input("x", vec![3, 40], DType::F32);
+        let o1 = f.op(Op::TopK { k: 5 }, &[x]);
+        let idx = f.u2("idx", &[3, 0, 39, 7, 1, 2, 3, 4, 9, 9, 0, 1], &[3, 4]);
+        let o2 = f.op(Op::GatherCols, &[x, idx]);
+        let row = f.x("row", &[1, 40]);
+        let o3 = f.op(Op::GatherCols, &[row, idx]);
+        let o4 = f.op(Op::Softmax { axis: -1 }, &[x]);
+        let o5 = f.op(Op::Softmax { axis: 0 }, &[x]);
+        cases.push(f.case("TopK / GatherCols / Softmax", &[o1, o2, o3, o4, o5]));
+        let mut f = fx();
+        let score = f.x("score", &[4, 5]);
+        let pos = f.u("pos", &[3, 9, 15, 19]);
+        let o1 = f.op(
+            Op::QsaSelect {
+                ratio: 4,
+                top_blocks: 2,
+            },
+            &[score, pos],
+        );
+        let o2 = f.op(
+            Op::QsaBias {
+                ratio: 4,
+                top_blocks: 2,
+            },
+            &[score, pos],
+        );
+        cases.push(f.case("QsaSelect / QsaBias", &[o1, o2]));
+        // MoE with an f32 and a block-coded bank.
+        for coded in [false, true] {
+            let mut f = fx();
+            let x = f.x("x", &[2, 64]);
+            let bank = if coded {
+                let raw = quant_rows(Q::GGUF_Q4_0, 24, 64, 9);
+                f.wt(
+                    "bank",
+                    &[24, 64],
+                    DType::Quant(Q::GGUF_Q4_0),
+                    Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                        Q::GGUF_Q4_0,
+                        raw,
+                        24,
+                        64,
+                    )),
+                )
+            } else {
+                f.w("bank", &[24, 64])
+            };
+            let ids = f.u2("ids", &[3, 0, 1, 3], &[2, 2]);
+            let o = f.op(
+                Op::MoeLinear {
+                    experts: 4,
+                    top_k: 2,
+                },
+                &[x, bank, ids],
+            );
+            cases.push(f.case(&format!("MoeLinear coded={coded}"), &[o]));
+        }
+        // Positions, states and pooling.
+        let mut f = fx();
+        let table = f.w("table", &[32, 2]);
+        let qp = f.u("qp", &[0, 3, 7, 40]);
+        let kp = f.u("kp", &[0, 1, 2, 3, 60, 200]);
+        let o = f.op(
+            Op::RelPosBias {
+                buckets: 32,
+                max_distance: 128,
+                bidirectional: true,
+                heads: 2,
+            },
+            &[table, qp, kp],
+        );
+        let o2 = f.op(
+            Op::RelPosBias {
+                buckets: 32,
+                max_distance: 128,
+                bidirectional: false,
+                heads: 2,
+            },
+            &[table, qp, kp],
+        );
+        cases.push(f.case("RelPosBias", &[o, o2]));
+        let mut f = fx();
+        let st = f.g.state("rows", vec![8, 4], DType::F32, false);
+        let rows = f.x("rows_in", &[2, 4]);
+        let p0 = f.u("p0", &[3]);
+        let tok = f.op(Op::StateWrite, &[st, rows, p0]);
+        let parent = f.u("parent", &[1, 0]);
+        let small = f.x("small", &[2, 4]);
+        let reo = f.op(Op::StateReorder, &[small, parent]);
+        let seen = f.op(
+            Op::Unary {
+                kind: U::Scale(2.0),
+            },
+            &[st],
+        );
+        cases.push(f.case("StateWrite / StateReorder", &[tok, reo, seen]));
+        let mut f = fx();
+        let x = f.x("x", &[5, 6]);
+        let mask = f.u("mask", &[1, 0, 1, 1, 0]);
+        let o1 = f.op(Op::MeanPool, &[x, mask]);
+        let o2 = f.op(Op::L2Normalize, &[x]);
+        let mut outs = vec![o1, o2];
+        for (kind, axes) in [
+            (ReduceKind::Sum, vec![1]),
+            (ReduceKind::Mean, vec![0]),
+            (ReduceKind::Max, vec![-1]),
+            (ReduceKind::Min, vec![0, 1]),
+        ] {
+            outs.push(f.op(
+                Op::Reduce {
+                    kind,
+                    axes,
+                    keep_dims: false,
+                },
+                &[x],
+            ));
+        }
+        cases.push(f.case("MeanPool / L2Normalize / Reduce", &outs));
+        // The fused MLP block.
+        for (geglu, post) in [(false, false), (true, true)] {
+            let mut f = fx();
+            let x = f.x("x", &[2, 16]);
+            let norm = f.w("norm", &[16]);
+            let gate = f.w("gate", &[24, 16]);
+            let up = f.w("up", &[24, 16]);
+            let down = f.w("down", &[16, 24]);
+            let mut ins = vec![x, norm, gate, up, down];
+            if post {
+                ins.push(f.w("post", &[16]));
+            }
+            let kind = crate::graph::MegakernelKind::Mlp {
+                hidden_dim: 16,
+                intermediate_dim: 24,
+                eps: 1e-6,
+                is_geglu: geglu,
+                has_post_norm: post,
+            };
+            let o = f.op(
+                Op::Megakernel(crate::graph::MegakernelDescriptor {
+                    kind,
+                    name: "mlp".into(),
+                }),
+                &ins,
+            );
+            cases.push(f.case(&format!("Megakernel geglu={geglu} post={post}"), &[o]));
+        }
+        cases
+    }
+
+    /// Relative RMS of `got` against `want`; non-finite entries must match exactly. u32 outputs
+    /// are exact (1.0 on any difference).
+    fn rel_rms(got: &Tensor, want: &Tensor) -> f64 {
+        match (got, want) {
+            (Tensor::U32(a), Tensor::U32(b)) => (a != b) as u8 as f64,
+            _ => {
+                let (a, b) = (got.to_f32(), want.to_f32());
+                if a.len() != b.len() {
+                    return f64::INFINITY;
+                }
+                let (mut num, mut den) = (0f64, 0f64);
+                for (&x, &y) in a.iter().zip(&b) {
+                    if !y.is_finite() {
+                        if x.to_bits() != y.to_bits() && !(x.is_nan() && y.is_nan()) {
+                            return f64::INFINITY;
+                        }
+                        continue;
+                    }
+                    num += (x as f64 - y as f64).powi(2);
+                    den += (y as f64).powi(2);
+                }
+                (num / den.max(1e-30)).sqrt()
+            }
+        }
+    }
+
+    /// Device-bound: every available non-CPU, non-Metal device runs one graph per op variant, a
+    /// Linear per weight codec and CachedAttention prefill/decode pairs like the CPU executor:
+    /// relative RMS <= 1e-4 (2e-2 on XLA, which holds bf16 weights). Prints each op's worst error.
+    #[test]
+    #[ignore = "device: GIBBS_XPU_ANY_OPENCL=1 cargo test --release --lib -- --ignored backends_match_cpu_on_every_op --nocapture"]
+    fn backends_match_cpu_on_every_op() {
+        let cases = op_cases();
+        let covered: std::collections::BTreeSet<&str> = cases
+            .iter()
+            .flat_map(|c| c.graph.nodes.iter().map(|n| n.op.name()))
+            .collect();
+        let all = [
+            "Embedding",
+            "Linear",
+            "MatMul",
+            "LayerNorm",
+            "RmsNorm",
+            "GroupNorm",
+            "InstanceNorm",
+            "Rope",
+            "Attention",
+            "SwiGlu",
+            "GeGlu",
+            "Unary",
+            "Binary",
+            "CachedAttention",
+            "CausalConv1dCached",
+            "DeltaRule",
+            "Gather",
+            "Scatter",
+            "Pad",
+            "AvgPool2d",
+            "Upsample",
+            "Conv3d",
+            "TopK",
+            "GatherCols",
+            "MoeLinear",
+            "Softmax",
+            "RelPosBias",
+            "StateReorder",
+            "StateWrite",
+            "QsaSelect",
+            "QsaBias",
+            "Conv2d",
+            "Conv1d",
+            "Reshape",
+            "Transpose",
+            "Concat",
+            "Slice",
+            "Squeeze",
+            "Unsqueeze",
+            "Tile",
+            "Reduce",
+            "MeanPool",
+            "L2Normalize",
+            "Megakernel",
+        ];
+        let missing: Vec<_> = all.iter().filter(|n| !covered.contains(*n)).collect();
+        assert!(missing.is_empty(), "ops without a case: {missing:?}");
+        let devices: Vec<Device> = available_devices()
+            .into_iter()
+            .filter(|d| !matches!(d, Device::Cpu | Device::Metal))
+            .collect();
+        assert!(
+            !devices.is_empty(),
+            "no non-CPU, non-Metal device on this host"
+        );
+        for dev in devices {
+            let tol = if dev == Device::Xla { 2e-2 } else { 1e-4 };
+            let mut worst: std::collections::BTreeMap<String, f64> = Default::default();
+            let mut failures = Vec::new();
+            for case in &cases {
+                let wants = cpu_reference(case);
+                let mut gpu = GraphProgram::compile(
+                    case.graph.clone(),
+                    case.weights.clone(),
+                    PlacementMode::Pin(dev),
+                )
+                .unwrap_or_else(|e| panic!("{dev} {}: {e}", case.name));
+                assert_eq!(gpu.cpu_node_count(), 0);
+                let mut err = 0f64;
+                for (step, ((g, ins), want)) in case.runs.iter().zip(&wants).enumerate() {
+                    let got = match g {
+                        None => gpu.run(ins.clone()),
+                        Some(g) => gpu.run_reshaped(g, ins.clone()),
+                    };
+                    let got = got.unwrap_or_else(|e| panic!("{dev} {} run {step}: {e}", case.name));
+                    assert_eq!(want.len(), got.len());
+                    for (o, (w, g)) in want.iter().zip(&got).enumerate() {
+                        let e = rel_rms(g, w);
+                        if !(e <= tol) {
+                            failures.push(format!(
+                                "{} run {step} output {o}: rel RMS {e:.3e}",
+                                case.name
+                            ));
+                        }
+                        err = err.max(e);
+                    }
+                }
+                for n in &case.graph.nodes {
+                    let e = worst.entry(n.op.name().to_string()).or_default();
+                    *e = e.max(err);
+                }
+            }
+            eprintln!("{dev} ({}): worst relative RMS per op", gpu_name(dev));
+            for (op, e) in &worst {
+                eprintln!("  {op:<20} {e:.3e}");
+            }
+            assert!(failures.is_empty(), "{dev}: {failures:#?}");
+        }
+    }
+
+    fn gpu_name(d: Device) -> String {
+        crate::graph::portable::device_api(d)
+            .map_or_else(|| d.to_string(), |a| a.device_name().to_string())
+    }
+
+    /// The CPU executor's outputs for every run of `case`, in order, on one state.
+    fn cpu_reference(case: &Case) -> Vec<Vec<Tensor>> {
+        let mode = PlacementMode::Pin(Device::Cpu);
+        let mut cpu =
+            GraphProgram::compile(case.graph.clone(), case.weights.clone(), mode).unwrap();
+        case.runs
+            .iter()
+            .map(|(g, ins)| {
+                match g {
+                    None => cpu.run(ins.clone()),
+                    Some(g) => cpu.run_reshaped(g, ins.clone()),
+                }
+                .unwrap()
+            })
+            .collect()
     }
 }
