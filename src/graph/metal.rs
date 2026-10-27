@@ -52,7 +52,7 @@ pub fn new_shared_buffer(device: &Device, bytes: usize) -> Result<Buffer, String
     Ok(buf)
 }
 
-pub fn set_bytes<T>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
+pub(crate) fn set_bytes<T>(enc: &Counted, index: u64, value: &T) {
     enc.set_bytes(
         index,
         std::mem::size_of::<T>() as u64,
@@ -60,11 +60,18 @@ pub fn set_bytes<T>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
     );
 }
 
-/// Compute encoder that counts `dispatch_thread_groups` calls (the only dispatch form used).
-/// Everything else goes through `Deref` to the raw encoder.
+/// Buffer argument slots of a compute encoder (Metal's limit).
+const ENC_SLOTS: usize = 31;
+
+/// Compute encoder that counts `dispatch_thread_groups` calls (the only dispatch form used) and
+/// skips redundant bindings: a pipeline equal to the bound one, a `(buffer, offset)` equal to the
+/// slot's binding (an offset-only change uses `setBufferOffset:atIndex:`). Everything else goes
+/// through `Deref` to the raw encoder; bindings must go through these methods to keep the cache true.
 pub(crate) struct Counted<'a> {
     inner: &'a ComputeCommandEncoderRef,
     dispatches: std::cell::Cell<u32>,
+    pso: std::cell::Cell<*const ComputePipelineStateRef>,
+    bufs: [std::cell::Cell<(*const BufferRef, u64)>; ENC_SLOTS],
 }
 
 impl<'a> Counted<'a> {
@@ -72,6 +79,8 @@ impl<'a> Counted<'a> {
         Self {
             inner,
             dispatches: std::cell::Cell::new(0),
+            pso: std::cell::Cell::new(std::ptr::null()),
+            bufs: std::array::from_fn(|_| std::cell::Cell::new((std::ptr::null(), 0))),
         }
     }
     pub(crate) fn dispatches(&self) -> u32 {
@@ -80,6 +89,32 @@ impl<'a> Counted<'a> {
     pub(crate) fn dispatch_thread_groups(&self, groups: MTLSize, threads: MTLSize) {
         self.dispatches.set(self.dispatches.get() + 1);
         self.inner.dispatch_thread_groups(groups, threads);
+    }
+    pub(crate) fn set_compute_pipeline_state(&self, pso: &ComputePipelineStateRef) {
+        if !std::ptr::eq(self.pso.get(), pso) {
+            self.pso.set(pso);
+            self.inner.set_compute_pipeline_state(pso);
+        }
+    }
+    pub(crate) fn set_buffer(&self, index: u64, buffer: Option<&BufferRef>, offset: u64) {
+        let b = buffer.map_or(std::ptr::null(), |b| b as *const BufferRef);
+        let Some(slot) = self.bufs.get(index as usize) else {
+            return self.inner.set_buffer(index, buffer, offset);
+        };
+        let (bound, bound_off) = slot.get();
+        slot.set((b, offset));
+        if b.is_null() || b != bound {
+            self.inner.set_buffer(index, buffer, offset);
+        } else if offset != bound_off {
+            // SAFETY: `setBufferOffset:atIndex:` on a slot holding a buffer (bound above).
+            let () = unsafe { msg_send![self.inner, setBufferOffset: offset atIndex: index] };
+        }
+    }
+    pub(crate) fn set_bytes(&self, index: u64, length: u64, bytes: *const c_void) {
+        if let Some(slot) = self.bufs.get(index as usize) {
+            slot.set((std::ptr::null(), 0));
+        }
+        self.inner.set_bytes(index, length, bytes);
     }
 }
 
@@ -275,9 +310,9 @@ use metal::foreign_types::ForeignType;
 use metal::objc::runtime::Object;
 use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
-    BinaryArchiveDescriptor, Buffer, CommandBufferRef, CommandQueue, CompileOptions,
+    BinaryArchiveDescriptor, Buffer, BufferRef, CommandBufferRef, CommandQueue, CompileOptions,
     ComputeCommandEncoderRef, ComputePipelineDescriptor, ComputePipelineDescriptorRef,
-    ComputePipelineState, Device, DeviceRef, Library, MTLComputePipelineState, MTLPipelineOption,
+    ComputePipelineState, ComputePipelineStateRef, Device, DeviceRef, Library, MTLComputePipelineState, MTLPipelineOption,
     MTLResourceOptions, MTLSize, URL,
 };
 use parking_lot::Mutex;

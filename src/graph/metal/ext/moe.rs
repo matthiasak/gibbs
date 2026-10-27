@@ -2102,7 +2102,8 @@ mod tests {
             let run_n = |pso: &super::ComputePipelineState, out: &metal::Buffer, n: usize| -> f64 {
                 metal::objc::rc::autoreleasepool(|| {
                     let cb = rt.queue.new_command_buffer();
-                    let enc = cb.new_compute_command_encoder();
+                    let raw = cb.new_compute_command_encoder();
+                    let enc = &super::super::super::Counted::new(raw);
                     enc.set_compute_pipeline_state(pso);
                     enc.set_buffer(1, Some(&x_buf), 0);
                     enc.set_buffer(2, Some(out), 0);
@@ -2284,7 +2285,8 @@ mod tests {
             let run_n = |pso: &super::ComputePipelineState, out: &metal::Buffer, n: usize| -> f64 {
                 metal::objc::rc::autoreleasepool(|| {
                     let cb = rt.queue.new_command_buffer();
-                    let enc = cb.new_compute_command_encoder();
+                    let raw = cb.new_compute_command_encoder();
+                    let enc = &super::super::super::Counted::new(raw);
                     enc.set_compute_pipeline_state(pso);
                     enc.set_buffer(1, Some(&x_buf), 0);
                     enc.set_buffer(2, Some(out), 0);

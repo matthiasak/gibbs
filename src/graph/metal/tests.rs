@@ -3134,7 +3134,8 @@ for (uint s = 0; s < p.z; s++) {
     let run_sep = || -> f64 {
         init(&xa);
         let cb = q.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
+        let raw = cb.new_compute_command_encoder();
+        let enc = &Counted::new(raw);
         enc.set_compute_pipeline_state(&sep);
         for s in 0..steps {
             let (x, y) = if s % 2 == 0 { (&xa, &xb) } else { (&xb, &xa) };
@@ -3156,7 +3157,8 @@ for (uint s = 0; s < p.z; s++) {
         init(&xa);
         unsafe { *(ctr.contents() as *mut u32) = 0 };
         let cb = q.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
+        let raw = cb.new_compute_command_encoder();
+        let enc = &Counted::new(raw);
         enc.set_compute_pipeline_state(&persist);
         enc.set_buffer(0, Some(&w), 0);
         enc.set_buffer(1, Some(&xa), 0);
