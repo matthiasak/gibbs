@@ -12,8 +12,8 @@
 use super::AneInfo;
 use crate::graph::cpu::{attention_key_range, channel_layout, rope_position, upsample_nsp};
 use crate::graph::{
-    BinaryKind, DType, Graph, MegakernelKind, Op, PairLayout, ReduceKind, RopeVariant, Tensor,
-    UnaryKind, UpsampleMode, ValueId, ValueKind, Weights,
+    BinaryKind, DType, Graph, MegakernelKind, Node, Op, PairLayout, ReduceKind, RopeVariant,
+    Tensor, UnaryKind, UpsampleMode, ValueId, ValueKind, Weights,
 };
 use crate::hardware::QuantFormat;
 use std::collections::HashMap;
@@ -61,9 +61,21 @@ impl IoBinding {
         self.channels * self.row_bytes()
     }
 
+    /// Checks `elements` of graph data against the binding and a surface of `bytes`.
+    fn fits(&self, elements: usize, bytes: usize) -> Result<(), String> {
+        if elements != self.channels * self.spatial || bytes < self.bytes() {
+            return Err(format!(
+                "{elements} elements / {bytes}-byte surface do not fit [1, {}, 1, {}]",
+                self.channels, self.spatial
+            ));
+        }
+        Ok(())
+    }
+
     /// Writes graph row-major `data` into a surface's bytes.
-    pub fn pack(&self, data: &[f32], dst: &mut [u8]) {
+    pub fn pack(&self, data: &[f32], dst: &mut [u8]) -> Result<(), String> {
         let (c, s, rb) = (self.channels, self.spatial, self.row_bytes());
+        self.fits(data.len(), dst.len())?;
         for ci in 0..c {
             let row = &mut dst[ci * rb..][..s * 4];
             for (si, o) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -75,11 +87,13 @@ impl IoBinding {
                 o.copy_from_slice(&v.to_le_bytes());
             }
         }
+        Ok(())
     }
 
     /// Reads a surface's bytes back in graph row-major order.
-    pub fn unpack(&self, src: &[u8]) -> Vec<f32> {
+    pub fn unpack(&self, src: &[u8]) -> Result<Vec<f32>, String> {
         let (c, s, rb) = (self.channels, self.spatial, self.row_bytes());
+        self.fits(c * s, src.len())?;
         let mut out = vec![0.0f32; c * s];
         for ci in 0..c {
             for (si, b) in src[ci * rb..][..s * 4]
@@ -96,7 +110,7 @@ impl IoBinding {
                 }] = v;
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -158,61 +172,515 @@ pub fn rope_table(
     Ok(t)
 }
 
-/// Whether [`lower`] handles `op`; `dtype` is the placement dtype (the weight's for `Linear` and
-/// `Megakernel`, else the output's) and `shapes` the operand shapes. State ops, gathers,
-/// scatters, `TopK`, `MoeLinear`, `Conv3d`, `Concat`, `Ln`, `RoundEven` and `Sign` stay on Metal.
-pub fn supports_op(op: &Op, dtype: DType, shapes: &[&[usize]]) -> bool {
-    if shapes.iter().any(|s| s.len() > 4) {
-        return false;
+/// Whether [`lower`] lowers `node` of `graph`: [`check`] passes. State ops, gathers, scatters,
+/// `TopK`, `MoeLinear`, `Conv3d`, `Concat`, `Ln`, `RoundEven`, `Sign` and bicubic or 3-D
+/// upsampling stay on Metal.
+pub fn supports_op(graph: &Graph, node: &Node) -> bool {
+    check(graph, node).is_ok()
+}
+
+/// How a `Binary` combines its operands, mirroring the CPU executor's order of attempts.
+#[derive(Debug, Clone, PartialEq)]
+enum BinPlan {
+    /// Equal shapes: element by element.
+    Same,
+    /// numpy broadcast to this shape (rank ≤ 4).
+    Numpy(Vec<usize>),
+    /// `Mul` of `[m, ..]` by `[m, 1]` (not numpy-compatible): row `r` of the larger operand
+    /// (operand 0 when `scaled_first`) times element `r` of the `m`-element one.
+    RowScale { rows: usize, scaled_first: bool },
+    /// Flat zip of equal lengths, or the shorter operand tiled over the longer one.
+    Tile,
+}
+
+fn bin_plan(kind: BinaryKind, a: &[usize], b: &[usize], out_len: usize) -> Result<BinPlan, String> {
+    let numel = |s: &[usize]| s.iter().product::<usize>();
+    if a.is_empty() || b.is_empty() {
+        return Err("operand shapes are unknown".into());
     }
-    let float = matches!(dtype, DType::F32 | DType::F16 | DType::BF16);
-    match op {
-        Op::Linear | Op::Megakernel(_) => dtype != DType::U32,
-        Op::MatMul { .. } => float && shapes.iter().all(|s| s.len() >= 2),
-        Op::LayerNorm { .. }
-        | Op::RmsNorm { .. }
-        | Op::Rope { .. }
-        | Op::Attention { .. }
-        | Op::SwiGlu
-        | Op::GeGlu
-        | Op::Softmax { .. }
-        | Op::Reduce { .. }
-        | Op::Transpose { .. }
-        | Op::Slice { .. }
-        | Op::Squeeze { .. }
-        | Op::Unsqueeze { .. }
-        | Op::Tile { .. }
-        | Op::Pad { .. }
-        | Op::Conv1d { .. }
-        | Op::Conv2d { .. }
-        | Op::MeanPool
-        | Op::L2Normalize => float,
-        Op::AvgPool2d { .. } => float && shapes.first().is_some_and(|s| s.len() >= 3),
+    let fits = |n: usize, plan: BinPlan| {
+        if n == out_len {
+            Ok(plan)
+        } else {
+            Err(format!(
+                "{a:?} by {b:?} gives {n} elements, output has {out_len}"
+            ))
+        }
+    };
+    if a == b {
+        return fits(numel(a), BinPlan::Same);
+    }
+    if let Some(s) = broadcast(a, b).filter(|s| numel(s) == out_len) {
+        return if s.len() <= 4 {
+            Ok(BinPlan::Numpy(s))
+        } else {
+            Err(format!("broadcast {a:?} by {b:?} has rank > 4"))
+        };
+    }
+    let row = |x: &[usize], s: &[usize]| {
+        x.len() >= 2 && s.len() >= 2 && s.last() == Some(&1) && x[0] == s[0]
+    };
+    if kind == BinaryKind::Mul {
+        for (first, x, s) in [(true, a, b), (false, b, a)] {
+            if row(x, s) {
+                let rows = numel(s);
+                return if numel(x) % rows == 0 {
+                    fits(
+                        numel(x),
+                        BinPlan::RowScale {
+                            rows,
+                            scaled_first: first,
+                        },
+                    )
+                } else {
+                    Err(format!("{x:?} does not split into {rows} rows"))
+                };
+            }
+        }
+    }
+    let (la, lb) = (numel(a), numel(b));
+    if la.max(lb) % la.min(lb) == 0 {
+        fits(la.max(lb), BinPlan::Tile)
+    } else {
+        Err(format!("{a:?} and {b:?} do not broadcast"))
+    }
+}
+
+/// Normalizes a possibly negative `axis` of a rank-`r` shape.
+fn norm_axis(axis: isize, r: usize) -> Result<usize, String> {
+    let a = if axis < 0 { axis + r as isize } else { axis };
+    if a < 0 || a >= r as isize {
+        return Err(format!("axis {axis} is out of range for rank {r}"));
+    }
+    Ok(a as usize)
+}
+
+/// Why [`lower`] cannot lower `node` (a fragment of `graph`), or `Ok` when it can. Every shape,
+/// dtype and operand-kind condition the lowering relies on is checked here, before any MIL is
+/// emitted, so [`supports_op`] and [`lower`] agree.
+pub fn check(graph: &Graph, node: &Node) -> Result<(), String> {
+    let ins = &node.inputs;
+    let val = |k: usize| graph.value(ins[k]);
+    let shape = |k: usize| graph.value(ins[k]).shape.as_slice();
+    let numel = |s: &[usize]| s.iter().product::<usize>();
+    let float = |d: DType| matches!(d, DType::F32 | DType::F16 | DType::BF16);
+    let is_weight = |k: usize| val(k).kind == ValueKind::Weight;
+    let [out] = node.outputs[..] else {
+        return Err("needs exactly one output".into());
+    };
+    let out = graph.value(out);
+    let os = out.shape.as_slice();
+    let need = |ok: bool, why: &dyn Fn() -> String| if ok { Ok(()) } else { Err(why()) };
+    need(float(out.dtype), &|| {
+        format!("output dtype {:?} is not float", out.dtype)
+    })?;
+    need(!os.is_empty() && os.len() <= 4, &|| {
+        format!("output shape {os:?} is not rank 1..=4")
+    })?;
+    // Operand slots that may be U32 (positions, masks) or packed weights.
+    let (u32_slot, quant_slots): (Option<usize>, &[usize]) = match &node.op {
+        Op::Rope { .. } | Op::MeanPool => (Some(1), &[]),
+        Op::Linear => (None, &[1]),
+        Op::Megakernel(_) => (None, &[2, 3, 4]),
+        _ => (None, &[]),
+    };
+    for (k, &v) in ins.iter().enumerate() {
+        let x = graph.value(v);
+        need(!matches!(x.kind, ValueKind::State { .. }), &|| {
+            format!("operand '{}' is a state", x.name)
+        })?;
+        need(!x.shape.is_empty() && x.shape.len() <= 4, &|| {
+            format!("operand '{}' shape {:?} is not rank 1..=4", x.name, x.shape)
+        })?;
+        let ok = match x.dtype {
+            DType::U32 => u32_slot == Some(k) && x.kind == ValueKind::Input,
+            DType::Quant(_) => quant_slots.contains(&k) && x.kind == ValueKind::Weight,
+            d => float(d),
+        };
+        need(ok, &|| {
+            format!(
+                "operand '{}' of dtype {:?} is not lowerable here",
+                x.name, x.dtype
+            )
+        })?;
+    }
+    let arity = |lo: usize, hi: usize| {
+        need((lo..=hi).contains(&ins.len()), &|| {
+            format!("takes {lo}..={hi} operands, got {}", ins.len())
+        })
+    };
+    let weight = |k: usize| {
+        need(is_weight(k), &|| {
+            format!("operand '{}' must be a weight", val(k).name)
+        })
+    };
+    let out_is = |want: &[usize]| {
+        need(numel(os) == numel(want), &|| {
+            format!("output {os:?} is not {want:?}")
+        })
+    };
+    match &node.op {
+        Op::Linear => {
+            arity(2, 3)?;
+            weight(1)?;
+            let [o, k] = shape(1)[..] else {
+                return Err(format!("weight {:?} is not [out, in]", shape(1)));
+            };
+            let (s, c) = flat2(shape(0));
+            need(c == k, &|| {
+                format!("x {:?} does not match weight [{o}, {k}]", shape(0))
+            })?;
+            if ins.len() == 3 {
+                need(numel(shape(2)) == o, &|| {
+                    format!("bias {:?} is not [{o}]", shape(2))
+                })?;
+            }
+            out_is(&[s, o])
+        }
+        Op::MatMul {
+            transpose_a,
+            transpose_b,
+        } => {
+            arity(2, 2)?;
+            let (a, b) = (shape(0), shape(1));
+            need(a.len() >= 2 && b.len() >= 2, &|| {
+                format!("{a:?} × {b:?} needs rank >= 2")
+            })?;
+            let mm = |s: &[usize], t: bool| {
+                let (r, c) = (s[s.len() - 2], s[s.len() - 1]);
+                if t {
+                    (c, r)
+                } else {
+                    (r, c)
+                }
+            };
+            let ((m, k1), (k2, n)) = (mm(a, *transpose_a), mm(b, *transpose_b));
+            let batch = broadcast(&a[..a.len() - 2], &b[..b.len() - 2])
+                .ok_or_else(|| format!("batch dims of {a:?} and {b:?} do not broadcast"))?;
+            need(k1 == k2, &|| format!("{a:?} × {b:?}: inner dims differ"))?;
+            let mut want = batch;
+            want.extend([m, n]);
+            need(want.len() <= 4 && os == want.as_slice(), &|| {
+                format!("output {os:?} is not {want:?}")
+            })
+        }
+        Op::RmsNorm { .. } | Op::LayerNorm { .. } => {
+            let layer = matches!(node.op, Op::LayerNorm { .. });
+            arity(if layer { 2 } else { 1 }, if layer { 3 } else { 2 })?;
+            let c = flat2(shape(0)).1;
+            let d = if ins.len() > 1 { numel(shape(1)) } else { c };
+            need(d > 0 && c.is_multiple_of(d), &|| {
+                format!("gamma of {d} does not tile rows of {c}")
+            })?;
+            if ins.len() > 2 {
+                need(numel(shape(2)) == d, &|| {
+                    format!("beta {:?} is not [{d}]", shape(2))
+                })?;
+            }
+            out_is(shape(0))
+        }
         Op::GroupNorm { .. } | Op::InstanceNorm { .. } => {
-            float
-                && match shapes {
-                    [x, g, ..] => channel_layout(x, g.iter().product()).is_ok_and(|(n, _)| n == 1),
-                    _ => false,
-                }
+            arity(3, 3)?;
+            let c = numel(shape(1));
+            let groups = match node.op {
+                Op::GroupNorm { groups, .. } => groups,
+                _ => c,
+            };
+            let (n, _) = channel_layout(shape(0), c)?;
+            need(n == 1, &|| format!("{:?} is not one sample", shape(0)))?;
+            need(
+                groups > 0 && c % groups == 0 && numel(shape(2)) == c,
+                &|| {
+                    format!(
+                        "{c} channels / beta {:?} do not fit {groups} groups",
+                        shape(2)
+                    )
+                },
+            )?;
+            out_is(shape(0))
         }
-        Op::Reshape { shape } => float && shape.is_some(),
+        Op::Rope {
+            head_dim,
+            rotary_dim,
+            variant,
+            ..
+        } => {
+            arity(3, 3)?;
+            weight(2)?;
+            let (d, r) = (*head_dim, *rotary_dim);
+            let (n, width) = flat2(shape(0));
+            need(
+                d > 0 && r > 0 && r <= d && r % 2 == 0 && width % d == 0,
+                &|| format!("rotary {r} of head {d} does not fit {:?}", shape(0)),
+            )?;
+            need(
+                val(1).kind == ValueKind::Input && val(1).dtype == DType::U32,
+                &|| "positions must be a U32 fragment input".into(),
+            )?;
+            let per_row = if matches!(variant, RopeVariant::MRope { .. }) {
+                3
+            } else {
+                1
+            };
+            need(
+                numel(shape(1)) == n * per_row && numel(shape(2)) == r / 2,
+                &|| {
+                    format!(
+                        "positions {:?} / inv_freq {:?} do not fit {n} rows",
+                        shape(1),
+                        shape(2)
+                    )
+                },
+            )?;
+            out_is(shape(0))
+        }
+        Op::Attention {
+            heads,
+            kv_heads,
+            causal,
+            window,
+            ..
+        } => {
+            arity(3, 4)?;
+            let (h, kv) = (*heads, *kv_heads);
+            let (nq, width) = flat2(shape(0));
+            let (nk, kw) = flat2(shape(1));
+            need(
+                h > 0 && kv > 0 && h % kv == 0 && width % h == 0 && kw * h == kv * width,
+                &|| {
+                    format!(
+                        "{h} heads over {kv} kv heads do not fit q {:?} k {:?}",
+                        shape(0),
+                        shape(1)
+                    )
+                },
+            )?;
+            need(numel(shape(2)) == nk * kw, &|| {
+                format!("v {:?} differs from k", shape(2))
+            })?;
+            if ins.len() == 4 {
+                let bl = numel(shape(3));
+                need([nk, nq * nk, h * nq * nk].contains(&bl), &|| {
+                    format!(
+                        "bias {:?} is not [{h}, {nq}, {nk}], [{nq}, {nk}] or [{nk}]",
+                        shape(3)
+                    )
+                })?;
+            }
+            // The ANE softmax of an all-masked row is uniform; the reference outputs zeros.
+            let empty = (0..nq).find(|&p| {
+                let (lo, hi) = attention_key_range(p, nk, *causal, *window);
+                lo >= hi
+            });
+            need(empty.is_none(), &|| {
+                format!("query row {empty:?} sees no key")
+            })?;
+            out_is(&[nq, width])
+        }
+        Op::SwiGlu | Op::GeGlu => {
+            arity(2, 2)?;
+            need(numel(shape(0)) == numel(shape(1)), &|| {
+                "gate and up lengths differ".into()
+            })?;
+            out_is(shape(0))
+        }
         Op::Unary { kind } => {
-            float && !matches!(kind, UnaryKind::Ln | UnaryKind::RoundEven | UnaryKind::Sign)
+            arity(1, 1)?;
+            need(
+                !matches!(kind, UnaryKind::Ln | UnaryKind::RoundEven | UnaryKind::Sign),
+                &|| format!("Unary {kind:?} does not compile for the ANE"),
+            )?;
+            out_is(shape(0))
         }
-        Op::Binary { .. } => {
-            float
-                && match shapes {
-                    [a, b] => broadcast(a, b).is_some(),
-                    _ => false,
-                }
+        Op::Binary { kind } => {
+            arity(2, 2)?;
+            bin_plan(*kind, shape(0), shape(1), numel(os)).map(|_| ())
         }
-        Op::Upsample { mode, .. } => {
-            float
-                && matches!(mode, UpsampleMode::Nearest | UpsampleMode::Bilinear)
-                && shapes.first().is_some_and(|s| s.len() >= 2)
+        Op::Softmax { axis } => {
+            arity(1, 1)?;
+            norm_axis(*axis, shape(0).len())?;
+            out_is(shape(0))
         }
-        _ => false,
+        Op::Reduce {
+            axes, keep_dims, ..
+        } => {
+            arity(1, 1)?;
+            let r = shape(0).len();
+            let mut seen = [false; 4];
+            need(!axes.is_empty(), &|| "Reduce with no axes".into())?;
+            for &a in axes {
+                let a = norm_axis(a, r)?;
+                need(!seen[a], &|| format!("axis {a} repeats"))?;
+                seen[a] = true;
+            }
+            let kept: Vec<usize> = (0..r)
+                .filter_map(|i| match (seen[i], keep_dims) {
+                    (false, _) => Some(shape(0)[i]),
+                    (true, true) => Some(1),
+                    (true, false) => None,
+                })
+                .collect();
+            out_is(&kept)
+        }
+        Op::Reshape { shape: Some(_) } | Op::Squeeze { .. } | Op::Unsqueeze { .. } => {
+            arity(1, 1)?;
+            out_is(shape(0))
+        }
+        Op::Transpose { perm } => {
+            arity(1, 1)?;
+            let r = shape(0).len();
+            let mut sorted = perm.clone();
+            sorted.sort_unstable();
+            need(sorted == (0..r).collect::<Vec<_>>(), &|| {
+                format!("{perm:?} is not a permutation of rank {r}")
+            })?;
+            out_is(shape(0))
+        }
+        Op::Slice { axis, start, end } => {
+            arity(1, 1)?;
+            let ax = norm_axis(*axis, shape(0).len())?;
+            let (s0, e0) = slice_range(shape(0)[ax], *start, *end);
+            need(e0 > s0, &|| "empty slice".into())
+        }
+        Op::Tile { reps } => {
+            arity(1, 1)?;
+            need(reps.len() <= 4 && reps.iter().all(|&r| r > 0), &|| {
+                format!("reps {reps:?}")
+            })
+        }
+        Op::Pad { padding, .. } => {
+            arity(1, 1)?;
+            let k = padding.len() / 2;
+            need(
+                padding.len() % 2 == 0 && k <= shape(0).len() && k <= 2,
+                &|| format!("padding {padding:?} must pad at most the last two dims"),
+            )
+        }
+        Op::Conv2d { stride, groups, .. } => {
+            arity(2, 3)?;
+            weight(1)?;
+            let ci = match shape(0) {
+                [ci, _, _] | [1, ci, _, _] => *ci,
+                s => return Err(format!("Conv2d input {s:?} is not [c, h, w]")),
+            };
+            let w = shape(1);
+            need(
+                w.len() == 4
+                    && *groups > 0
+                    && ci % groups == 0
+                    && w[0] % groups == 0
+                    && w[1] * groups == ci
+                    && !stride.contains(&0),
+                &|| format!("weight {w:?} does not fit {ci} channels in {groups} groups"),
+            )?;
+            if ins.len() == 3 {
+                need(numel(shape(2)) == w[0], &|| {
+                    format!("bias {:?} is not [{}]", shape(2), w[0])
+                })?;
+            }
+            need(os.len() >= 3 && os[os.len() - 3] == w[0], &|| {
+                format!("output {os:?}")
+            })
+        }
+        Op::Conv1d { stride, groups, .. } => {
+            arity(2, 3)?;
+            weight(1)?;
+            let ci = match shape(0) {
+                [ci, _] | [1, ci, _] => *ci,
+                s => return Err(format!("Conv1d input {s:?} is not [c, l]")),
+            };
+            let w = shape(1);
+            need(
+                w.len() == 3
+                    && *groups > 0
+                    && ci % groups == 0
+                    && w[0] % groups == 0
+                    && w[1] * groups == ci
+                    && *stride > 0,
+                &|| format!("weight {w:?} does not fit {ci} channels in {groups} groups"),
+            )?;
+            if ins.len() == 3 {
+                need(numel(shape(2)) == w[0], &|| {
+                    format!("bias {:?} is not [{}]", shape(2), w[0])
+                })?;
+            }
+            need(os.len() >= 2 && os[os.len() - 2] == w[0], &|| {
+                format!("output {os:?}")
+            })
+        }
+        Op::AvgPool2d { kernel, stride } => {
+            arity(1, 1)?;
+            let s = shape(0);
+            need(
+                s.len() >= 3
+                    && !stride.contains(&0)
+                    && s[s.len() - 2] >= kernel[0]
+                    && s[s.len() - 1] >= kernel[1],
+                &|| format!("{kernel:?}/{stride:?} pool does not fit {s:?}"),
+            )
+        }
+        Op::Upsample { scale, mode } => {
+            arity(1, 1)?;
+            need(
+                matches!(mode, UpsampleMode::Nearest | UpsampleMode::Bilinear),
+                &|| format!("{mode:?} upsampling does not lower"),
+            )?;
+            need(upsample_nsp(shape(0), os, *scale)? == 2, &|| {
+                "3-D upsampling does not lower".into()
+            })
+        }
+        Op::MeanPool => {
+            arity(2, 2)?;
+            let (n, d) = flat2(shape(0));
+            need(val(1).dtype == DType::U32 && numel(shape(1)) == n, &|| {
+                format!("mask {:?} is not U32 [{n}]", shape(1))
+            })?;
+            out_is(&[d])
+        }
+        Op::L2Normalize => {
+            arity(1, 1)?;
+            out_is(shape(0))
+        }
+        Op::Megakernel(desc) => {
+            let MegakernelKind::Mlp {
+                hidden_dim: h,
+                intermediate_dim: i,
+                has_post_norm,
+                ..
+            } = desc.kind;
+            arity(
+                if has_post_norm { 6 } else { 5 },
+                if has_post_norm { 6 } else { 5 },
+            )?;
+            (2..5).try_for_each(weight)?;
+            need(flat2(shape(0)).1 == h && numel(shape(1)) == h, &|| {
+                format!("x / norm do not have width {h}")
+            })?;
+            need(
+                shape(2) == [i, h] && shape(3) == [i, h] && shape(4) == [h, i],
+                &|| {
+                    format!(
+                        "gate/up/down {:?}/{:?}/{:?} are not [{i}, {h}] / [{h}, {i}]",
+                        shape(2),
+                        shape(3),
+                        shape(4)
+                    )
+                },
+            )?;
+            if has_post_norm {
+                need(numel(shape(5)) == h, &|| format!("post norm is not [{h}]"))?;
+            }
+            out_is(shape(0))
+        }
+        other => Err(format!("{} does not lower to the ANE", other.name())),
     }
+}
+
+/// `[start, end)` of a `Slice` over a dim of `dim` elements (negative ends count from the back).
+fn slice_range(dim: usize, start: i64, end: i64) -> (usize, usize) {
+    let dim = dim as i64;
+    let at = |v: i64| (if v < 0 { dim + v } else { v }).clamp(0, dim) as usize;
+    (at(start), at(end))
 }
 
 /// Lowers every node of `graph` (whose inputs and outputs are the program's) to MIL text and
@@ -238,9 +706,10 @@ pub fn lower(
         ins: Vec::new(),
         n: 0,
     };
-    for i in 0..graph.nodes.len() {
-        l.node(i)
-            .map_err(|e| format!("ANE lowering of node '{}': {e}", graph.nodes[i].name))?;
+    for (i, node) in graph.nodes.iter().enumerate() {
+        check(graph, node)
+            .and_then(|()| l.node(i))
+            .map_err(|e| format!("ANE lowering of node '{}': {e}", node.name))?;
     }
     let to32 = l.string("fp32");
     let mut outs = Vec::new();
@@ -881,32 +1350,32 @@ impl<'a> Lower<'a> {
                 let y = self.matmul(&a, &b, *transpose_a, *transpose_b, o);
                 self.set(out, y, false);
             }
-            Op::RmsNorm { eps } => {
+            Op::RmsNorm { .. } | Op::LayerNorm { .. } => {
+                // Normalized over chunks of gamma's width `d` (`d < C` for per-head norms):
+                // token form `[1, C, 1, S]` viewed as `[C / d, d, 1, S]`.
                 let x = self.tok(ins[0])?;
-                let mut y = self.rms(&x, *eps);
-                if let Some(&g) = ins.get(1) {
-                    let g = self.tok(g)?;
-                    y = self.bin("mul", &y, &g);
+                let [_, c, _, s] = self.sh(&x);
+                let d = match ins.get(1) {
+                    Some(&g) => self.shape(g).iter().product(),
+                    None => c,
+                };
+                let xd = self.reshape(&x, [c / d, d, 1, s]);
+                let mut y = match node.op {
+                    Op::RmsNorm { eps } => self.rms(&xd, eps),
+                    Op::LayerNorm { eps } => {
+                        let m = self.reduce("reduce_mean", &xd, &[1]);
+                        let xc = self.bin("sub", &xd, &m);
+                        self.rms(&xc, eps)
+                    }
+                    _ => unreachable!(),
+                };
+                for (k, f) in [(1, "mul"), (2, "add")] {
+                    if let Some(&p) = ins.get(k) {
+                        let p = self.operand(p, Want::Row([1, d, 1, 1]))?;
+                        y = self.bin(f, &y, &p);
+                    }
                 }
-                self.set(out, y, true);
-            }
-            Op::LayerNorm { eps } => {
-                let x = self.tok(ins[0])?;
-                let d = self.sh(&x)[1];
-                let m = self.reduce("reduce_mean", &x, &[1]);
-                let xc = self.bin("sub", &x, &m);
-                let xs = self.bin_s("mul", &xc, 1.0 / (d as f32).sqrt());
-                let sq = self.bin("mul", &xs, &xs);
-                let var = self.reduce("reduce_sum", &sq, &[1]);
-                let e = self.bin_s("add", &var, *eps);
-                let r = self.bin_s("pow", &e, -0.5);
-                let mut y = self.bin("mul", &xc, &r);
-                let g = self.tok(ins[1])?;
-                y = self.bin("mul", &y, &g);
-                if let Some(&b) = ins.get(2) {
-                    let b = self.tok(b)?;
-                    y = self.bin("add", &y, &b);
-                }
+                let y = self.reshape(&y, [1, c, 1, s]);
                 self.set(out, y, true);
             }
             Op::GroupNorm { .. } | Op::InstanceNorm { .. } => {
@@ -1073,7 +1542,12 @@ impl<'a> Lower<'a> {
                 self.set(out, o, true);
             }
             Op::SwiGlu | Op::GeGlu => {
-                let (gate, tok) = self.like(ins[0])?;
+                let (mut gate, mut tok) = self.like(ins[0])?;
+                if tok && self.shape(ins[1]) != in_shape {
+                    // Equal lengths, different shapes: combine in row-major order.
+                    gate = self.row(ins[0])?.0;
+                    tok = false;
+                }
                 let want = if tok {
                     Want::Tok
                 } else {
@@ -1136,33 +1610,70 @@ impl<'a> Lower<'a> {
                 };
                 let (a, b) = (ins[0], ins[1]);
                 let (sa, sb) = (self.shape(a), self.shape(b));
-                let lead = if self.g.value(a).kind == ValueKind::Weight {
+                let out_len = self.shape(out).iter().product();
+                let lead = if g.value(a).kind == ValueKind::Weight {
                     b
                 } else {
                     a
                 };
-                let other = if lead == a { b } else { a };
-                let (so, sl) = (self.shape(other), self.shape(lead));
-                // Token form when the other operand broadcasts over `[S, C]` without leading dims.
-                let ((s, c), (os, oc)) = (flat2(&sl), flat2(&so));
-                let tok = self.mv(lead)?.tok
-                    && (so.len() <= 1 || (sl.len() <= 2 && so.len() <= 2))
-                    && (os == s || os == 1)
-                    && (oc == c || oc == 1);
-                let (xa, xb) = if tok {
-                    (self.tok(a)?, self.tok(b)?)
-                } else {
-                    (
+                let lead_tok = g.value(lead).kind != ValueKind::Weight && self.mv(lead)?.tok;
+                let (sl, so) = if lead == a { (&sa, &sb) } else { (&sb, &sa) };
+                // Token form `[1, C, 1, S]` broadcasts like `[S, C]` only when the lead operand
+                // keeps its shape and the other one is constant over rows or matches every row.
+                let tok_bcast = |bs: &[usize]| {
+                    let ((s, c), (os, oc)) = (flat2(sl), flat2(so));
+                    bs == sl.as_slice()
+                        && so.len() <= sl.len()
+                        && (os == s || os == 1)
+                        && (oc == c || oc == 1)
+                };
+                let (xa, xb, tok) = match bin_plan(*kind, &sa, &sb, out_len)? {
+                    BinPlan::Same if lead_tok => (self.tok(a)?, self.tok(b)?, true),
+                    BinPlan::Numpy(bs) if lead_tok && tok_bcast(&bs) => {
+                        (self.tok(a)?, self.tok(b)?, true)
+                    }
+                    BinPlan::Same | BinPlan::Numpy(_) => (
                         self.operand(a, Want::Row(pad4(&sa)?))?,
                         self.operand(b, Want::Row(pad4(&sb)?))?,
-                    )
+                        false,
+                    ),
+                    BinPlan::RowScale { rows, scaled_first } => {
+                        let (la, lb): (usize, usize) = (sa.iter().product(), sb.iter().product());
+                        let view = |n: usize| [1, 1, rows, n / rows];
+                        let (va, vb) = if scaled_first {
+                            (view(la), [1, 1, rows, 1])
+                        } else {
+                            ([1, 1, rows, 1], view(lb))
+                        };
+                        (
+                            self.operand(a, Want::Row(va))?,
+                            self.operand(b, Want::Row(vb))?,
+                            false,
+                        )
+                    }
+                    BinPlan::Tile => {
+                        let (la, lb): (usize, usize) = (sa.iter().product(), sb.iter().product());
+                        let (n, m) = (la.max(lb), la.min(lb));
+                        let view = |l: usize| {
+                            if l == n {
+                                [1, 1, n / m, m]
+                            } else {
+                                [1, 1, 1, m]
+                            }
+                        };
+                        (
+                            self.operand(a, Want::Row(view(la)))?,
+                            self.operand(b, Want::Row(view(lb)))?,
+                            false,
+                        )
+                    }
                 };
                 let y = self.bin(f, &xa, &xb);
                 self.set(out, y, tok);
             }
             Op::Softmax { axis } => {
                 let r = in_shape.len();
-                let ax = if *axis < 0 { *axis + r as isize } else { *axis } as usize;
+                let ax = norm_axis(*axis, r)?;
                 let (x, axm, tok) = if ax + 1 == r && self.mv(ins[0])?.tok {
                     (self.tok(ins[0])?, 1, true)
                 } else {
@@ -1176,10 +1687,10 @@ impl<'a> Lower<'a> {
             Op::Reduce { kind, axes, .. } => {
                 let r = in_shape.len();
                 let (x, _) = self.row(ins[0])?;
-                let axes: Vec<usize> = axes
+                let axes = axes
                     .iter()
-                    .map(|&a| (if a < 0 { a + r as isize } else { a }) as usize + 4 - r)
-                    .collect();
+                    .map(|&a| Ok(norm_axis(a, r)? + 4 - r))
+                    .collect::<Result<Vec<usize>, String>>()?;
                 let f = match kind {
                     ReduceKind::Sum => "reduce_sum",
                     ReduceKind::Mean => "reduce_mean",
@@ -1187,6 +1698,7 @@ impl<'a> Lower<'a> {
                     ReduceKind::Min => "reduce_min",
                 };
                 let y = self.reduce(f, &x, &axes);
+                let y = self.reshape(&y, pad4(&self.shape(out))?);
                 self.set(out, y, false);
             }
             Op::Reshape { .. } | Op::Squeeze { .. } | Op::Unsqueeze { .. } => {
@@ -1223,10 +1735,8 @@ impl<'a> Lower<'a> {
             }
             Op::Slice { axis, start, end } => {
                 let r = in_shape.len();
-                let ax = if *axis < 0 { *axis + r as isize } else { *axis } as usize;
-                let dim = in_shape[ax] as i64;
-                let at = |v: i64| (if v < 0 { dim + v } else { v }).clamp(0, dim) as usize;
-                let (s0, e0) = (at(*start), at(*end).max(at(*start)));
+                let ax = norm_axis(*axis, r)?;
+                let (s0, e0) = slice_range(in_shape[ax], *start, *end);
                 if ax + 1 == r && self.mv(ins[0])?.tok {
                     let x = self.tok(ins[0])?;
                     let n = self.sh(&x)[3];
