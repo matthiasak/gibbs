@@ -942,6 +942,9 @@ impl NativeLm for SpecLm {
         seq.ahead.clear();
         (seq.len, seq.asked) = (len, len);
         seq.ids.truncate(len);
+        if let Some(kv) = seq.state.kv.as_mut() {
+            kv.release_from(len);
+        }
         Ok(())
     }
 
@@ -998,7 +1001,7 @@ impl NativeLm for SpecLm {
             return None;
         }
         Some(crate::kv::CachedKvSnapshot {
-            state: seq.state.fork_prefix(),
+            state: seq.state.fork(token_len).ok()?,
             token_len,
             has_recurrent: !self.recurrent.is_empty(),
         })
@@ -1025,7 +1028,10 @@ impl NativeLm for SpecLm {
         if (snap.has_recurrent || !self.recurrent.is_empty()) && prefix_len != snap.token_len {
             return false;
         }
-        seq.state = snap.state.fork_prefix();
+        let Ok(forked) = snap.state.fork(prefix_len) else {
+            return false;
+        };
+        seq.state = forked;
         seq.len = prefix_len;
         seq.asked = prefix_len;
         seq.ids = seq.prompt[..prefix_len].to_vec();

@@ -1459,8 +1459,33 @@ struct KvAppendParams {
     uint m;
     uint kv_dim;
     uint stride;
-    uint start_pos;
+    uint kv_base;    // stored row of the first written row (`crate::kv` module docs)
+    uint ring_pages; // ring length of a paged windowed state, 0 otherwise
+    uint paged;      // the state operands are `KvDesc` bindings
 };
+
+// A paged KV state's binding (`kv::KvView::metal_desc`): header, then the class page table (one
+// page id per logical 64-row page). `slabs[pg >> 8]` is the base of the name's slab holding page `pg`.
+struct KvDesc {
+    uint ring_pages; // host-read; kernels take it from their params
+    uint evicted;    // host-read
+    uint n_pages;    // host-read
+    uint pad;
+    device uchar* device* slabs;
+    ulong pad2;
+};
+
+// Stored row `t` of a KV state with `stride` elements per row: the contiguous buffer `kv`, or,
+// when `paged`, the page `table[(t >> 6) % ring]` of the `KvDesc` bound at `kv` (`crate::kv`).
+template <typename T>
+inline device T* kv_row(device T* kv, uint paged, uint ring, uint t, ulong stride) {
+    if (paged == 0) return kv + (ulong)t * stride;
+    device const KvDesc* d = (device const KvDesc*)kv;
+    uint lp = t >> 6;
+    if (ring != 0) lp %= ring;
+    const uint pg = ((device const uint*)(d + 1))[lp];
+    return (device T*)(d->slabs[pg >> 8]) + (ulong)((pg & 255u) * 64u + (t & 63u)) * stride;
+}
 
 // KV cache element type: float, or half (round-to-nearest-even; |x| > 65504 saturates instead of becoming inf,
 // NaN is kept).
@@ -1478,9 +1503,10 @@ kernel void kv_append_t(device const float* k_in [[buffer(0)]],
     if (gid >= total) return;
     uint tok = gid / p.kv_dim;
     uint d = gid % p.kv_dim;
-    ulong dst_idx = (ulong)(p.start_pos + tok) * p.stride + d;
-    k_state[dst_idx] = kv_store(k_in[gid], T(0));
-    v_state[dst_idx] = kv_store(v_in[gid], T(0));
+    device T* kr = kv_row(k_state, p.paged, p.ring_pages, p.kv_base + tok, p.stride);
+    device T* vr = kv_row(v_state, p.paged, p.ring_pages, p.kv_base + tok, p.stride);
+    kr[d] = kv_store(k_in[gid], T(0));
+    vr[d] = kv_store(v_in[gid], T(0));
 }
 
 typedef decltype(kv_append_t<float>) kv_append_k;
@@ -1505,6 +1531,9 @@ struct AttnCachedParams {
     uint rotary_dim;
     uint pair_stride;
     float mscale;
+    uint ring_pages; // ring length of paged windowed states, 0 otherwise
+    uint kv_base;    // stored rows before this step (`start_pos` unless Tier-4 evicted pages)
+    uint paged;      // the k/v state operands are `KvDesc` bindings
 };
 
 template <uint NJ, typename T>
@@ -1533,15 +1562,16 @@ inline void attn_cached_f32_impl(device const float* q,
     const uint kv_off = (head / p.group) * hd;
     if (p.write_kv != 0 && (head % p.group) == 0 && q_tok == 0) {
         const uint tid = sg * 32 + lane;
-        ulong dst_base = (ulong)p.start_pos * p.stride + kv_off;
+        device T* kd = kv_row(kc, p.paged, p.ring_pages, p.kv_base, p.stride) + kv_off;
+        device T* vd = kv_row(vc, p.paged, p.ring_pages, p.kv_base, p.stride) + kv_off;
         for (uint d = tid; d < hd; d += nsg * 32) {
-            kc[dst_base + d] = kv_store(k_in[kv_off + d], T(0));
-            vc[dst_base + d] = kv_store(v_in[kv_off + d], T(0));
+            kd[d] = kv_store(k_in[kv_off + d], T(0));
+            vd[d] = kv_store(v_in[kv_off + d], T(0));
         }
     }
-    const uint cur_pos = p.start_pos + q_tok;
-    const uint len = p.has_vis ? vis[q_tok] : cur_pos + 1;
-
+    // Stored-row space: query row `q_tok` is row `kv_base + q_tok`; `vis` holds positions.
+    const uint cur_pos = p.kv_base + q_tok;
+    const uint len = p.has_vis ? vis[q_tok] - (p.start_pos - p.kv_base) : cur_pos + 1;
     float qr[NJ];
     float acc[NJ];
     for (uint j = 0; j < NJ; ++j) {
@@ -1555,9 +1585,9 @@ inline void attn_cached_f32_impl(device const float* q,
     const uint hi = len;
     for (uint t = lo + sg; t < hi; t += nsg) {
         // The fused write's own row comes from k_in / v_in (other heads' threadgroups may not see the store).
-        const bool cur_in = p.write_kv != 0 && t == p.start_pos;
-        device const T* k = kc + (ulong)t * p.stride + kv_off;
-        device const T* v = vc + (ulong)t * p.stride + kv_off;
+        const bool cur_in = p.write_kv != 0 && t == p.kv_base;
+        device const T* k = kv_row(kc, p.paged, p.ring_pages, t, p.stride) + kv_off;
+        device const T* v = kv_row(vc, p.paged, p.ring_pages, t, p.stride) + kv_off;
         device const float* ki = k_in + kv_off;
         device const float* vi = v_in + kv_off;
         float s = 0.0f;
@@ -1746,15 +1776,16 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
 
     const uint kv_off = kvh * hd;
     if (p.write_kv != 0 && (tg3.x % hgroups) == 0 && split == 0) {
-        ulong dst_base = (ulong)p.start_pos * p.stride + kv_off;
+        device T* kd = kv_row(kc, p.paged, p.ring_pages, p.kv_base, p.stride) + kv_off;
+        device T* vd = kv_row(vc, p.paged, p.ring_pages, p.kv_base, p.stride) + kv_off;
         for (uint d = tid; d < hd; d += nsg * 32) {
-            kc[dst_base + d] = kv_store(p.rotary_dim > 0
+            kd[d] = kv_store(p.rotary_dim > 0
                 ? attn_rope_val(k_in + kv_off, d, p.start_pos, inv_freq, p.rotary_dim, p.pair_stride, p.mscale)
                 : k_in[kv_off + d], T(0));
-            vc[dst_base + d] = kv_store(v_in[kv_off + d], T(0));
+            vd[d] = kv_store(v_in[kv_off + d], T(0));
         }
     }
-    const uint cur_pos = p.start_pos + q_tok;
+    const uint cur_pos = p.kv_base + q_tok;
     const uint len = cur_pos + 1;
     uint lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;
     lo += split * p.chunk;
@@ -1768,9 +1799,9 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
         for (uint j = 0; j < NJ; ++j) acc[h][j] = 0.0f;
     }
     for (uint t = lo + sg; t < hi; t += nsg) {
-        const bool cur_in = p.write_kv != 0 && t == p.start_pos;
-        device const T* k = kc + (ulong)t * p.stride + kv_off;
-        device const T* v = vc + (ulong)t * p.stride + kv_off;
+        const bool cur_in = p.write_kv != 0 && t == p.kv_base;
+        device const T* k = kv_row(kc, p.paged, p.ring_pages, t, p.stride) + kv_off;
+        device const T* v = kv_row(vc, p.paged, p.ring_pages, t, p.stride) + kv_off;
         float kr[NJ];
         if (cur_in) {
             for (uint j = 0; j < NJ; ++j) {

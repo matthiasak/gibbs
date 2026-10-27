@@ -1662,6 +1662,9 @@ pub struct Session {
     last_gpu_s: std::sync::atomic::AtomicU64,
     /// Store attention KV caches (states read only as `CachedAttention` k/v operands) as f16.
     kv_f16: bool,
+    /// Paged KV state names ([`Self::new_kv_pool`]): their `CachedAttention` steps bind
+    /// [`crate::kv::KvView`] descriptors.
+    kv_paged: HashSet<String>,
 }
 
 impl Session {
@@ -1844,6 +1847,7 @@ impl Session {
             variant_override: None,
             last_gpu_s: std::sync::atomic::AtomicU64::new(0),
             kv_f16: kv_f16_default(),
+            kv_paged: HashSet::new(),
         })
     }
     /// GPU seconds of the last completed (non-profiled) [`Self::run`] command buffer.
@@ -1854,6 +1858,21 @@ impl Session {
     /// the default is f32 unless `GIBBS_KV_DTYPE=f16`.
     pub fn set_kv_f16(&mut self, on: bool) {
         self.kv_f16 = on;
+    }
+    /// A page pool for `states` (`crate::graph::paged_states`) on this session's device and
+    /// queue, f16 when this session stores KV as f16; plans prepared after this call page those
+    /// states and need a `StateStore` holding a view of the pool.
+    pub fn new_kv_pool(
+        &mut self,
+        states: &[crate::graph::PagedState],
+    ) -> Result<Arc<crate::kv::KvPool>, String> {
+        self.kv_paged = states.iter().map(|s| s.name.clone()).collect();
+        let f16 = if self.kv_f16 {
+            self.kv_paged.clone()
+        } else {
+            HashSet::new()
+        };
+        crate::kv::KvPool::metal(states, &f16, &self.rt.device, &self.rt.queue)
     }
     /// Uses `kind` for every Linear instead of the host profile's choice.
     pub fn force_gemm(&mut self, kind: GemmKernel) -> Result<(), String> {
@@ -2031,6 +2050,21 @@ impl Session {
         } else {
             HashSet::new()
         };
+        for s in steps.iter_mut() {
+            if let Step::CachedAttention {
+                k_state: Some(ks),
+                v_state: Some(vs),
+                paged,
+                ..
+            } = &mut s.op
+            {
+                let named = |v: ValueId| match &graph.value(v).kind {
+                    ValueKind::State { name, .. } => self.kv_paged.contains(name),
+                    _ => false,
+                };
+                *paged = named(*ks) && named(*vs);
+            }
+        }
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
         pair_small_hand_gemvs(
             graph,
@@ -2280,19 +2314,43 @@ impl Session {
     }
 
     /// The state buffers of `plan` in `state` (else the session's own), grown to cover `need_rows`
-    /// positions.
+    /// positions; paged states reserve their pages (`write`: the positions this run writes, see
+    /// [`crate::kv::KvView::reserve`]) and bind their descriptors.
     fn resolve_state_bufs(
         &self,
         graph: &Graph,
         plan: &PreparedPlan,
         mut state: Option<&mut crate::graph::StateStore>,
         need_rows: usize,
+        write: std::ops::Range<usize>,
     ) -> Result<Vec<Arc<Buffer>>, String> {
         let mut state_bufs: Vec<Arc<Buffer>> = Vec::with_capacity(plan.state_vars.len());
+        if plan.state_vars.iter().any(|(_, n)| self.kv_paged.contains(n)) {
+            let view = state
+                .as_mut()
+                .and_then(|st| st.kv.as_mut())
+                .ok_or("paged KV states need a StateStore holding a KV view")?;
+            view.reserve(need_rows, write)?;
+        }
         if let Some(st) = &mut state {
             for &(v, ref name) in &plan.state_vars {
-                let n = state_len(graph, v, need_rows)?;
                 let f16 = plan.f16_states.contains(name);
+                if self.kv_paged.contains(name) {
+                    let view = st.kv.as_mut().expect("checked above");
+                    let (c, i) = view.pool().locate(name).ok_or_else(|| {
+                        format!("paged state '{name}' is not in this state's KV pool")
+                    })?;
+                    if (view.pool().classes[c].names[i].elem == 2) != f16 {
+                        return Err(format!(
+                            "paged state '{name}' is stored as {} but this program needs {}",
+                            if f16 { "f32" } else { "f16" },
+                            if f16 { "f16" } else { "f32" },
+                        ));
+                    }
+                    state_bufs.push(view.metal_desc(name)?);
+                    continue;
+                }
+                let n = state_len(graph, v, need_rows)?;
                 let eb = if f16 { 2 } else { 4 };
                 if st.metal_buffers.contains_key(name) && st.metal_f16.contains(name) != f16 {
                     return Err(format!(
@@ -2433,16 +2491,16 @@ impl Session {
             }
         }
         // Positions this call touches: 2-D states keep at least 4096 rows and grow in 4096-row steps.
-        let need_rows = plan
+        let (start, need_rows) = plan
             .attn_pos_inputs
             .iter()
             .filter_map(|&(i, m)| match &inputs[i] {
-                Tensor::U32(v) => v.first().map(|&x| x as usize + m),
+                Tensor::U32(v) => v.first().map(|&x| (x as usize, x as usize + m)),
                 _ => None,
             })
-            .max()
-            .unwrap_or(0);
-        let state_bufs = self.resolve_state_bufs(graph, plan, state, need_rows)?;
+            .fold((usize::MAX, 0), |(s, e), (a, b)| (s.min(a), e.max(b)));
+        let state_bufs =
+            self.resolve_state_bufs(graph, plan, state, need_rows, start.min(need_rows)..need_rows)?;
 
         let size = plan.arena_size;
         let mut arena = self.arena.lock();
@@ -2636,8 +2694,9 @@ impl Session {
         } else {
             (None, 0)
         };
+        let at = pos as usize;
         let state_bufs =
-            self.resolve_state_bufs(graph, plan, Some(state), pos as usize + budget)?;
+            self.resolve_state_bufs(graph, plan, Some(state), at + budget, at..at + 1)?;
         Ok(FedStream {
             ring,
             state_bufs,
@@ -3583,6 +3642,7 @@ impl Session {
                 write,
                 m,
                 kv_f16,
+                paged,
             } => {
                 let start_pos = if let Some(p_val) = pos {
                     let (p_buf, p_off) = loc(p_val);
@@ -3594,18 +3654,41 @@ impl Session {
                 let kv_dim = kv_heads * head_dim;
                 let stride = kv_dim;
 
-                // State buffers are physically capped (4096 rows); never write or read past them.
-                if let Some(ks) = k_state {
-                    let (kb, ko) = loc(ks);
-                    let rows =
-                        (kb.length() as usize - ko) / (stride * if kv_f16 { 2 } else { 4 }).max(1);
-                    if start_pos as usize + m > rows {
-                        return Err(format!(
-                            "KV cache holds {rows} positions on this backend; need {}",
-                            start_pos as usize + m
-                        ));
+                // Paged states (`crate::kv`): the bound `KvDesc` header gives the ring length and
+                // the positions Tier-4 eviction dropped, so `kv_base` is the stored row of
+                // `start_pos`. Contiguous state buffers are physically capped (4096 rows): never
+                // write or read past them.
+                let (ring_pages, kv_base) = match k_state {
+                    Some(ks) if paged => {
+                        let (kb, ko) = loc(ks);
+                        let (ring, evicted, n_pages) = crate::kv::desc_header(kb, ko);
+                        let kv_base = start_pos.checked_sub(evicted).ok_or_else(|| {
+                            format!("position {start_pos} precedes {evicted} evicted KV rows")
+                        })?;
+                        let rows = n_pages as usize * crate::kv::PAGE_TOKENS;
+                        if ring == 0 && kv_base as usize + m > rows {
+                            return Err(format!(
+                                "KV pages hold {rows} rows; need {}",
+                                kv_base as usize + m
+                            ));
+                        }
+                        crate::kv::use_untracked(enc);
+                        (ring, kv_base)
                     }
-                }
+                    Some(ks) => {
+                        let (kb, ko) = loc(ks);
+                        let rows = (kb.length() as usize - ko)
+                            / (stride * if kv_f16 { 2 } else { 4 }).max(1);
+                        if start_pos as usize + m > rows {
+                            return Err(format!(
+                                "KV cache holds {rows} positions on this backend; need {}",
+                                start_pos as usize + m
+                            ));
+                        }
+                        (0, start_pos)
+                    }
+                    None => (0, start_pos),
+                };
                 let gqa_decode = m == 1 && vis.is_none();
                 let fuse_kv_write = gqa_decode && write && k_state.is_some() && v_state.is_some();
                 if write && k_state.is_some() && v_state.is_some() && !fuse_kv_write {
@@ -3625,13 +3708,17 @@ impl Session {
                         m: u32,
                         kv_dim: u32,
                         stride: u32,
-                        start_pos: u32,
+                        kv_base: u32,
+                        ring_pages: u32,
+                        paged: u32,
                     }
                     let append_p = KvAppendParams {
                         m: m as u32,
                         kv_dim: kv_dim as u32,
                         stride: stride as u32,
-                        start_pos,
+                        kv_base,
+                        ring_pages,
+                        paged: paged as u32,
                     };
                     set_bytes(enc, 4, &append_p);
                     grid1(m * kv_dim);
@@ -3646,7 +3733,7 @@ impl Session {
                 // Long decode cache: one threadgroup per (KV head group, key slice) plus a merge, instead of
                 // one per head scanning every key (8 threadgroups on a 20-core GPU). Slices of at least
                 // `ATTN_SPLIT_KEYS` keys, enough of them for about `ATTN_TARGET_TGS` threadgroups.
-                let len = start_pos as usize + 1;
+                let len = kv_base as usize + 1;
                 let lo = window.map_or(0, |w| len.saturating_sub(w));
                 let n_keys = len - lo;
                 let n_splits = attn_splits(n_keys, head_dim, kv_heads, group, gqa_decode);
@@ -3762,6 +3849,9 @@ impl Session {
                     rotary_dim: u32,
                     pair_stride: u32,
                     mscale: f32,
+                    ring_pages: u32,
+                    kv_base: u32,
+                    paged: u32,
                 }
                 let p = AttnCachedParams {
                     n_heads: heads as u32,
@@ -3780,6 +3870,9 @@ impl Session {
                     rotary_dim: rope.map_or(0, |r| r.rotary_dim as u32),
                     pair_stride: rope.map_or(1, |r| r.pair_stride as u32),
                     mscale: rope.map_or(1.0, |r| r.mscale),
+                    ring_pages,
+                    kv_base,
+                    paged: paged as u32,
                 };
                 set_bytes(enc, 4, &p);
                 let tgs = if let Some((_, qb)) = mm_spec {
@@ -4257,6 +4350,8 @@ pub enum Step {
         m: usize,
         /// The k/v state buffers hold f16 (set by `assign_kv_dtypes`).
         kv_f16: bool,
+        /// The k/v state operands are paged (`Session::new_kv_pool`): bound as `KvDesc`s.
+        paged: bool,
     },
     CausalConv1dCached {
         x: ValueId,
@@ -4350,63 +4445,24 @@ pub struct PreparedPlan {
     pub f16_states: HashSet<String>,
 }
 
-/// The one f16 KV cache policy (`Session::set_kv_f16`, `GIBBS_KV_DTYPE`): decides which states are
-/// stored as f16 and flags their `CachedAttention` steps. A state qualifies when every step reading it
-/// uses it as the k or v state of a `CachedAttention` (any other reader, e.g. a plain `Attention` or
-/// `StateReorder` over the same cache, needs f32), and both states of a step agree. Returns the f16
-/// state names.
+/// The one f16 KV cache policy (`Session::set_kv_f16`, `GIBBS_KV_DTYPE`): the paged KV states
+/// ([`crate::graph::paged_states`]: read only as `CachedAttention` k/v operands, both states of a
+/// step agreeing; any other reader, e.g. a plain `Attention` or `StateReorder`, needs f32) are
+/// stored as f16 and their `CachedAttention` steps flagged. Returns the f16 state names.
 fn assign_kv_dtypes(graph: &Graph, steps: &mut [Planned]) -> HashSet<String> {
-    let name_of = |v: ValueId| match &graph.value(v).kind {
-        ValueKind::State { name: n, .. } => Some(n.clone()),
-        _ => None,
-    };
-    let kv_pair = |op: &Step| match op {
-        Step::CachedAttention {
-            k_state: Some(k),
-            v_state: Some(v),
-            ..
-        } => Some((*k, *v)),
-        _ => None,
-    };
-    let (mut f16, mut other) = (HashSet::new(), HashSet::new());
-    for s in steps.iter() {
-        let pair = kv_pair(&s.op);
-        for &r in &s.reads {
-            if let Some(n) = name_of(r) {
-                if pair.is_some_and(|(k, v)| r == k || r == v) {
-                    f16.insert(n);
-                } else {
-                    other.insert(n);
-                }
-            }
-        }
-    }
-    f16.retain(|n| !other.contains(n));
-    // A step's two states share one kernel dtype: drop a state whose partner dropped out.
-    loop {
-        let before = f16.len();
-        for s in steps.iter() {
-            if let Some((k, v)) = kv_pair(&s.op) {
-                let (kn, vn) = (
-                    name_of(k).unwrap_or_default(),
-                    name_of(v).unwrap_or_default(),
-                );
-                if !(f16.contains(&kn) && f16.contains(&vn)) {
-                    f16.remove(&kn);
-                    f16.remove(&vn);
-                }
-            }
-        }
-        if f16.len() == before {
-            break;
-        }
-    }
+    let f16: HashSet<String> = crate::graph::paged_states(graph)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
     for s in steps.iter_mut() {
-        if let Some((k, _)) = kv_pair(&s.op) {
-            let on = name_of(k).is_some_and(|n| f16.contains(&n));
-            if let Step::CachedAttention { kv_f16, .. } = &mut s.op {
-                *kv_f16 = on;
-            }
+        if let Step::CachedAttention {
+            k_state: Some(k),
+            kv_f16,
+            ..
+        } = &mut s.op
+        {
+            *kv_f16 =
+                matches!(&graph.value(*k).kind, ValueKind::State { name, .. } if f16.contains(name));
         }
     }
     f16
@@ -5232,6 +5288,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         write: *write,
                         m,
                         kv_f16: false,
+                        paged: false,
                     },
                     m * *heads * *v_head_dim,
                 )
