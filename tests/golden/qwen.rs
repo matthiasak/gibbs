@@ -7,7 +7,7 @@ use crate::util::*;
 use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::model::image::ImageBuffer;
 use gibbs_engine::model::native::{MediaInput, NativeLm, SeqState};
-use gibbs_engine::scheduler::spec::Drafter;
+use gibbs_engine::scheduler::spec::{DraftLogits, Drafter};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
@@ -442,7 +442,10 @@ fn qwen3_5_mtp() {
         let mut draw = |toks: &[u32], h: &[f32], tag: &str, out: &mut Out| {
             let mut rows = Vec::new();
             let ids = d
-                .propose(&mut ds, toks, h, 3, &mut |l: &[f32]| {
+                .propose(&mut ds, toks, h, 3, &mut |l| {
+                    let DraftLogits::Dense(l) = l else {
+                        unreachable!("model drafters pick dense rows")
+                    };
                     rows.extend_from_slice(l);
                     argmax(l)
                 })
@@ -680,7 +683,10 @@ fn drafter_case(case: &str, cfg: Value, w: Weights) {
             let hidden = rng.vec(rows * taps.len() * H, 1.0);
             let (mut vals, mut idx) = (Vec::new(), Vec::new());
             let ids = d
-                .propose(&mut st, &toks, &hidden, d.max_k(), &mut |l: &[f32]| {
+                .propose(&mut st, &toks, &hidden, d.max_k(), &mut |l| {
+                    let DraftLogits::Dense(l) = l else {
+                        unreachable!("model drafters pick dense rows")
+                    };
                     // Selector / pruned-vocab rows are -inf off their candidates: keep the finite
                     // entries and their ids.
                     for (i, &x) in l.iter().enumerate().filter(|(_, x)| x.is_finite()) {

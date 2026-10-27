@@ -36,16 +36,16 @@ pub fn settings_path() -> PathBuf {
     DIR.with(|d| d.path().join("settings.json"))
 }
 
-static CACHE: Mutex<Option<(SystemTime, GibbsSettings)>> = Mutex::new(None);
+/// The last settings read or written, by path and mtime (each test thread has its own path).
+static CACHE: Mutex<Option<(PathBuf, SystemTime, GibbsSettings)>> = Mutex::new(None);
 
 pub fn load_settings() -> GibbsSettings {
     let path = settings_path();
     let Some(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()).ok() else {
-        *CACHE.lock() = None;
         return GibbsSettings::default();
     };
-    if let Some((ct, s)) = CACHE.lock().as_ref() {
-        if *ct == mtime {
+    if let Some((cp, ct, s)) = CACHE.lock().as_ref() {
+        if *cp == path && *ct == mtime {
             return s.clone();
         }
     }
@@ -54,7 +54,7 @@ pub fn load_settings() -> GibbsSettings {
     };
     match serde_json::from_str::<GibbsSettings>(&data) {
         Ok(s) => {
-            *CACHE.lock() = Some((mtime, s.clone()));
+            *CACHE.lock() = Some((path, mtime, s.clone()));
             s
         }
         Err(err) => {
@@ -74,7 +74,7 @@ pub fn save_settings(s: &GibbsSettings) -> Result<(), String> {
     *CACHE.lock() = std::fs::metadata(&path)
         .and_then(|m| m.modified())
         .ok()
-        .map(|t| (t, s.clone()));
+        .map(|t| (path, t, s.clone()));
     Ok(())
 }
 
