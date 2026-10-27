@@ -37,7 +37,7 @@
     shuffle: "first(cfg.scale_factor, 2)",
     tokens_per_tile: "v_n // (shuffle * shuffle)",
   },
-  checks: [
+  "checks+": [
     {expr: "first(cfg.vision_config.hidden_act, 'gelu_pytorch_tanh') != 'gelu_pytorch_tanh'", error: "SigLIP hidden_act {cfg.vision_config.hidden_act} is not supported"},
     {expr: "v_size % v_patch != 0 || v_grid % shuffle != 0", error: "scale_factor {shuffle} does not divide the {v_grid}-patch grid"},
     {expr: "json.preprocessor_config.max_image_size.longest_edge != v_size", error: "max_image_size {json.preprocessor_config.max_image_size.longest_edge} differs from the vision encoder's image_size {v_size}"},
