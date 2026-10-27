@@ -1998,7 +1998,12 @@ pub(crate) fn upsample_nsp(inp: &[usize], out: &[usize], scale: usize) -> Result
 
 /// Source taps `(index, weight)` of output coordinate `o` along one axis of size `n`
 /// (half-pixel centres, `align_corners = false`, border clamp).
-fn upsample_taps(o: usize, n: usize, scale: usize, mode: super::UpsampleMode) -> Vec<(usize, f32)> {
+pub(crate) fn upsample_taps(
+    o: usize,
+    n: usize,
+    scale: usize,
+    mode: super::UpsampleMode,
+) -> Vec<(usize, f32)> {
     use super::UpsampleMode::*;
     let src = (o as f32 + 0.5) / scale as f32 - 0.5;
     match mode {

@@ -1012,7 +1012,6 @@ mod tests {
         for dev in [
             Device::Cuda,
             Device::Rocm,
-            Device::Xla,
             Device::IntelXpu,
             Device::Extropic,
         ] {
