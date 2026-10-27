@@ -73,12 +73,6 @@ static POOL: LazyLock<Pool> = LazyLock::new(|| {
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()) - 1;
     for _ in 0..workers {
         std::thread::spawn(|| {
-            // macOS runs user-interactive threads on the performance cores first.
-            #[cfg(target_os = "macos")]
-            // SAFETY: sets the calling thread's own QoS class.
-            unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-            }
             let pool = &*POOL;
             let mut seen = 0;
             loop {
