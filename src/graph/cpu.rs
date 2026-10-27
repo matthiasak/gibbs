@@ -2378,7 +2378,10 @@ fn dispatch_linear(
                 None => nn::matmul_bf16(x, m.data(), bias, rows, in_f, out_f, &mut out),
                 // Decode and small batches dot the stored blocks directly; larger batches keep the
                 // f32 GEMM unless an `smmla` kernel covers the format.
-                Some(p) if rows <= 8 || crate::model::qdot::i8mm_format(p.format) => {
+                Some(p)
+                    if rows <= crate::model::qdot::DOT_ROWS
+                        || crate::model::qdot::i8mm_format(p.format) =>
+                {
                     crate::model::qdot::linear_q(m, x, rows, bias, &mut out)
                 }
                 Some(_) => nn::matmul_rows(x, rows, in_f, out_f, bias, &mut out, &|j, p0, d| {

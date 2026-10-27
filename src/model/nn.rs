@@ -72,7 +72,11 @@ impl Out {
 /// Runs `tasks` independent tasks, pulling indices from a shared counter so the
 /// slower efficiency cores simply take fewer tasks. `S` is per-worker scratch.
 // ponytail: spawns scoped threads per call (~tens of µs); a persistent pool if small-op overhead shows in profiles.
-pub(crate) fn par_tasks<S: Default>(tasks: usize, parallel: bool, f: impl Fn(&mut S, usize) + Sync) {
+pub(crate) fn par_tasks<S: Default>(
+    tasks: usize,
+    parallel: bool,
+    f: impl Fn(&mut S, usize) + Sync,
+) {
     let threads = if parallel { par_limit().min(tasks) } else { 1 };
     let next = AtomicUsize::new(0);
     let work = || {
@@ -416,9 +420,19 @@ fn gemm<B: PackB>(
         let (mc, nc) = (MC.min(m - i0), NC.min(n - j0));
         if sme {
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            return gemm_tile::<B, 32, 32>(&a, b, i0, mc, j0, nc, k, bias, out, scratch, |kc, a, b, t| {
-                crate::model::sme2::sgemm_32x32(a, b, t, kc, 32, false)
-            });
+            return gemm_tile::<B, 32, 32>(
+                &a,
+                b,
+                i0,
+                mc,
+                j0,
+                nc,
+                k,
+                bias,
+                out,
+                scratch,
+                |kc, a, b, t| crate::model::sme2::sgemm_32x32(a, b, t, kc, 32, false),
+            );
         }
         gemm_tile::<B, MR, NR>(&a, b, i0, mc, j0, nc, k, bias, out, scratch, kernel);
     });

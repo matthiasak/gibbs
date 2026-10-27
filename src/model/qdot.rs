@@ -37,6 +37,10 @@ fn quantize_activations() -> bool {
 /// Output rows per task.
 const TASK_ROWS: usize = 64;
 
+/// Activation rows up to which the `sdot` kernels beat `smmla` (one unpacked weight block serves
+/// every row; measured on M5 Pro: K-quant `smmla` is 0.7-0.9x at 2-8 rows, 1.02-1.19x from 9).
+pub const DOT_ROWS: usize = 8;
+
 /// Kernel family `linear_q` runs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Path {
@@ -83,8 +87,8 @@ fn i8mm() -> bool {
     false
 }
 
-/// `linear_q` runs `smmla` kernels for `f` when the activation has two or more rows (never under
-/// [`exact`]).
+/// `linear_q` runs `smmla` kernels for `f` when the activation has more than [`DOT_ROWS`] rows
+/// (never under [`exact`]).
 pub fn i8mm_format(f: Q) -> bool {
     quantize_activations() && i8mm() && kernel(Path::I8mm, f).is_some()
 }
@@ -243,7 +247,7 @@ fn quant_kernel(m: &Mat, path: Path) -> Option<(Kernel, Act)> {
 
 fn path_for(m: &Mat, rows: usize) -> Path {
     match m.packed() {
-        Some(p) if rows >= 2 && i8mm_format(p.format) => Path::I8mm,
+        Some(p) if rows > DOT_ROWS && i8mm_format(p.format) => Path::I8mm,
         _ if dotprod() && quantize_activations() => Path::Dot,
         _ => Path::Generic,
     }
@@ -267,7 +271,11 @@ fn linear_with(m: &Mat, x: &[f32], rows: usize, bias: Option<&[f32]>, out: &mut 
         cols,
         rows,
         x,
-        a: ActRef { qs: &[], d: &[], bs: &[] },
+        a: ActRef {
+            qs: &[],
+            d: &[],
+            bs: &[],
+        },
         out: OutPtr::new(out),
         out_off: 0,
         ldo: n,
@@ -295,7 +303,10 @@ fn linear_with(m: &Mat, x: &[f32], rows: usize, bias: Option<&[f32]>, out: &mut 
 /// Points `job` at `m`'s packed bytes and activation row `r0` of `a`, checking every bound the
 /// kernels read without checks.
 fn bind<'a>(job: &mut Job<'a>, act: Act, a: &'a QAct, r0: usize) {
-    let p = job.m.packed().expect("quantized kernels read packed weights");
+    let p = job
+        .m
+        .packed()
+        .expect("quantized kernels read packed weights");
     job.row_bytes = p.format.tensor_bytes(job.cols);
     job.w = &p.map[p.off..p.off + job.m.rows * job.row_bytes];
     job.a = a.view(act, job.cols, r0);
@@ -313,7 +324,11 @@ pub(crate) fn gather_linear(
 ) {
     let cols = m.cols;
     assert_eq!(x.len() % cols, 0, "gather_linear: x is not rows * cols");
-    assert_eq!(out.len(), slots.len() * n, "gather_linear: out is not slots * n");
+    assert_eq!(
+        out.len(),
+        slots.len() * n,
+        "gather_linear: out is not slots * n"
+    );
     assert!(
         slots
             .iter()
@@ -336,7 +351,11 @@ pub(crate) fn gather_linear(
                 cols,
                 rows: 1,
                 x: &x[xr * cols..][..cols],
-                a: ActRef { qs: &[], d: &[], bs: &[] },
+                a: ActRef {
+                    qs: &[],
+                    d: &[],
+                    bs: &[],
+                },
                 out: o,
                 out_off: s * n,
                 ldo: n,
@@ -716,7 +735,8 @@ mod neon {
                         let s = mm16(vdupq_n_s32(0), a0, b0, vld1q_s8(y0), vld1q_s8(y1));
                         let s = mm16(s, a1, b1, vld1q_s8(y0.add(16)), vld1q_s8(y1.add(16)));
                         let dy = vld1_f32([*ds.add(r0 * nb + b), *ds.add(r1 * nb + b)].as_ptr());
-                        *acc = vfmaq_f32(*acc, vcvtq_f32_s32(s), vmulq_f32(dw, vcombine_f32(dy, dy)));
+                        *acc =
+                            vfmaq_f32(*acc, vcvtq_f32_s32(s), vmulq_f32(dw, vcombine_f32(dy, dy)));
                     }
                 }
                 for (p, &a) in acc[..pairs].iter().enumerate() {
@@ -847,8 +867,12 @@ mod tests {
                         for j in 0..n {
                             let wr = &w[j * cols..][..cols];
                             let want: f64 = bias[j] as f64
-                                + wr.iter().zip(xr).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>();
-                            let abs: f64 = wr.iter().zip(xr).map(|(&a, &b)| (a * b).abs() as f64).sum();
+                                + wr.iter()
+                                    .zip(xr)
+                                    .map(|(&a, &b)| a as f64 * b as f64)
+                                    .sum::<f64>();
+                            let abs: f64 =
+                                wr.iter().zip(xr).map(|(&a, &b)| (a * b).abs() as f64).sum();
                             // Int8 activations err by at most half a step (amax / 254) per element.
                             let quant = if path == Path::Generic {
                                 0.0

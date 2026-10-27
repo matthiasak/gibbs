@@ -100,13 +100,29 @@ extern "C" {
 /// `c[0..32][0..32] (+)= Σ_p A[·][p] ⊗ B[p][·]` over `k` packed columns of A and rows of B;
 /// row `i` of `c` starts at `c[i * ldc]`.
 pub fn sgemm_32x32(a: &[f32], b: &[f32], c: &mut [f32], k: usize, ldc: usize, accumulate: bool) {
-    assert!(available(), "sgemm_32x32 needs SME2 with 512-bit streaming vectors");
-    assert!(a.len() >= 32 * k && b.len() >= 32 * k, "sgemm_32x32: short panels");
-    assert!(ldc >= 32 && c.len() >= 31 * ldc + 32, "sgemm_32x32: short output");
+    assert!(
+        available(),
+        "sgemm_32x32 needs SME2 with 512-bit streaming vectors"
+    );
+    assert!(
+        a.len() >= 32 * k && b.len() >= 32 * k,
+        "sgemm_32x32: short panels"
+    );
+    assert!(
+        ldc >= 32 && c.len() >= 31 * ldc + 32,
+        "sgemm_32x32: short output"
+    );
     // SAFETY: the asserts bound every load and store; the routine saves the callee-saved
     // registers streaming mode clobbers and leaves streaming mode before returning.
     unsafe {
-        gibbs_sme2_sgemm_32x32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), k, ldc, accumulate as u32)
+        gibbs_sme2_sgemm_32x32(
+            a.as_ptr(),
+            b.as_ptr(),
+            c.as_mut_ptr(),
+            k,
+            ldc,
+            accumulate as u32,
+        )
     }
 }
 
@@ -123,7 +139,10 @@ mod tests {
         let val = |i: usize| ((i * 37 % 101) as f32 - 50.0) / 25.0;
         // Raw tile, both modes, against a scalar reference.
         let k = 19;
-        let (a, b): (Vec<f32>, Vec<f32>) = ((0..32 * k).map(val).collect(), (0..32 * k).map(|i| val(i + 7)).collect());
+        let (a, b): (Vec<f32>, Vec<f32>) = (
+            (0..32 * k).map(val).collect(),
+            (0..32 * k).map(|i| val(i + 7)).collect(),
+        );
         let ldc = 40;
         let c0: Vec<f32> = (0..32 * ldc).map(|i| val(i + 3)).collect();
         for acc in [false, true] {
@@ -132,11 +151,15 @@ mod tests {
             for i in 0..32 {
                 for j in 0..ldc {
                     let want = if j < 32 {
-                        (0..k).map(|p| a[p * 32 + i] * b[p * 32 + j]).sum::<f32>() + if acc { c0[i * ldc + j] } else { 0.0 }
+                        (0..k).map(|p| a[p * 32 + i] * b[p * 32 + j]).sum::<f32>()
+                            + if acc { c0[i * ldc + j] } else { 0.0 }
                     } else {
                         c0[i * ldc + j]
                     };
-                    assert!((c[i * ldc + j] - want).abs() <= 1e-4 * want.abs().max(1.0), "acc {acc} ({i}, {j})");
+                    assert!(
+                        (c[i * ldc + j] - want).abs() <= 1e-4 * want.abs().max(1.0),
+                        "acc {acc} ({i}, {j})"
+                    );
                 }
             }
         }
@@ -149,7 +172,10 @@ mod tests {
         crate::model::nn::matmul_nt_with(&x, &w, Some(&bias), m, kk, n, &mut sme, true);
         crate::model::nn::matmul_nt_with(&x, &w, Some(&bias), m, kk, n, &mut neon, false);
         for (i, (s, r)) in sme.iter().zip(&neon).enumerate() {
-            assert!((s - r).abs() <= 1e-4 * r.abs().max(1.0), "{i}: sme {s} vs neon {r}");
+            assert!(
+                (s - r).abs() <= 1e-4 * r.abs().max(1.0),
+                "{i}: sme {s} vs neon {r}"
+            );
         }
     }
 }
