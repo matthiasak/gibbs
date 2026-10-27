@@ -2090,7 +2090,6 @@ impl Session {
             &mut steps,
             &aliases,
             &offsets,
-            self.variant_override == Some(GemvVariant::HAND),
         );
         let mut arena = self.arena.lock();
         if arena
@@ -4597,7 +4596,6 @@ fn pair_small_hand_gemvs(
     steps: &mut Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
     offsets: &HashMap<ValueId, usize>,
-    allow_quant_pair: bool,
 ) {
     if !fusion_enabled() {
         return;
@@ -4647,10 +4645,9 @@ fn pair_small_hand_gemvs(
             return false;
         }
         let fmt_ok = *f0 == WeightFormat::BF16
-            || (allow_quant_pair
-                && (*f0 == WeightFormat::Q4_K
-                    || *f0 == WeightFormat::Q8_0
-                    || (*f0 == WeightFormat::Q4_0 && *c0 >= 512 && (*c0 & 255) == 0)));
+            || *f0 == WeightFormat::Q4_K
+            || *f0 == WeightFormat::Q8_0
+            || (*f0 == WeightFormat::Q4_0 && *c0 >= 512 && (*c0 & 255) == 0);
         if !fmt_ok
             || b.reads
                 .iter()
@@ -5971,7 +5968,7 @@ pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
     let (steps, aliases) = plan(g)?;
     let mut steps = batch_horizontal(steps, &aliases)?;
     let (offsets, arena) = allocate(g, &steps, &aliases)?;
-    pair_small_hand_gemvs(g, &mut steps, &aliases, &offsets, false);
+    pair_small_hand_gemvs(g, &mut steps, &aliases, &offsets);
     let mut out = String::new();
     let mut kinds: HashMap<String, usize> = HashMap::new();
     let (mut layer, mut dispatches, mut unassigned) = (None, 0usize, 0usize);
