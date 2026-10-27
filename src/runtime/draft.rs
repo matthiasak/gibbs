@@ -30,7 +30,7 @@ use crate::hardware::PlacementMode;
 use crate::model::hub::ModelArtifacts;
 use crate::model::native::{NativeLm, SeqState};
 use crate::model::weight_format::{ReencodeConfig, ReencodePolicy};
-use crate::scheduler::spec::{DraftState, Drafter};
+use crate::scheduler::spec::{DraftLogits, DraftState, Drafter};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value as J;
@@ -342,7 +342,7 @@ impl Drafter for Mtp {
         tokens: &[u32],
         hidden: &[f32],
         k: usize,
-        pick: &mut dyn FnMut(&[f32]) -> u32,
+        pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
     ) -> Result<Vec<u32>, String> {
         let s = st
             .downcast_mut::<MtpState>()
@@ -373,7 +373,7 @@ impl Drafter for Mtp {
         let k = k.min(self.ctx - s.len + 1);
         let mut drafts = Vec::with_capacity(k);
         while drafts.len() < k {
-            let tok = pick(&logits);
+            let tok = pick(DraftLogits::Dense(&logits));
             drafts.push(tok);
             if drafts.len() < k {
                 let pos = s.len + drafts.len() - 1;
@@ -473,22 +473,6 @@ pub fn refused_draft_gguf(arch: &str) -> Option<String> {
             format!("GGUF draft sidecar with fork architecture '{arch}' (tensor names and metadata differ from '{ours}'; attach a '{ours}' GGUF or the safetensors drafter)")
         })
     })
-}
-
-/// Builds an [`OnlineNoiseDrafter`] parameterized by `target`'s layer count, hidden dimension,
-/// and vocabulary size.
-pub fn online_drafter_for_target(
-    target: &ModelArtifacts,
-    knobs: Arc<crate::runtime::noise_draft::LiveDraftKnobs>,
-) -> Result<Arc<dyn Drafter>, String> {
-    let reg = registry()?;
-    let tm = crate::arch::load::load(target, reg, None)?;
-    let layers = tm.env.var("layers")?.usize()?;
-    let hidden = tm.env.var("hidden")?.usize()?;
-    let vocab = tm.env.var("vocab")?.usize()?;
-    Ok(crate::runtime::noise_draft::OnlineNoiseDrafter::new(
-        layers, hidden, vocab, knobs,
-    ))
 }
 
 /// Loads `draft` as a drafter for the target loaded from `target`, computing on `mode`: a block
@@ -739,7 +723,7 @@ impl Drafter for Block {
         tokens: &[u32],
         hidden: &[f32],
         k: usize,
-        pick: &mut dyn FnMut(&[f32]) -> u32,
+        pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
     ) -> Result<Vec<u32>, String> {
         let s = st
             .downcast_mut::<BlockState>()
@@ -815,9 +799,9 @@ impl Drafter for Block {
                     for (&t, &l) in ids.iter().zip(&vals) {
                         full[t as usize] = l;
                     }
-                    pick(&full)
+                    pick(DraftLogits::Dense(&full))
                 }
-                None => pick(&vals),
+                None => pick(DraftLogits::Dense(&vals)),
             };
             drafts.push(prev);
         }
@@ -900,7 +884,7 @@ impl Drafter for Plain {
         tokens: &[u32],
         _hidden: &[f32],
         k: usize,
-        pick: &mut dyn FnMut(&[f32]) -> u32,
+        pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
     ) -> Result<Vec<u32>, String> {
         let st = st
             .downcast_mut::<PlainState>()
@@ -938,7 +922,7 @@ impl Drafter for Plain {
         for i in 0..k {
             let logits = m.forward_all(&[last], n - 1 + i, s)?;
             st.ids.push(last);
-            last = pick(&logits);
+            last = pick(DraftLogits::Dense(&logits));
             out.push(last);
         }
         Ok(out)
@@ -1067,6 +1051,9 @@ mod tests {
         let mut rows = Vec::new();
         let out = d
             .propose(&mut st, &[1, 2, 3], &hidden, 3, &mut |l| {
+                let DraftLogits::Dense(l) = l else {
+                    unreachable!("model drafters pick from dense rows")
+                };
                 rows.push(l.to_vec());
                 l.iter()
                     .enumerate()
@@ -1237,7 +1224,10 @@ mod tests {
         let mut toks = vec![5u32, 9, 14, 3];
         for round in 0..3 {
             let got = d
-                .propose(&mut st, &toks, &[], 3, &mut |l| argmax(l))
+                .propose(&mut st, &toks, &[], 3, &mut |l| match l {
+                    DraftLogits::Dense(l) => argmax(l),
+                    DraftLogits::Sparse { .. } => unreachable!("plain drafters pick dense rows"),
+                })
                 .unwrap();
             assert_eq!(got, greedy(&toks, 3), "round {round}");
             // Accept the first draft, reject the second.

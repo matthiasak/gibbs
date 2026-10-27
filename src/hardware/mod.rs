@@ -41,6 +41,8 @@ pub enum Device {
     Cpu,
     /// Apple GPU through Metal.
     Metal,
+    /// Apple Neural Engine through the private `AppleNeuralEngine.framework` (in-memory MIL).
+    Ane,
     /// NVIDIA GPU through CUDA Driver + NVRTC (`libcuda` / `libnvrtc`).
     Cuda,
     /// AMD GPU through ROCm HIP + hipRTC (`libamdhip64` / `libhiprtc`).
@@ -59,6 +61,7 @@ impl Device {
         match self {
             Device::Cpu => "cpu",
             Device::Metal => "metal",
+            Device::Ane => "ane",
             Device::Cuda => "cuda",
             Device::Rocm => "rocm",
             Device::Xla => "xla",
@@ -80,13 +83,14 @@ impl std::str::FromStr for Device {
         match s.trim().to_ascii_lowercase().as_str() {
             "cpu" => Ok(Device::Cpu),
             "metal" => Ok(Device::Metal),
+            "ane" | "neural-engine" => Ok(Device::Ane),
             "cuda" | "nvidia" => Ok(Device::Cuda),
             "rocm" | "hip" | "amd" => Ok(Device::Rocm),
             "xla" | "tpu" | "stablehlo" | "pjrt" => Ok(Device::Xla),
             "intel-xpu" | "xpu" | "intel_xpu" | "sycl" | "opencl" => Ok(Device::IntelXpu),
             "extropic" | "tsu" | "xtr0" => Ok(Device::Extropic),
             other => Err(format!(
-                "unknown --backend '{other}' (expected auto, cpu, metal, cuda, rocm, xla, intel-xpu, or extropic)"
+                "unknown --backend '{other}' (expected auto, cpu, metal, ane, cuda, rocm, xla, intel-xpu, or extropic)"
             )),
         }
     }
