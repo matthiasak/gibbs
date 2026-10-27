@@ -17,7 +17,6 @@ pub mod theme;
 mod widgets;
 use crate::arch::dispatch::Loaded;
 use crate::hardware::{HardwareCapability, PlacementMode, QuantFormat};
-use crate::kv::PagedKVPool;
 use crate::model::classifier::{self, ClassifierSlot};
 use crate::model::hf_loader::ChatMessage;
 use crate::model::hub::{
@@ -513,7 +512,6 @@ pub(crate) struct DeviceStatus {
 
 pub struct TuiApp {
     pub telemetry: Arc<EngineTelemetry>,
-    pub kv_pool: Arc<PagedKVPool>,
     pub hw: HardwareCapability,
     pub scheduler: Option<Arc<ContinuousBatchScheduler>>,
     pub hub: HuggingFaceHub,
@@ -592,7 +590,7 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
-    pub fn new(telemetry: Arc<EngineTelemetry>, kv_pool: Arc<PagedKVPool>) -> Self {
+    pub fn new(telemetry: Arc<EngineTelemetry>) -> Self {
         let hw = HardwareCapability::probe_system();
         if let Some(perf_cores) = hw.performance_cores {
             let limit = (perf_cores as usize).saturating_sub(1).max(1);
@@ -638,7 +636,6 @@ impl TuiApp {
         let gemm_top: Vec<String> = gemm_top.into_iter().take(3).map(|(_, s)| s).collect();
         Self {
             telemetry,
-            kv_pool,
             host_lines: hw.summary(),
             hw,
             scheduler: None,
@@ -810,7 +807,7 @@ impl TuiApp {
                 let prev_turns = self.chat_history.len() / 2;
                 self.chat_history.clear();
                 if let Some(s) = &self.scheduler {
-                    s.kv_pool.radix_cache.clear();
+                    s.radix.clear();
                 }
                 Some(Ok(format!(
                     "Cleared multi-turn chat history ({prev_turns} turns removed) and reset KV prefix cache."
@@ -2816,7 +2813,7 @@ mod tests {
     /// Commands with nothing to run on fail at once with the reason; nothing is fabricated.
     #[test]
     fn test_prompt_commands_report_missing_models_and_bad_input() {
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
         let cases = [
             ("/decide is this safe | approve, reject", "System 1"),
             ("/embed quick brown fox", "System 1"),
@@ -2840,7 +2837,7 @@ mod tests {
     /// Keys type into the prompt while it has focus; the same keys drive the dashboard otherwise.
     #[test]
     fn test_keys_type_in_prompt_and_command_dashboard() {
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
         assert!(!app.handle_key(key(KeyCode::Char('i'))));
         for c in "mq".chars() {
             assert!(!app.handle_key(key(KeyCode::Char(c))), "'{c}' must type");
@@ -2859,9 +2856,8 @@ mod tests {
     #[test]
     fn test_model_load_hot_swaps_scheduler_and_chat_streams() {
         let cache = tempfile::tempdir().unwrap();
-        let kv = Arc::new(PagedKVPool::new(1024));
-        let sched = Arc::new(ContinuousBatchScheduler::new("", kv.clone(), None));
-        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+        let sched = Arc::new(ContinuousBatchScheduler::new("", None));
+        let mut app = TuiApp::new(EngineTelemetry::new()).with_runtime(
             sched.clone(),
             HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
             None,
@@ -2948,9 +2944,8 @@ mod tests {
             eprintln!("SKIP: gemma-4-E2B GGUF not found");
             return;
         }
-        let kv = Arc::new(PagedKVPool::new(1024));
-        let sched = Arc::new(ContinuousBatchScheduler::new("", kv.clone(), None));
-        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+        let sched = Arc::new(ContinuousBatchScheduler::new("", None));
+        let mut app = TuiApp::new(EngineTelemetry::new()).with_runtime(
             sched.clone(),
             HuggingFaceHub::with_cache_dir("disk".into()),
             None,
@@ -2990,9 +2985,8 @@ mod tests {
             cache.path().join(repo.file_name().unwrap()),
         )
         .unwrap();
-        let kv = Arc::new(PagedKVPool::new(1024));
-        let sched = Arc::new(ContinuousBatchScheduler::new("", kv.clone(), None));
-        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+        let sched = Arc::new(ContinuousBatchScheduler::new("", None));
+        let mut app = TuiApp::new(EngineTelemetry::new()).with_runtime(
             sched.clone(),
             HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
             None,
@@ -3031,9 +3025,8 @@ mod tests {
         let repo = cache.path().join("models--o--r");
         std::fs::create_dir_all(repo.join("snapshots/main")).unwrap();
         std::fs::write(repo.join("snapshots/main/model.safetensors"), b"w").unwrap();
-        let kv = Arc::new(PagedKVPool::new(64));
-        let sched = Arc::new(ContinuousBatchScheduler::new("", kv.clone(), None));
-        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+        let sched = Arc::new(ContinuousBatchScheduler::new("", None));
+        let mut app = TuiApp::new(EngineTelemetry::new()).with_runtime(
             sched,
             HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
             None,
@@ -3084,7 +3077,7 @@ mod tests {
 
     #[test]
     fn test_scratch_dir_cleanup_on_drop() {
-        let app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let app = TuiApp::new(EngineTelemetry::new());
         let scratch = app.scratch_dir.path().to_path_buf();
         std::fs::write(scratch.join("probe.png"), b"x").unwrap();
         drop(app);
@@ -3124,7 +3117,7 @@ mod tests {
     }
     #[test]
     fn test_chat_template_hot_swapping_and_modal() {
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
         let tok = Tokenizer::default_bpe();
 
         // 1. Toggle modal with F2
@@ -3162,7 +3155,7 @@ mod tests {
 
     #[test]
     fn test_mascot_reactive_state_machine_in_tui() {
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
         assert_eq!(app.mascot.state, mascot::MascotState::Idle);
 
         // While running > 0, mascot becomes Generating
@@ -3190,9 +3183,8 @@ mod tests {
     #[test]
     fn test_logprob_inspector_toggle_and_channel() {
         let cache = tempfile::tempdir().unwrap();
-        let kv = Arc::new(PagedKVPool::new(64));
-        let sched = Arc::new(ContinuousBatchScheduler::new("", kv.clone(), None));
-        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+        let sched = Arc::new(ContinuousBatchScheduler::new("", None));
+        let mut app = TuiApp::new(EngineTelemetry::new()).with_runtime(
             sched.clone(),
             HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
             None,
@@ -3232,7 +3224,7 @@ mod tests {
 
     #[test]
     fn test_roofline_probe_and_gibbs_commands() {
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
 
         // 1. /gibbs command
         app.input = "/gibbs".into();
@@ -3306,7 +3298,7 @@ mod tests {
         use crate::model::weight_format::{ReencodePolicy as R, VariantPolicy as V};
         let _settings = settings_guard();
         let _ = std::fs::remove_file(settings::settings_path());
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
 
         // 1. /settings toggles modal
         assert!(!app.show_settings_modal);
@@ -3353,7 +3345,7 @@ mod tests {
         assert_eq!(c.mode, crate::compact::CompactionMode::Aggressive);
         assert_eq!((c.trigger_ratio, c.target_ratio, c.keep_recent_turns), (0.3, 0.2, 3));
         assert_eq!(c.summarizer.as_deref(), Some("org/sum"));
-        let restarted = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let restarted = TuiApp::new(EngineTelemetry::new());
         assert_eq!(
             (restarted.reencode_policy, restarted.variant_policy),
             (R::LowBitNative, V::Fastest4Bit)
@@ -3493,7 +3485,7 @@ mod tests {
         assert!(crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility));
 
         // 2. PAR_LIMIT configuration
-        let app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let app = TuiApp::new(EngineTelemetry::new());
         if cfg!(target_os = "macos") {
             let limit = crate::model::nn::PAR_LIMIT.load(Ordering::Relaxed);
             if app.hw.performance_cores.is_some() {
@@ -3524,7 +3516,7 @@ mod tests {
     #[test]
     fn test_s7_4_reencode_and_variant_slash_commands_and_picker_keys() {
         let _settings = settings_guard();
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
 
         // 1. /reencode slash command
         app.input = "/reencode low-bit-native".into();
@@ -3587,9 +3579,8 @@ mod tests {
     /// A tiny synthetic model loaded offline into a fresh app.
     fn app_with_tiny_model() -> (TuiApp, Arc<ContinuousBatchScheduler>, tempfile::TempDir) {
         let cache = tempfile::tempdir().unwrap();
-        let kv = Arc::new(PagedKVPool::new(1024));
-        let sched = Arc::new(ContinuousBatchScheduler::new("", kv.clone(), None));
-        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+        let sched = Arc::new(ContinuousBatchScheduler::new("", None));
+        let mut app = TuiApp::new(EngineTelemetry::new()).with_runtime(
             sched.clone(),
             HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
             None,
@@ -3732,7 +3723,7 @@ mod tests {
     /// `/placement` prints the table and ends in `100% Metal`, or lists the CPU ops as an error.
     #[test]
     fn placement_command_explains_the_loaded_program() {
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
         type_and_run(&mut app, "/placement");
         assert_eq!(app.history.last().unwrap().kind, Kind::Error);
 
@@ -3776,7 +3767,7 @@ mod tests {
             weights_ms: 3.9,
             dispatches: 10,
         });
-        let app = TuiApp::new(telemetry, Arc::new(PagedKVPool::new(64)));
+        let app = TuiApp::new(telemetry);
         let text = lines_of(&snapshot::render_buffer(&app, 120, 40)).join("\n");
         assert!(text.contains("■0.000 ms"), "{text}");
         assert!(!text.contains("■-"), "{text}");
@@ -3898,7 +3889,7 @@ mod tests {
             assert_eq!(s.parse::<V>().ok(), Some(p));
             assert_eq!(p.name(), s);
         }
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
         for bad in ["/reencode turbo", "/variant best", "/profile sort size"] {
             type_and_run(&mut app, bad);
             let e = app.history.last().unwrap();
@@ -3910,7 +3901,7 @@ mod tests {
     /// `/help` and the unknown-command text list every command.
     #[test]
     fn help_lists_every_command() {
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
         type_and_run(&mut app, "/help");
         let help = app.history.last().unwrap().output.clone();
         type_and_run(&mut app, "/nope");
@@ -4031,7 +4022,7 @@ mod tests {
     #[test]
     fn compact_dock_keeps_each_component_on_one_row() {
         let _g = truecolor();
-        let app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let app = TuiApp::new(EngineTelemetry::new());
         let lines = lines_of(&snapshot::render_buffer(&app, 80, 24));
         let (v, th) = (app.vitals(), theme::theme());
         let atoms = app.dock_atoms(&v, &th);
@@ -4049,7 +4040,7 @@ mod tests {
     #[test]
     fn load_component_shows_the_stage_track_at_every_tier() {
         let _g = truecolor();
-        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let mut app = TuiApp::new(EngineTelemetry::new());
         app.load = Some(fake_load());
         for (w, h) in [(80, 24), (120, 40), (200, 60)] {
             let text = lines_of(&snapshot::render_buffer(&app, w, h)).join("\n");
@@ -4104,19 +4095,14 @@ mod tests {
 
     #[test]
     fn llm_can_be_used_and_toggled_as_system1_in_tui() {
-        let kv = Arc::new(PagedKVPool::new(64));
         let dir = tempfile::tempdir().unwrap();
         let llm = crate::arch::testing::synthetic_lm(
             dir.path(),
             serde_json::json!({}),
             crate::hardware::Device::Cpu,
         );
-        let sched = Arc::new(ContinuousBatchScheduler::new(
-            "foundry/smollm-1m",
-            kv.clone(),
-            Some(llm),
-        ));
-        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+        let sched = Arc::new(ContinuousBatchScheduler::new("foundry/smollm-1m", Some(llm)));
+        let mut app = TuiApp::new(EngineTelemetry::new()).with_runtime(
             sched,
             HuggingFaceHub::new(),
             None,
@@ -4161,8 +4147,7 @@ mod tests {
 
     #[test]
     fn test_multi_turn_chat_history_and_slash_commands() {
-        let kv = Arc::new(PagedKVPool::new(64));
-        let mut app = TuiApp::new(EngineTelemetry::new(), kv);
+        let mut app = TuiApp::new(EngineTelemetry::new());
         app.chat_history
             .push(("user".into(), "First question".into()));
         app.chat_history

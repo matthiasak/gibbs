@@ -170,23 +170,21 @@ pub trait NativeLm: Send + Sync {
         None
     }
 
-    /// Exports a physical KV/state snapshot after `token_len` committed tokens for [`RadixPrefixCache`].
-    fn export_kv_snapshot(
-        &self,
-        _state: &SeqState,
-        _token_len: usize,
-    ) -> Option<crate::kv::CachedKvSnapshot> {
+    /// What the radix prefix cache keeps of `state`'s first `len` positions: references to its
+    /// KV pages and, when the model needs one, its boundary state (`None`: not cacheable).
+    fn kv_export(&self, _state: &SeqState, _len: usize) -> Option<crate::kv::KvExport> {
         None
     }
 
-    /// Restores a physical KV/state prefix of `prefix_len` tokens from `snap` into `state`.
-    fn restore_kv_prefix(
-        &self,
-        _state: &mut SeqState,
-        _snap: &crate::kv::CachedKvSnapshot,
-        _prefix_len: usize,
-    ) -> bool {
-        false
+    /// Resumes a freshly prepared `state` from cached prefix `m`; the positions resumed (`None`:
+    /// nothing reused).
+    fn kv_restore(&self, _state: &mut SeqState, _m: &crate::kv::Match) -> Option<usize> {
+        None
+    }
+
+    /// The model's KV page pool.
+    fn kv_pool(&self) -> Option<Arc<crate::kv::KvPool>> {
+        None
     }
 
     /// The chat template's thinking delimiters as `(open, close)` pairs

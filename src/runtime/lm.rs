@@ -141,6 +141,9 @@ pub struct SpecLm {
     /// Compiled from the decode instance; every other instance runs reshaped on it.
     program: Mutex<GraphProgram>,
     recurrent: Vec<String>,
+    /// States the KV pool does not page: a prefix-cache boundary snapshots them.
+    contiguous: Vec<String>,
+    kv_pool: Option<Arc<crate::kv::KvPool>>,
     /// The decode instance takes exactly `[token_ids, positions]`, outputs `logits` first and
     /// holds no recurrent state: greedy decode may stream on the device.
     streams: bool,
@@ -439,6 +442,8 @@ impl SpecLm {
         let embed = EmbedTable::find(&decode.graph, &weights).map(Arc::new);
         let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
         let recurrent = program.recurrent_states();
+        let contiguous = program.contiguous_states();
+        let kv_pool = program.kv_pool.clone();
         let streams = decode.output_index("logits") == Some(0)
             && decode
                 .inputs
@@ -455,6 +460,8 @@ impl SpecLm {
             shapes,
             program: Mutex::new(program),
             recurrent,
+            contiguous,
+            kv_pool,
             streams,
             weights: decode.weights.len(),
             mode,
@@ -468,6 +475,16 @@ impl SpecLm {
         state
             .downcast_mut::<Seq>()
             .ok_or_else(|| "sequence state was not built by this model".into())
+    }
+
+    /// Whether a cached prefix resumes only at an exported boundary: ring pages or contiguous
+    /// states hold the sequence's state at one exact length.
+    fn needs_boundary(&self) -> bool {
+        !self.contiguous.is_empty()
+            || self
+                .kv_pool
+                .as_ref()
+                .is_some_and(|p| p.classes.iter().any(|c| c.window.is_some()))
     }
 
     fn instance(
@@ -1073,14 +1090,10 @@ impl NativeLm for SpecLm {
         self.media.contains_key("image") && !self.off.contains_key("image")
     }
 
-    fn export_kv_snapshot(
-        &self,
-        state: &SeqState,
-        token_len: usize,
-    ) -> Option<crate::kv::CachedKvSnapshot> {
+    fn kv_export(&self, state: &SeqState, len: usize) -> Option<crate::kv::KvExport> {
         let seq = state.downcast_ref::<Seq>()?;
-        if token_len == 0
-            || seq.len < token_len
+        if len == 0
+            || seq.len < len
             || seq.recurrent_ahead
             || !seq.blocks.is_empty()
             || !seq.media.media_index.is_empty()
@@ -1088,49 +1101,69 @@ impl NativeLm for SpecLm {
         {
             return None;
         }
-        if !self.recurrent.is_empty() && seq.len != token_len {
+        let boundary = self.needs_boundary();
+        if boundary && seq.len != len {
             return None;
         }
-        Some(crate::kv::CachedKvSnapshot {
-            state: seq.state.fork(token_len).ok()?,
-            token_len,
-            has_recurrent: !self.recurrent.is_empty(),
-        })
+        let recurrent = boundary.then(|| {
+            let names: Vec<&str> = self.contiguous.iter().map(String::as_str).collect();
+            seq.state.snapshot(&names)
+        });
+        match &seq.state.kv {
+            Some(v) if v.evicted == 0 => v.export(len, recurrent).ok(),
+            Some(_) => None,
+            None if self.kv_pool.is_none() => Some(crate::kv::KvExport {
+                pool: None,
+                pages: Vec::new(),
+                boundary: recurrent.map(|recurrent| crate::kv::Boundary {
+                    len,
+                    rings: Vec::new(),
+                    recurrent,
+                    pool: None,
+                }),
+            }),
+            None => None,
+        }
     }
 
-    fn restore_kv_prefix(
-        &self,
-        state: &mut SeqState,
-        snap: &crate::kv::CachedKvSnapshot,
-        prefix_len: usize,
-    ) -> bool {
-        let Ok(seq) = Self::seq(state) else {
-            return false;
-        };
-        if prefix_len == 0
-            || prefix_len > snap.token_len
-            || prefix_len > seq.prompt.len()
+    fn kv_restore(&self, state: &mut SeqState, m: &crate::kv::Match) -> Option<usize> {
+        let seq = Self::seq(state).ok()?;
+        if seq.len != 0
             || !seq.blocks.is_empty()
             || !seq.media.media_index.is_empty()
             || !seq.taps.is_empty()
         {
-            return false;
+            return None;
         }
-        if (snap.has_recurrent || !self.recurrent.is_empty()) && prefix_len != snap.token_len {
-            return false;
-        }
-        let Ok(forked) = snap.state.fork(prefix_len) else {
-            return false;
+        let same_pool = match (&self.kv_pool, &m.pool) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
         };
-        seq.state = forked;
-        seq.len = prefix_len;
-        seq.asked = prefix_len;
-        seq.ids = seq.prompt[..prefix_len].to_vec();
+        let b = m.boundary.as_deref();
+        let len = if self.needs_boundary() { b?.len } else { m.len };
+        if !same_pool || len == 0 || len > m.len || len > seq.prompt.len() {
+            return None;
+        }
+        let rings = b.filter(|b| b.len == len).map_or(&[][..], |b| &b.rings[..]);
+        seq.state = StateStore::new();
+        if let Some(p) = &self.kv_pool {
+            seq.state.kv = Some(crate::kv::KvView::resume(p.clone(), len, &m.pages, rings).ok()?);
+        }
+        if self.needs_boundary() {
+            seq.state.restore(b?.recurrent.clone());
+        }
+        seq.len = len;
+        seq.asked = len;
+        seq.ids = seq.prompt[..len].to_vec();
         seq.ahead.clear();
         seq.ckpt.clear();
         seq.ckpt_from = 0;
         seq.recurrent_ahead = false;
-        true
+        Some(len)
+    }
+
+    fn kv_pool(&self) -> Option<Arc<crate::kv::KvPool>> {
+        self.kv_pool.clone()
     }
 }
 

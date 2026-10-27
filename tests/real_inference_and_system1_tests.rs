@@ -1,7 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gibbs_engine::hardware::{Device, PlacementMode, QuantFormat};
-use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::hub::{HuggingFaceHub, ModelArtifacts};
 use gibbs_engine::model::native::NativeLm;
 use gibbs_engine::model::tokenizer::Tokenizer;
@@ -210,16 +209,11 @@ fn test_real_safetensors_tinystories_model_inference_and_comprehension() {
 
 #[tokio::test]
 async fn test_server_real_streaming_and_system1_endpoint() {
-    let kv_pool = Arc::new(PagedKVPool::new(1024));
     let telemetry = EngineTelemetry::new();
 
     let jev_model = Default::default();
 
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(
-        "",
-        kv_pool.clone(),
-        Some(tiny_model()),
-    ));
+    let scheduler = Arc::new(ContinuousBatchScheduler::new("", Some(tiny_model())));
 
     // Spawn scheduler step runner for the duration of the test
     let sched_clone = scheduler.clone();
@@ -790,11 +784,7 @@ fn test_chat_template_and_scheduler_greedy_match_hf() {
         };
         let model = ExecutableModel::new(load(&artifacts).unwrap());
 
-        let sched = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(1024)),
-            Some(model),
-        );
+        let sched = ContinuousBatchScheduler::new("", Some(model));
         let greedy = SamplingParams {
             temperature: Some(0.0),
             top_p: None,

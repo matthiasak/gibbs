@@ -3,7 +3,6 @@
 //! `target/tui-snapshot.html`.
 
 use super::{mascot::MascotState, theme, DeviceStatus, Kind, TuiApp};
-use crate::kv::PagedKVPool;
 use crate::telemetry::{EngineTelemetry, GapSample, KernelRow};
 use ratatui::{
     backend::TestBackend,
@@ -11,7 +10,7 @@ use ratatui::{
     style::{Color, Modifier},
     Terminal,
 };
-use std::{fmt::Write as _, sync::Arc, time::{Duration, Instant}};
+use std::{fmt::Write as _, time::{Duration, Instant}};
 
 const DEFAULT_FG: (u8, u8, u8) = (0xF5, 0xEE, 0xDB);
 const DEFAULT_BG: (u8, u8, u8) = (0x14, 0x10, 0x0D);
@@ -160,11 +159,7 @@ pub(super) fn fixture_app() -> TuiApp {
     telemetry
         .is_tui_active
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    let kv = Arc::new(PagedKVPool::new(64));
-    for step in 0..8 {
-        kv.allocate_block(step);
-    }
-    let mut app = TuiApp::new(telemetry.clone(), kv);
+    let mut app = TuiApp::new(telemetry.clone());
     // `new` probes the real GPU; the fixture pins its own readings.
     telemetry.set_hardware_profile("Apple M5 Pro", 273.0);
     telemetry.set_model_size_bytes((273.0e9 / 329.0) as u64);

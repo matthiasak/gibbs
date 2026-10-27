@@ -1,7 +1,6 @@
 use clap::Parser;
 use gibbs_engine::arch::dispatch::{LoadOpts, Loaded};
 use gibbs_engine::hardware::{Device, HardwareCapability};
-use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::classifier::{self, ClassifierSlot};
 use gibbs_engine::model::hub::{is_synthetic_model_id, HuggingFaceHub, StorageBackend};
 use gibbs_engine::model::image::ImageBuffer;
@@ -455,11 +454,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(gibbs_engine::model::weight_format::parse_quant)
         .transpose()?;
 
-    // 2. Initialize Memory Hierarchy and KV Pool
-    let kv_pool = Arc::new(PagedKVPool::new(
-        gibbs_engine::scheduler::ONE_SHOT_POOL_BLOCKS,
-    ));
-
     // 4. Model Resolution & Cache Inspection (Auto-Download & Cloud Storage)
     let storage_backend = StorageBackend::from_uri(&cli.storage)?;
     let hub = HuggingFaceHub::new()
@@ -720,7 +714,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Initialize Continuous Batch Scheduler with Real Streaming Channel & Telemetry
     let scheduler = Arc::new(ContinuousBatchScheduler::with_telemetry(
         cli.model.clone(),
-        kv_pool.clone(),
         model_exec,
         telemetry.clone(),
     ));
@@ -886,7 +879,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 8. Interactive TUI or Headless Daemon Mode
     if cli.tui {
         let mut tui_app =
-            TuiApp::new(telemetry, kv_pool).with_runtime(scheduler, hub, token, None, image_slot);
+            TuiApp::new(telemetry).with_runtime(scheduler, hub, token, None, image_slot);
         tui_app.quant_override = quant_override;
         tui_app.frame_log_path = cli.tui_frame_log;
         tui_app.classifier = classifier_slot;

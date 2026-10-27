@@ -579,6 +579,10 @@ impl NativeLm for SpecEncDec {
         self.dec.lock().primary_device()
     }
 
+    fn kv_pool(&self) -> Option<Arc<crate::kv::KvPool>> {
+        self.dec.lock().kv_pool.clone()
+    }
+
     fn summary(&self) -> String {
         let search = match (&self.text, self.gen.beams) {
             (EncDecText::Translation(_), b) if b > 1 => format!("beam search ×{b}"),

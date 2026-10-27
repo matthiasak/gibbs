@@ -317,6 +317,28 @@ impl GraphProgram {
         self.segment.graph().recurrent_states()
     }
 
+    /// Names of the program's states its KV pool does not page (recurrent conv/ssm, `StateWrite`
+    /// caches, ...), sorted: what a prefix-cache boundary snapshots.
+    pub fn contiguous_states(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .segment
+            .graph()
+            .values
+            .iter()
+            .filter_map(|v| match &v.kind {
+                crate::graph::ValueKind::State { name, .. }
+                    if self.kv_pool.as_ref().is_none_or(|p| p.locate(name).is_none()) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// The program's graph nodes grouped by op kind, device and avenue, most numerous first.
     pub fn placement_summary(&self) -> Vec<PlacementRow> {
         let mut rows: Vec<PlacementRow> = Vec::new();
