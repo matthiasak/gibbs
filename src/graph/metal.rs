@@ -2516,7 +2516,7 @@ impl Session {
                 *LAST_PROFILE.lock() = Some((Instant::now(), rows));
             } else {
                 let (cbs, dispatches, encode_dur) =
-                    self.encode_chunks(steps, &loc, mlp_scratch_buf.as_ref())?;
+                    self.encode_chunks(steps, &loc, mlp_scratch_buf.as_ref(), None)?;
                 let last = cbs.last().expect("a plan has at least one step");
                 commit_and_wait(last)?;
                 for cb in &cbs[..cbs.len() - 1] {
@@ -2617,6 +2617,11 @@ impl Session {
         sample_spec: Option<SampleGpuSpec>,
         recent: &[u32],
     ) -> Result<FedStream, String> {
+        // Greedy streams bind output 0 to the ring word, so a step must write it (not a view of it).
+        let out = graph.outputs.first();
+        if sample_spec.is_none() && !plan.steps.iter().any(|st| Some(&st.out) == out) {
+            return Err("a greedy fed stream needs output 0 written by a step".into());
+        }
         let ring = new_shared_buffer(&self.rt.device, 128)?;
         // SAFETY: a fresh 128-byte shared buffer no command buffer uses yet.
         unsafe { *(ring.contents() as *mut u32).add(16) = last };
@@ -2655,8 +2660,8 @@ impl Session {
     }
 
     /// Encodes and commits the stream's next token: its id is the previous token's device pick
-    /// (the first token's from the ring), its position host-written into its ring slot; a blit
-    /// copies the picked id (output 0) into that slot. Nothing waits.
+    /// (the first token's from the ring), its position host-written into its ring slot; the picked
+    /// id lands in that slot (greedy: output 0's step writes it; sampled: the sampler does). Nothing waits.
     pub(crate) fn submit_fed(
         &self,
         graph: &Graph,
@@ -2685,7 +2690,11 @@ impl Session {
             let arena = arena.as_ref().expect("allocated above");
             let mlp_scratch_buf = self.mlp_scratch_for(plan)?;
             let (ring, state_bufs) = (&s.ring, &s.state_bufs);
+            let direct = s.sample_spec.is_none();
             let loc = |v: ValueId| -> (&Buffer, usize) {
+                if direct && v == out {
+                    return (ring, 16 * slot + 4);
+                }
                 if let Some(&(_, i, off)) = plan.input_views.iter().find(|x| x.0 == v) {
                     return (ring, if i == 0 { ids_at } else { 16 * slot } + off);
                 }
@@ -2699,54 +2708,52 @@ impl Session {
                     }
                 }
             };
+            let sample = |enc: &Counted| -> Result<(), String> {
+                let (Some(sp), Some(rb)) = (s.sample_spec, s.recent_buf.as_ref()) else {
+                    return Ok(());
+                };
+                #[repr(C)]
+                struct SampleGpuParams {
+                    vocab: u32,
+                    top_k: u32,
+                    inv_temp: f32,
+                    top_p: f32,
+                    rep_penalty: f32,
+                    n_recent: u32,
+                    rng_seed: u64,
+                }
+                let (ob, oo) = loc(out);
+                enc.set_compute_pipeline_state(self.rt.pso("sample_logits_gpu")?);
+                enc.set_buffer(0, Some(ob), oo as u64);
+                enc.set_buffer(1, Some(ring), (16 * slot + 4) as u64);
+                enc.set_buffer(2, Some(rb), 0);
+                let p = SampleGpuParams {
+                    vocab: sp.vocab,
+                    top_k: sp.top_k,
+                    inv_temp: sp.inv_temp,
+                    top_p: sp.top_p,
+                    rep_penalty: sp.rep_penalty,
+                    n_recent: s.recent_len.clamp(1, 64),
+                    rng_seed: sp
+                        .rng_seed
+                        .wrapping_add((t as u64).wrapping_mul(0x9E3779B97F4A7C15)),
+                };
+                set_bytes(enc, 3, &p);
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+                Ok(())
+            };
             metal::objc::rc::autoreleasepool(|| {
                 use std::sync::atomic::Ordering::Relaxed;
                 self.fed_ids.store(true, Relaxed);
-                let r = self.encode_chunks(&plan.steps, &loc, mlp_scratch_buf.as_ref());
+                let r = self.encode_chunks(
+                    &plan.steps,
+                    &loc,
+                    mlp_scratch_buf.as_ref(),
+                    (!direct).then_some(&sample as &dyn Fn(&Counted) -> Result<(), String>),
+                );
                 self.fed_ids.store(false, Relaxed);
-                let (cbs, mut dispatches, encode_dur) = r?;
+                let (cbs, dispatches, encode_dur) = r?;
                 let last = cbs.last().expect("encode_chunks returns a buffer");
-                let (ob, oo) = loc(out);
-                if let (Some(sp), Some(rb)) = (s.sample_spec, s.recent_buf.as_ref()) {
-                    #[repr(C)]
-                    struct SampleGpuParams {
-                        vocab: u32,
-                        top_k: u32,
-                        inv_temp: f32,
-                        top_p: f32,
-                        rep_penalty: f32,
-                        n_recent: u32,
-                        rng_seed: u64,
-                    }
-                    let enc = last.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(self.rt.pso("sample_logits_gpu")?);
-                    enc.set_buffer(0, Some(ob), oo as u64);
-                    enc.set_buffer(1, Some(ring), (16 * slot + 4) as u64);
-                    enc.set_buffer(2, Some(rb), 0);
-                    let p = SampleGpuParams {
-                        vocab: sp.vocab,
-                        top_k: sp.top_k,
-                        inv_temp: sp.inv_temp,
-                        top_p: sp.top_p,
-                        rep_penalty: sp.rep_penalty,
-                        n_recent: s.recent_len.max(1).min(64),
-                        rng_seed: sp
-                            .rng_seed
-                            .wrapping_add((t as u64).wrapping_mul(0x9E3779B97F4A7C15)),
-                    };
-                    enc.set_bytes(
-                        3,
-                        std::mem::size_of::<SampleGpuParams>() as u64,
-                        &p as *const SampleGpuParams as *const c_void,
-                    );
-                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-                    enc.end_encoding();
-                    dispatches += 1;
-                } else {
-                    let blit = last.new_blit_command_encoder();
-                    blit.copy_from_buffer(ob, oo as u64, ring, (16 * slot + 4) as u64, 4);
-                    blit.end_encoding();
-                }
                 last.commit();
                 *self.fed_tail.lock() = Some(last.clone());
                 Ok::<_, String>((cbs, dispatches, encode_dur))
@@ -2781,7 +2788,7 @@ impl Session {
                 cb.status()
             ));
         }
-        // SAFETY: the token's blit wrote this word and its command buffers completed.
+        // SAFETY: the token's last step wrote this word and its command buffers completed.
         let tok = unsafe { *(s.ring.contents() as *const u32).add(4 * f.slot + 1) };
         let span = gpu_span_seconds(&f.cbs[0], last);
         self.last_gpu_s
@@ -2820,12 +2827,14 @@ impl Session {
     }
 
     /// Encodes `steps` into command buffers cut into chunks, committing every chunk but the last as
-    /// soon as it is encoded; returns the buffers (the last uncommitted), dispatches and encode time.
+    /// soon as it is encoded; `tail` encodes into the last chunk's encoder after the steps. Returns
+    /// the buffers (the last uncommitted), dispatches and encode time.
     fn encode_chunks<'a>(
         &self,
         steps: &[Planned],
         loc: &dyn Fn(ValueId) -> (&'a Buffer, usize),
         mlp_scratch: Option<&Buffer>,
+        tail: Option<&dyn Fn(&Counted) -> Result<(), String>>,
     ) -> Result<(Vec<metal::CommandBuffer>, u32, std::time::Duration), String> {
         // The GPU runs the first `CB_FIRST_STEPS` steps while the host encodes the rest (encoding costs
         // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
@@ -2841,8 +2850,8 @@ impl Session {
         let mut err = None;
         let mut dispatches = 0u32;
         let encode_start = std::time::Instant::now();
-        let mut at = 0;
-        while at < steps.len() && err.is_none() {
+        let mut at = 0usize;
+        loop {
             let end = if cbs.is_empty() {
                 first
             } else {
@@ -2858,6 +2867,9 @@ impl Session {
                     break;
                 }
             }
+            if let (true, None, Some(t)) = (end == steps.len(), &err, tail) {
+                err = t(&counted).err();
+            }
             enc.end_encoding();
             dispatches += counted.dispatches();
             if end < steps.len() && err.is_none() {
@@ -2865,6 +2877,9 @@ impl Session {
             }
             cbs.push(cb);
             at = end;
+            if at == steps.len() || err.is_some() {
+                break;
+            }
         }
         let encode_dur = encode_start.elapsed();
         if let Some(e) = err {
@@ -2873,11 +2888,6 @@ impl Session {
                 cbs[cbs.len() - 2].wait_until_completed();
             }
             return Err(e);
-        }
-        if cbs.is_empty() {
-            let cb = self.rt.queue.new_command_buffer().to_owned();
-            cb.new_compute_command_encoder().end_encoding();
-            cbs.push(cb);
         }
         Ok((cbs, dispatches, encode_dur))
     }
