@@ -4561,3 +4561,55 @@ fn multi_row_recurrent_ops_with_state_match_cpu() {
         assert!(rel_err(&states[0].0, &states[0].1) < 1e-6, "conv state");
     }
 }
+
+#[test]
+fn sample_topk_matches_cpu_nucleus() {
+    let s = Session::new(rt(), &Weights::new()).unwrap();
+    let vocab = 10_000;
+    let mut logits: Vec<f32> = rand(vocab, 11).iter().map(|v| v * 4.0).collect();
+    // The two largest logits share a 256-stride lane of the first span (ids 300 and 300 + 256).
+    logits[300] = 9.0;
+    logits[556] = 8.5;
+    let (temp, top_p) = (0.8f32, 0.95f32);
+    let buf = |bytes: usize| new_shared_buffer(&s.rt.device, bytes).unwrap();
+    let (lb, ob, rb) = (buf(vocab * 4), buf(4), buf(64 * 4));
+    // SAFETY: fresh shared buffers no command buffer uses yet.
+    unsafe { std::ptr::copy_nonoverlapping(logits.as_ptr(), lb.contents() as *mut f32, vocab) };
+    let p = SampleGpuParams {
+        vocab: vocab as u32,
+        top_k: crate::scheduler::SAMPLE_TOP_K as u32,
+        inv_temp: 1.0 / temp,
+        top_p,
+        rep_penalty: 1.0,
+        n_recent: 1,
+        rng_seed: 42,
+    };
+    let cb = s.rt.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    s.encode_sample(&Counted::new(enc), (&lb, 0), (&ob, 0), &rb, &p)
+        .unwrap();
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    let k = crate::scheduler::SAMPLE_TOP_K;
+    let scratch = s.argmax_scratch.lock().clone().unwrap();
+    // SAFETY: the command buffer completed; the final kernel wrote `k` (id, prob bits) pairs.
+    let kept = unsafe { std::slice::from_raw_parts(scratch.contents() as *const [u32; 2], k) };
+    let got: Vec<(u32, f32)> = kept
+        .iter()
+        .take_while(|e| e[0] != u32::MAX)
+        .map(|e| (e[0], f32::from_bits(e[1])))
+        .collect();
+    let (cands, probs, n) = crate::runtime::lm::nucleus(&logits, &[], temp, k, top_p, 1.0);
+    assert!(n > 2, "the nucleus keeps more than the two planted logits");
+    assert_eq!(
+        got.iter().map(|e| e.0).collect::<Vec<_>>(),
+        cands[..n].iter().map(|c| c.0 as u32).collect::<Vec<_>>()
+    );
+    for ((_, gp), &cp) in got.iter().zip(&probs[..n]) {
+        assert!((gp - cp).abs() < 1e-5, "prob {gp} vs {cp}");
+    }
+    // SAFETY: the command buffer completed.
+    let tok = unsafe { *(ob.contents() as *const u32) };
+    assert!(got.iter().any(|e| e.0 == tok), "drawn token {tok} is kept");
+}

@@ -161,8 +161,7 @@ pub(crate) fn profile_requested() -> bool {
     PROFILE_NEXT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A greedy decode stream ([`Session::submit_fed`]): each token's command buffers are queued before
-/// the previous token is read back, and token ids flow between tokens on the device through `ring`.
+/// A sampled fed stream's sampler: top-`top_k` at `1 / inv_temp`, nucleus `top_p`, repetition penalty.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleGpuSpec {
     pub vocab: u32,
@@ -173,6 +172,24 @@ pub struct SampleGpuSpec {
     pub rng_seed: u64,
 }
 
+/// `SampleGpuParams` of `sample_topk_part` / `sample_topk_final` (`metal_kernels.metal`).
+#[repr(C)]
+struct SampleGpuParams {
+    vocab: u32,
+    top_k: u32,
+    inv_temp: f32,
+    top_p: f32,
+    rep_penalty: f32,
+    n_recent: u32,
+    rng_seed: u64,
+}
+
+/// Logits one `sample_topk_part` threadgroup covers (`SAMPLE_SPAN` in the MSL).
+const SAMPLE_SPAN: usize = 4096;
+
+/// A greedy or sampled decode stream ([`Session::submit_fed`]): each token's command buffers are
+/// queued before the previous token is read back, and token ids flow between tokens on the device
+/// through `ring`.
 pub struct FedStream {
     /// Slot `t % 4` (16 bytes at `16 * (t % 4)`) holds token `t`'s `[position, picked token, -, -]`;
     /// byte 64 holds the stream's first input token.
@@ -472,7 +489,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 76] = [
+const BASE_KERNELS: [&str; 77] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -548,7 +565,8 @@ const BASE_KERNELS: [&str; 76] = [
     "attn_cached_merge_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
-    "sample_logits_gpu",
+    "sample_topk_part",
+    "sample_topk_final",
 ];
 const MPP_KERNELS: [&str; 18] = [
     "gemm_mpp_none",
@@ -2712,21 +2730,6 @@ impl Session {
                 let (Some(sp), Some(rb)) = (s.sample_spec, s.recent_buf.as_ref()) else {
                     return Ok(());
                 };
-                #[repr(C)]
-                struct SampleGpuParams {
-                    vocab: u32,
-                    top_k: u32,
-                    inv_temp: f32,
-                    top_p: f32,
-                    rep_penalty: f32,
-                    n_recent: u32,
-                    rng_seed: u64,
-                }
-                let (ob, oo) = loc(out);
-                enc.set_compute_pipeline_state(self.rt.pso("sample_logits_gpu")?);
-                enc.set_buffer(0, Some(ob), oo as u64);
-                enc.set_buffer(1, Some(ring), (16 * slot + 4) as u64);
-                enc.set_buffer(2, Some(rb), 0);
                 let p = SampleGpuParams {
                     vocab: sp.vocab,
                     top_k: sp.top_k,
@@ -2738,9 +2741,7 @@ impl Session {
                         .rng_seed
                         .wrapping_add((t as u64).wrapping_mul(0x9E3779B97F4A7C15)),
                 };
-                set_bytes(enc, 3, &p);
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-                Ok(())
+                self.encode_sample(enc, loc(out), (ring, 16 * slot + 4), rb, &p)
             };
             metal::objc::rc::autoreleasepool(|| {
                 use std::sync::atomic::Ordering::Relaxed;
@@ -2767,6 +2768,38 @@ impl Session {
             started,
         });
         s.submitted += 1;
+        Ok(())
+    }
+
+    /// Encodes the exact top-k sampler over `p.vocab` f32 `logits`: `sample_topk_part` writes each
+    /// 4096-wide span's top-k to `argmax_scratch`, `sample_topk_final` draws from their top-k and
+    /// writes the id to `out`, the `recent` slot, and the kept `(id, prob)` list to scratch offset 0.
+    fn encode_sample(
+        &self,
+        enc: &Counted,
+        logits: (&Buffer, usize),
+        out: (&Buffer, usize),
+        recent: &Buffer,
+        p: &SampleGpuParams,
+    ) -> Result<(), String> {
+        let parts = (p.vocab as usize).div_ceil(SAMPLE_SPAN);
+        let need = parts * (p.top_k as usize).clamp(1, 64) * 8;
+        let mut guard = self.argmax_scratch.lock();
+        if guard.as_ref().is_none_or(|b| (b.length() as usize) < need) {
+            *guard = Some(new_shared_buffer(&self.rt.device, need)?);
+        }
+        let scratch = guard.as_ref().expect("allocated above");
+        enc.set_compute_pipeline_state(self.rt.pso("sample_topk_part")?);
+        enc.set_buffer(0, Some(logits.0), logits.1 as u64);
+        enc.set_buffer(1, Some(scratch), 0);
+        enc.set_buffer(2, Some(recent), 0);
+        set_bytes(enc, 3, p);
+        enc.dispatch_thread_groups(MTLSize::new(parts as u64, 1, 1), MTLSize::new(256, 1, 1));
+        // Slots 2 (recent ids) and 3 (params) stay bound.
+        enc.set_compute_pipeline_state(self.rt.pso("sample_topk_final")?);
+        enc.set_buffer(0, Some(scratch), 0);
+        enc.set_buffer(1, Some(out.0), out.1 as u64);
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         Ok(())
     }
 

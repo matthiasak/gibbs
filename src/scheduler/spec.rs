@@ -46,9 +46,6 @@ pub trait Drafter: Send + Sync {
     }
 }
 
-/// Top-k the scheduler samples with (see `ExecutableModel::sample`).
-const TOP_K: usize = 50;
-
 /// One sequence's speculative state, tied to the drafter it started with.
 pub struct SpecSeq {
     drafter: Arc<dyn Drafter>,
@@ -261,7 +258,7 @@ pub(super) fn decode(
 
 /// The scheduler's sampling distribution over `logits` (sparse, normalized).
 fn dist(logits: &[f32], temp: f32, top_p: f32) -> Vec<(u32, f32)> {
-    let (cands, probs, n) = nucleus(logits, &[], temp, TOP_K, top_p, 1.0);
+    let (cands, probs, n) = nucleus(logits, &[], temp, super::SAMPLE_TOP_K, top_p, 1.0);
     let sum: f32 = probs[..n].iter().sum();
     cands[..n]
         .iter()
