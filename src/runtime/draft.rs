@@ -475,22 +475,6 @@ pub fn refused_draft_gguf(arch: &str) -> Option<String> {
     })
 }
 
-/// Builds an [`OnlineNoiseDrafter`] parameterized by `target`'s layer count, hidden dimension,
-/// and vocabulary size.
-pub fn online_drafter_for_target(
-    target: &ModelArtifacts,
-    knobs: Arc<crate::runtime::noise_draft::LiveDraftKnobs>,
-) -> Result<Arc<dyn Drafter>, String> {
-    let reg = registry()?;
-    let tm = crate::arch::load::load(target, reg, None)?;
-    let layers = tm.env.var("layers")?.usize()?;
-    let hidden = tm.env.var("hidden")?.usize()?;
-    let vocab = tm.env.var("vocab")?.usize()?;
-    Ok(crate::runtime::noise_draft::OnlineNoiseDrafter::new(
-        layers, hidden, vocab, knobs,
-    ))
-}
-
 /// Loads `draft` as a drafter for the target loaded from `target`, computing on `mode`: a block
 /// drafter when a `pipeline: drafter` family claims it, else a [`Plain`] causal LM.
 pub fn load_drafter(

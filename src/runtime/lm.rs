@@ -145,6 +145,68 @@ pub struct SpecLm {
     mode: PlacementMode,
     /// The spec's own drafter (`runtime.drafter`), compiled at the first ask.
     drafter: std::sync::OnceLock<Option<Arc<dyn crate::scheduler::spec::Drafter>>>,
+    /// The decode graph's token-embedding table, for [`NativeLm::embed_row`].
+    embed: Option<Arc<EmbedTable>>,
+}
+
+/// The weight of the decode graph's first `Embedding` node reading `token_ids`, `[vocab, cols]`.
+struct EmbedTable {
+    t: Tensor,
+    cols: usize,
+}
+
+impl EmbedTable {
+    // ponytail: an unpacked (f32/f16/bf16 vector) table is copied once here; share tensor data
+    // through `Arc` in `graph::Tensor` if that memory matters.
+    fn find(g: &crate::graph::Graph, w: &crate::graph::Weights) -> Option<Self> {
+        let ids = *g.inputs.iter().find(|&&v| g.value(v).name == "token_ids")?;
+        g.nodes.iter().find_map(|n| {
+            let (&table, &input) = (n.inputs.first()?, n.inputs.get(1)?);
+            let v = g.value(table);
+            (matches!(n.op, crate::graph::Op::Embedding)
+                && input == ids
+                && matches!(v.kind, crate::graph::ValueKind::Weight))
+            .then(|| {
+                Some(Self {
+                    t: w.get(&v.name)?.clone(),
+                    cols: *v.shape.last()?,
+                })
+            })
+            .flatten()
+        })
+    }
+
+    fn row(&self, id: u32, out: &mut [f32]) -> bool {
+        let (r, c) = (id as usize, self.cols);
+        let Some(out) = out.get_mut(..c) else {
+            return false;
+        };
+        let span = r * c..(r + 1) * c;
+        match &self.t {
+            Tensor::F32(v) => v.get(span).map(|s| out.copy_from_slice(s)).is_some(),
+            Tensor::F16(v) => v
+                .get(span)
+                .map(|s| {
+                    for (o, &x) in out.iter_mut().zip(s) {
+                        *o = crate::model::f16_to_f32(x);
+                    }
+                })
+                .is_some(),
+            Tensor::BF16(v) => v
+                .get(span)
+                .map(|s| {
+                    for (o, &x) in out.iter_mut().zip(s) {
+                        *o = crate::model::bf16_to_f32(x);
+                    }
+                })
+                .is_some(),
+            Tensor::Mat(m) if r < m.rows && m.cols == c => {
+                m.decode_row_f32(r, out);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn vars(rows: usize, head: &str, taps: &[usize], media: usize) -> Vec<(&'static str, Val)> {
@@ -366,6 +428,7 @@ impl SpecLm {
             ));
         }
         let weights = model.store.materialize(&program_weights)?;
+        let embed = EmbedTable::find(&decode.graph, &weights).map(Arc::new);
         let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
         let recurrent = program.recurrent_states();
         let streams = decode.output_index("logits") == Some(0)
@@ -388,6 +451,7 @@ impl SpecLm {
             weights: decode.weights.len(),
             mode,
             drafter: Default::default(),
+            embed,
             model: Arc::new(model),
         })
     }
@@ -967,15 +1031,22 @@ impl NativeLm for SpecLm {
             .clone()
     }
 
+    fn embed_row(&self, id: u32, out: &mut [f32]) -> bool {
+        self.embed.as_ref().is_some_and(|t| t.row(id, out))
+    }
+
     fn online_drafter(
         &self,
         knobs: Arc<crate::runtime::noise_draft::LiveDraftKnobs>,
     ) -> Option<Arc<dyn crate::scheduler::spec::Drafter>> {
-        let layers = self.model.env.var("layers").and_then(|v| v.usize()).ok()?;
-        let hidden = self.model.env.var("hidden").and_then(|v| v.usize()).ok()?;
         let vocab = self.model.env.var("vocab").and_then(|v| v.usize()).ok()?;
+        let table = self.embed.clone();
+        let hidden = table.as_ref().map_or(0, |t| t.cols);
         Some(crate::runtime::noise_draft::OnlineNoiseDrafter::new(
-            layers, hidden, vocab, knobs,
+            Arc::new(move |id, out: &mut [f32]| table.as_ref().is_some_and(|t| t.row(id, out))),
+            hidden,
+            vocab,
+            knobs,
         ))
     }
 

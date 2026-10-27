@@ -60,6 +60,10 @@ impl ExecutableModel {
     pub fn placement_summary(&self) -> Option<Vec<crate::graph::placement::PlacementRow>> {
         self.0.placement_summary()
     }
+    /// Row `id` of the model's token-embedding table ([`NativeLm::embed_row`]).
+    pub fn embed_row(&self, id: u32, out: &mut [f32]) -> bool {
+        self.0.embed_row(id, out)
+    }
     /// Decodes `last_token` against the sequence's state and samples the next token.
     /// `logprobs: Some(k)` also reports the chosen token's probability, the top `k` candidates
     /// and the entropy.
