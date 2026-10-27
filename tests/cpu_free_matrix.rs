@@ -587,7 +587,10 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             let h = lm.take_taps(&mut st);
             let drafts = d
-                .propose(&mut d.new_state(), &ids, &h, 3, &mut |l: &[f32]| argmax(l))
+                .propose(&mut d.new_state(), &ids, &h, 3, &mut |l| match l {
+                    gibbs_engine::scheduler::spec::DraftLogits::Dense(l) => argmax(l),
+                    _ => unreachable!("model drafters pick dense rows"),
+                })
                 .unwrap_or_else(|e| panic!("{name} drafter: {e}"));
             assert!(!drafts.is_empty(), "{name}: no drafts");
             lm.forward(&ids[n - 1..], n - 1, &mut st)

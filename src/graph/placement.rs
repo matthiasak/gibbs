@@ -65,6 +65,8 @@ pub fn device_supports_op(device: Device, op: &Op, dtype: DType) -> bool {
             #[cfg(not(target_os = "macos"))]
             false
         }
+        // Shape-dependent: ANE lowering is decided per node by `graph::ane::supports_op`.
+        Device::Ane => false,
         Device::Cuda => crate::graph::cuda::supports_op(op, dtype),
         Device::Rocm => crate::graph::rocm::supports_op(op, dtype),
         Device::Xla => crate::graph::xla::supports_op(op, dtype),
