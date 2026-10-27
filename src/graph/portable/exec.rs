@@ -807,7 +807,9 @@ impl PortableSession {
             }
         };
         let mut sig: Vec<u64> = vec![arena.0, plan.meta.buf.0, tab.0];
-        sig.extend(sbufs.iter().map(|b| b.0 .0));
+        // Capacities too: `StateRows` passes them as scalars, and a paged state's grows every
+        // 64 rows without its buffer changing.
+        sig.extend(sbufs.iter().flat_map(|b| [b.0 .0, b.1 as u64]));
         sig.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| p.tab as u64)));
         let replayed = match &plan.replay {
             Some((s, r)) if *s == sig => {
