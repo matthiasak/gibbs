@@ -454,22 +454,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::RelPosBias { .. }
         | Op::StateReorder
         | Op::L2Normalize => dtype == DType::F32,
-        Op::Megakernel(_) => {
-            matches!(
-                dtype,
-                DType::F32
-                    | DType::F16
-                    | DType::BF16
-                    | DType::Quant(QuantFormat::GGUF_Q4_0)
-                    | DType::Quant(QuantFormat::GGUF_Q8_0)
-                    | DType::Quant(QuantFormat::GGUF_IQ4_XS)
-                    | DType::Quant(QuantFormat::GGUF_IQ2_M)
-                    | DType::Quant(QuantFormat::GGUF_IQ2_S)
-                    | DType::Quant(QuantFormat::GGUF_Q4_K_M)
-                    | DType::Quant(QuantFormat::GGUF_Q2_K)
-                    | DType::Quant(QuantFormat::GGUF_IQ3_S)
-            )
-        }
+        Op::Megakernel(_) => crate::graph::passes::megakernel::megakernel_dtype(dtype),
         _ => false,
     }
 }
