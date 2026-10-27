@@ -1989,9 +1989,7 @@ impl Session {
                 *v = match self.variant_override {
                     Some(o) if allowed.contains(&o) => o,
                     Some(_) => f.default_variant(),
-                    None if !matches!(f, WeightFormat::Q4_0 | WeightFormat::Q4_K)
-                        && tune::enabled()
-                        && allowed.len() > 1 =>
+                    None if tune::enabled() && allowed.len() > 1 =>
                     {
                         *chosen
                             .entry((f, rows, cols))
