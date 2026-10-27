@@ -163,7 +163,7 @@ pub fn dequantize_q8_0_block(b: &[u8], y: &mut [f32]) {
 
 /// ggml `get_scale_min_k4`: unpacks 6-bit (scale, min) pair `j` from a K-quant block's 12 scale bytes.
 #[inline]
-fn k4_scale_min(j: usize, s: &[u8]) -> (f32, f32) {
+pub(crate) fn k4_scale_min(j: usize, s: &[u8]) -> (f32, f32) {
     if j < 4 {
         ((s[j] & 63) as f32, (s[j + 4] & 63) as f32)
     } else {

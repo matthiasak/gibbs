@@ -15,6 +15,8 @@ struct Job {
     next: AtomicUsize,
     done: AtomicUsize,
     panicked: AtomicBool,
+    /// Worker seats left: `nn::par_limit()` participants, the caller included.
+    seats: AtomicUsize,
 }
 
 thread_local! {
@@ -27,6 +29,12 @@ unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
 impl Job {
+    fn admit(&self) -> bool {
+        self.seats
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |s| s.checked_sub(1))
+            .is_ok()
+    }
+
     fn run(&self) {
         IN_POOL.set(true);
         loop {
@@ -82,7 +90,7 @@ static POOL: LazyLock<Pool> = LazyLock::new(|| {
                     seen = st.0;
                     st.1.clone()
                 };
-                if let Some(job) = job {
+                if let Some(job) = job.filter(|j| j.admit()) {
                     job.run();
                 }
             }
@@ -102,12 +110,13 @@ pub fn threads() -> usize {
     POOL.workers + 1
 }
 
-/// Runs `f(t)` for `t in 0..tasks` across the pool (the caller works too). Tasks must touch
-/// disjoint outputs.
+/// Runs `f(t)` for `t in 0..tasks` across the pool (the caller works too), on at most
+/// `nn::par_limit()` threads. Tasks must touch disjoint outputs.
 // ponytail: one job at a time across all callers; per-sequence pools if concurrent batches matter.
 pub fn par_for(tasks: usize, f: &(dyn Fn(usize) + Sync)) {
     let pool = &*POOL;
-    if tasks <= 1 || pool.workers == 0 || IN_POOL.get() {
+    let limit = crate::model::nn::par_limit();
+    if tasks <= 1 || pool.workers == 0 || limit <= 1 || IN_POOL.get() {
         (0..tasks).for_each(f);
         return;
     }
@@ -121,6 +130,7 @@ pub fn par_for(tasks: usize, f: &(dyn Fn(usize) + Sync)) {
         next: AtomicUsize::new(0),
         done: AtomicUsize::new(0),
         panicked: Default::default(),
+        seats: AtomicUsize::new(limit - 1),
     });
     {
         let mut st = pool.job.lock();

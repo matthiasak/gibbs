@@ -2355,24 +2355,40 @@ fn moe_linear_cpu(
             "node '{name}': slot {s} routes to expert {e} of {experts}"
         ));
     }
-    const ROW_BLOCK: usize = 16;
     let per_slot = x.len() / in_f == ids.len();
-    let blocks = out_f.div_ceil(ROW_BLOCK);
+    let x_row = |s: usize| if per_slot { s } else { s / top_k };
     let mut out = vec![0.0f32; ids.len() * out_f];
+    if let Tensor::Mat(m) = bank {
+        if m.rows == experts * out_f && m.cols == in_f {
+            let slots: Vec<(usize, usize)> = (0..ids.len())
+                .map(|s| (x_row(s), ids[s] as usize * out_f))
+                .collect();
+            crate::model::qdot::gather_linear(m, x, &slots, out_f, &mut out);
+            return Ok(out);
+        }
+    }
+    thread_local! {
+        static BANK_ROW: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    const ROW_BLOCK: usize = 16;
+    let blocks = out_f.div_ceil(ROW_BLOCK);
     let dst = crate::model::par::OutPtr::new(&mut out);
     let failure = parking_lot::Mutex::new(None::<String>);
     crate::model::par::par_for(ids.len() * blocks, &|t| {
         let (s, b) = (t / blocks, t % blocks);
-        let xr = &x[(if per_slot { s } else { s / top_k }) * in_f..][..in_f];
-        let mut w = vec![0.0f32; in_f];
-        for r in b * ROW_BLOCK..((b + 1) * ROW_BLOCK).min(out_f) {
-            if let Err(e) = bank_row(bank, ids[s] as usize * out_f + r, &mut w) {
-                *failure.lock() = Some(e);
-                return;
+        let xr = &x[x_row(s) * in_f..][..in_f];
+        BANK_ROW.with_borrow_mut(|w| {
+            w.resize(in_f, 0.0);
+            for r in b * ROW_BLOCK..((b + 1) * ROW_BLOCK).min(out_f) {
+                if let Err(e) = bank_row(bank, ids[s] as usize * out_f + r, w) {
+                    *failure.lock() = Some(e);
+                    return;
+                }
+                let v = crate::model::simd::vector_dot_product(w, xr);
+                // SAFETY: cell (s, r) belongs to this task alone.
+                unsafe { dst.slice(s * out_f + r, 1)[0] = v };
             }
-            // SAFETY: cell (s, r) belongs to this task alone.
-            unsafe { dst.slice(s * out_f + r, 1)[0] = w.iter().zip(xr).map(|(a, b)| a * b).sum() };
-        }
+        });
     });
     match failure.into_inner() {
         Some(e) => Err(format!("node '{name}': {e}")),
@@ -2446,12 +2462,19 @@ fn dispatch_linear(
                 ));
             }
             let mut out = alloc_cpu_f32(rows * out_f);
-            if m.packed().is_none() {
-                nn::matmul_bf16(x, m.data(), bias, rows, in_f, out_f, &mut out);
-            } else {
-                nn::matmul_rows(x, rows, in_f, out_f, bias, &mut out, &|j, p0, d| {
+            match m.packed() {
+                None => nn::matmul_bf16(x, m.data(), bias, rows, in_f, out_f, &mut out),
+                // Decode and small batches dot the stored blocks directly; larger batches keep the
+                // f32 GEMM unless an `smmla` kernel covers the format.
+                Some(p)
+                    if rows <= crate::model::qdot::DOT_ROWS
+                        || crate::model::qdot::i8mm_format(p.format) =>
+                {
+                    crate::model::qdot::linear_q(m, x, rows, bias, &mut out)
+                }
+                Some(_) => nn::matmul_rows(x, rows, in_f, out_f, bias, &mut out, &|j, p0, d| {
                     m.decode_slice_f32(j, p0, d);
-                });
+                }),
             }
             Ok(out)
         }

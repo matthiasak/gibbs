@@ -58,11 +58,14 @@ pub mod nn;
 pub mod par;
 pub mod peft;
 pub mod prequant;
+pub mod qdot;
 pub mod reencode;
 pub mod variant;
 pub mod video_repo;
 pub mod repack;
 pub mod simd;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod sme2;
 pub mod spm;
 pub mod tokenizer;
 pub mod vision_graph;

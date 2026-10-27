@@ -670,11 +670,15 @@ fn test_gguf_block_formats_decode_like_ggml() {
         let format = manifest.tensors[name].quant_format;
         let raw_data = &tensors.iter().find(|t| t.0 == name).unwrap().3;
         let mut y = [0.0f32; 2];
-        gibbs_engine::model::weights::Mat::from_packed_bytes(format, raw_data.clone(), 2, 256)
-            .gemv_f32(&x, &mut y);
-        for (got, want) in y.iter().zip(want_y) {
+        let m =
+            gibbs_engine::model::weights::Mat::from_packed_bytes(format, raw_data.clone(), 2, 256);
+        gibbs_engine::model::qdot::linear_q(&m, &x, 1, None, &mut y);
+        // Formats with int8 dot kernels quantize x: at most half a step (max|x| / 254) per element.
+        let amax = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        for (j, (got, want)) in y.iter().zip(want_y).enumerate() {
+            let quant = w[j * 256..][..256].iter().map(|v| v.abs()).sum::<f32>() * amax / 250.0;
             assert!(
-                (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                (got - want).abs() <= quant + 1e-4 * want.abs().max(1.0),
                 "{name} W·x = {got} want {want}"
             );
         }

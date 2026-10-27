@@ -1289,6 +1289,8 @@ mod tests {
 
     #[test]
     fn moe_linear_matches_cpu_for_every_format() {
+        // The CPU executor is the exact reference.
+        let _exact = crate::model::qdot::exact();
         let mut fmts = vec![Fmt::F32, Fmt::F16, Fmt::BF16];
         fmts.extend(crate::graph::codec::formats().into_iter().map(Fmt::Q));
         let (experts, top_k, rows) = (6, 3, 35);
@@ -1379,6 +1381,8 @@ mod tests {
 
     #[test]
     fn moe_linear_grouped_gemm_matches_cpu() {
+        // The CPU executor is the exact reference.
+        let _exact = crate::model::qdot::exact();
         let (experts, top_k, rows) = (16usize, 8usize, 65usize);
         let mut s = 123u64;
         let mut route = |n: usize| -> Vec<u32> {
