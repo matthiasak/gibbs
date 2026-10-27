@@ -733,12 +733,16 @@ pub fn compact_chat_session(
     }
 
     // Tier 3: the turns between the leading system messages and the kept turns fold into one
-    // summary turn (plus an assistant acknowledgement, so roles keep alternating).
+    // summary turn plus an assistant acknowledgement; the kept part starts at a user message, so
+    // roles keep alternating.
     let first = out
         .iter()
         .position(|m| m.role != "system")
         .unwrap_or(out.len());
-    let fold_end = out.len().saturating_sub(cfg.keep_recent_turns * 2);
+    let mut fold_end = out.len().saturating_sub(cfg.keep_recent_turns * 2);
+    while fold_end > first && out[fold_end].role != "user" {
+        fold_end -= 1;
+    }
     if fold_end <= first + 1 {
         return Ok(done);
     }
