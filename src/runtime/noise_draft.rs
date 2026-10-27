@@ -12,15 +12,12 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Bottleneck dimension of [`NoiseBlockHead`] (power of two for exact Walsh-Hadamard transform).
 pub const NOISE_BOTTLENECK_DIM: usize = 128;
 /// Maximum speculative lookahead offsets maintained by [`NoiseBlockHead`].
 pub const NOISE_MAX_K: usize = 15;
-/// Shortlist vocabulary capacity tracked online by [`NoiseBlockHead`].
-pub const NOISE_SHORTLIST_VOCAB: usize = 256;
 /// Committed tokens one update learns from at most (the prompt's tail on the first).
 const LEARN_SPAN: usize = 64;
 
@@ -61,26 +58,6 @@ impl DraftMode {
             Self::Off => Self::Auto,
         }
     }
-
-    fn to_u8(self) -> u8 {
-        match self {
-            Self::Auto => 0,
-            Self::Off => 1,
-            Self::Model => 2,
-            Self::Noise => 3,
-            Self::Suffix => 4,
-        }
-    }
-
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::Off,
-            2 => Self::Model,
-            3 => Self::Noise,
-            4 => Self::Suffix,
-            _ => Self::Auto,
-        }
-    }
 }
 
 impl FromStr for DraftMode {
@@ -113,10 +90,19 @@ pub struct DraftKnobs {
     pub cost_weight: f32,
     /// Minimum suffix n-gram match length (`1..=4`, default `2`) before [`SuffixLattice`] proposes.
     pub suffix_min_match: usize,
-    /// Online learning rate (`0.0..=0.05`, default `0.005`) for [`NoiseBlockHead`].
+    /// Online learning rate (`0.0..=0.10`, default `0.005`) for [`NoiseBlockHead`].
     pub noise_lr: f32,
-    /// Hadamard perturbation scale $\sigma$ (`1e-4..=0.1`, default `0.01`).
+    /// Node-perturbation scale $\sigma$ (`1e-5..=0.25`, default `0.01`).
     pub noise_sigma: f32,
+    /// Draft refinement passes (`1..=4`, default `2`): pass `r >= 2` conditions each offset on the
+    /// previous pass's earlier drafts.
+    pub denoise_steps: usize,
+    /// Shortlist tokens the head scores (`64..=1024`, default `256`).
+    pub shortlist: usize,
+    /// Hadamard probe directions per update (`4..=32`, a power of two, default `8`).
+    pub probes: usize,
+    /// Context tokens the head reads (`1..=8`, default `4`).
+    pub window: usize,
 }
 
 impl Default for DraftKnobs {
@@ -129,6 +115,10 @@ impl Default for DraftKnobs {
             suffix_min_match: 2,
             noise_lr: 0.005,
             noise_sigma: 0.01,
+            denoise_steps: 2,
+            shortlist: 256,
+            probes: 8,
+            window: 4,
         }
     }
 }
@@ -141,68 +131,30 @@ impl DraftKnobs {
         self.suffix_min_match = self.suffix_min_match.clamp(1, 4);
         self.noise_lr = self.noise_lr.clamp(0.0, 0.10);
         self.noise_sigma = self.noise_sigma.clamp(1e-5, 0.25);
+        self.denoise_steps = self.denoise_steps.clamp(1, 4);
+        self.shortlist = self.shortlist.clamp(64, 1024);
+        self.probes = self.probes.clamp(4, 32).next_power_of_two();
+        self.window = self.window.clamp(1, 8);
         self
     }
 }
 
-/// Lock-free atomic container for [`DraftKnobs`], shared across the scheduler, [`KTuner`], and
-/// [`OnlineNoiseDrafter`] so live edits take effect on the very next decode step.
-#[derive(Debug)]
-pub struct LiveDraftKnobs {
-    mode: AtomicU8,
-    max_k: AtomicUsize,
-    target_acceptance: AtomicU32,
-    cost_weight: AtomicU32,
-    suffix_min_match: AtomicUsize,
-    noise_lr: AtomicU32,
-    noise_sigma: AtomicU32,
-}
-
-impl Default for LiveDraftKnobs {
-    fn default() -> Self {
-        Self::new(DraftKnobs::default())
-    }
-}
+/// [`DraftKnobs`] shared by the scheduler, [`KTuner`] and [`OnlineNoiseDrafter`], so live edits
+/// take effect on the very next decode step.
+#[derive(Debug, Default)]
+pub struct LiveDraftKnobs(Mutex<DraftKnobs>);
 
 impl LiveDraftKnobs {
     pub fn new(knobs: DraftKnobs) -> Self {
-        let k = knobs.sanitized();
-        Self {
-            mode: AtomicU8::new(k.mode.to_u8()),
-            max_k: AtomicUsize::new(k.max_k),
-            target_acceptance: AtomicU32::new(k.target_acceptance.to_bits()),
-            cost_weight: AtomicU32::new(k.cost_weight.to_bits()),
-            suffix_min_match: AtomicUsize::new(k.suffix_min_match),
-            noise_lr: AtomicU32::new(k.noise_lr.to_bits()),
-            noise_sigma: AtomicU32::new(k.noise_sigma.to_bits()),
-        }
+        Self(Mutex::new(knobs.sanitized()))
     }
 
     pub fn snapshot(&self) -> DraftKnobs {
-        DraftKnobs {
-            mode: DraftMode::from_u8(self.mode.load(Ordering::Relaxed)),
-            max_k: self.max_k.load(Ordering::Relaxed),
-            target_acceptance: f32::from_bits(self.target_acceptance.load(Ordering::Relaxed)),
-            cost_weight: f32::from_bits(self.cost_weight.load(Ordering::Relaxed)),
-            suffix_min_match: self.suffix_min_match.load(Ordering::Relaxed),
-            noise_lr: f32::from_bits(self.noise_lr.load(Ordering::Relaxed)),
-            noise_sigma: f32::from_bits(self.noise_sigma.load(Ordering::Relaxed)),
-        }
+        *self.0.lock()
     }
 
     pub fn store(&self, knobs: DraftKnobs) {
-        let k = knobs.sanitized();
-        self.mode.store(k.mode.to_u8(), Ordering::Relaxed);
-        self.max_k.store(k.max_k, Ordering::Relaxed);
-        self.target_acceptance
-            .store(k.target_acceptance.to_bits(), Ordering::Relaxed);
-        self.cost_weight
-            .store(k.cost_weight.to_bits(), Ordering::Relaxed);
-        self.suffix_min_match
-            .store(k.suffix_min_match, Ordering::Relaxed);
-        self.noise_lr.store(k.noise_lr.to_bits(), Ordering::Relaxed);
-        self.noise_sigma
-            .store(k.noise_sigma.to_bits(), Ordering::Relaxed);
+        *self.0.lock() = knobs.sanitized();
     }
 }
 
@@ -410,8 +362,6 @@ pub type EmbedFn = Arc<dyn Fn(u32, &mut [f32]) -> bool + Send + Sync>;
 const SKETCH_DIM: usize = 256;
 /// Token sketches cached (least recently used evicted).
 const SKETCH_CACHE: usize = 4096;
-/// Context tokens whose sketches form the drafter input.
-const CONTEXT_WINDOW: usize = 4;
 
 /// Fixed random features of the target's token embeddings: a seeded sign flip, the normalized fast
 /// Walsh-Hadamard transform over `hidden` zero-padded to a power of two, and its first
@@ -487,6 +437,21 @@ impl Sketcher {
         rms_norm(&mut x);
         x
     }
+
+    /// The mean sketch of `toks` (tokens the target cannot embed count as zeros).
+    fn mean(&mut self, toks: &[u32]) -> Vec<f32> {
+        let mut m = vec![0.0f32; SKETCH_DIM];
+        for &t in toks {
+            if let Some(s) = self.sketch(t) {
+                for (a, b) in m.iter_mut().zip(s) {
+                    *a += b;
+                }
+            }
+        }
+        let inv = 1.0 / toks.len().max(1) as f32;
+        m.iter_mut().for_each(|v| *v *= inv);
+        m
+    }
 }
 
 // ---- NoiseBlockHead ---------------------------------------------------------------------------
@@ -528,16 +493,33 @@ impl Param {
         self.m[r.clone()].fill(0.0);
         self.v[r].fill(1e-3);
     }
+
+    /// ANVIL II steps on the outer product `g ⊗ x` (row `i` scaled by `g[i]`, `x.len()` wide).
+    fn step_outer(&mut self, g: &[f32], x: &[f32], lr: f32) {
+        for (i, &gi) in g.iter().enumerate() {
+            if gi.abs() < 1e-7 {
+                continue;
+            }
+            let base = i * x.len();
+            for (k, &xk) in x.iter().enumerate() {
+                self.step(base + k, gi * xk, lr);
+            }
+        }
+    }
 }
 
-/// Online multi-offset block drafter head: context `c = rmsnorm(W_c x)` over token sketches `x`,
-/// and per lookahead offset `j` shortlist logits `H_j c`.
+/// Online multi-offset block drafter head over token sketches `x`: context `c = rmsnorm(W_c x)`
+/// and, per lookahead offset `j`, shortlist logits `H_j c_j`. Refinement passes condition
+/// `c_j = rmsnorm(c + U m_j)` on the mean sketch `m_j` of the drafts before `j` (`c_j = c` on the
+/// first pass).
 pub struct NoiseBlockHead {
     vocab: usize,
     window: usize,
     cap: usize,
     /// `[D, window * SKETCH_DIM]`.
     w_c: Param,
+    /// `[D, SKETCH_DIM]`.
+    u: Param,
     /// Per offset `j < NOISE_MAX_K`: `[cap, D]`.
     heads: Vec<Param>,
     /// Active shortlist of token ids (`<= cap`), their decayed counts and slots.
@@ -562,11 +544,18 @@ impl NoiseBlockHead {
                 }
             })
             .collect();
+        // U starts as the identity on the sketch's first D coordinates: refinement passes see the
+        // earlier drafts before U has learned anything.
+        let mut u = vec![0.0f32; D * SKETCH_DIM];
+        for i in 0..D {
+            u[i * SKETCH_DIM + i] = 1.0;
+        }
         Self {
             vocab,
             window,
             cap,
             w_c: Param::new(w_c),
+            u: Param::new(u),
             heads: (0..NOISE_MAX_K)
                 .map(|_| Param::new(vec![0.0; cap * D]))
                 .collect(),
@@ -614,6 +603,17 @@ impl NoiseBlockHead {
         c
     }
 
+    /// `c_j = rmsnorm(c + U m)`.
+    fn refine(&self, c: &[f32], m: &[f32]) -> Vec<f32> {
+        let mut cj: Vec<f32> = c
+            .iter()
+            .zip(self.u.w.chunks_exact(SKETCH_DIM))
+            .map(|(&ci, r)| ci + dot(r, m))
+            .collect();
+        rms_norm(&mut cj);
+        cj
+    }
+
     /// Shortlist logits `H_j c`, one per active slot.
     fn logits(&self, j: usize, c: &[f32], out: &mut Vec<f32>) {
         out.clear();
@@ -626,14 +626,60 @@ impl NoiseBlockHead {
         );
     }
 
-    /// Exact local delta rule on `H_j` toward slot `target` from `c`: `ΔH_j ∝ (p - y) ⊗ c`.
-    fn delta(&mut self, j: usize, c: &[f32], target: usize, lr: f32) {
-        let mut p = Vec::new();
-        self.logits(j, c, &mut p);
-        softmax(&mut p);
+    /// `H_j ξ_p` for every probe direction, `[probes, active slots]`.
+    fn probe_logits(&self, j: usize, dirs: &[Vec<f32>]) -> Vec<f32> {
+        let n = self.ids.len();
+        dirs.iter()
+            .flat_map(|xi| {
+                self.heads[j]
+                    .w
+                    .chunks_exact(D)
+                    .take(n)
+                    .map(move |r| dot(r, xi))
+            })
+            .collect()
+    }
+
+    /// Trains offset `j` at context `c` toward the target distribution `y` (`(slot, prob)`): the
+    /// head takes the exact local delta rule `ΔH_j ∝ (p - y) ⊗ c`. Returns the node-perturbation
+    /// (forward-only) credit of `c`, `Σ_p (L(c + σξ_p) - L(c - σξ_p)) / (2σP) · ξ_p` with the
+    /// losses through `H_j` (`hx`: [`Self::probe_logits`]).
+    #[allow(clippy::too_many_arguments)]
+    fn train_offset(
+        &mut self,
+        j: usize,
+        c: &[f32],
+        y: &[(usize, f32)],
+        dirs: &[Vec<f32>],
+        hx: &[f32],
+        sigma: f32,
+        lr: f32,
+    ) -> Vec<f32> {
+        let n = self.ids.len();
+        let mut z = Vec::with_capacity(n);
+        self.logits(j, c, &mut z);
+        let mut g = vec![0.0f32; D];
+        let mut zs = vec![0.0f32; n];
+        let scale = 1.0 / (2.0 * sigma * dirs.len() as f32);
+        for (xi, h) in dirs.iter().zip(hx.chunks_exact(n)) {
+            for ((o, &zv), &hv) in zs.iter_mut().zip(&z).zip(h) {
+                *o = zv + sigma * hv;
+            }
+            let lp = cross_entropy(&zs, y);
+            for ((o, &zv), &hv) in zs.iter_mut().zip(&z).zip(h) {
+                *o = zv - sigma * hv;
+            }
+            let w = (lp - cross_entropy(&zs, y)) * scale;
+            for (gd, &x) in g.iter_mut().zip(xi) {
+                *gd += w * x;
+            }
+        }
+        softmax(&mut z);
+        for &(s, ys) in y {
+            z[s] -= ys;
+        }
         let h = &mut self.heads[j];
-        for (s, &ps) in p.iter().enumerate() {
-            let err = ps - if s == target { 1.0 } else { 0.0 };
+        for (s, &err) in z.iter().enumerate() {
             if err.abs() < 1e-4 {
                 continue;
             }
@@ -642,6 +688,7 @@ impl NoiseBlockHead {
                 h.step(i, err * cd + 1e-4 * h.w[i], lr * HEAD_LR);
             }
         }
+        g
     }
 }
 
@@ -663,6 +710,14 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     acc.iter().sum::<f32>() + tail
 }
 
+/// Index of the first largest element (0 when empty).
+fn argmax(z: &[f32]) -> usize {
+    z.iter()
+        .enumerate()
+        .fold((0, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b })
+        .0
+}
+
 fn softmax(z: &mut [f32]) {
     let max = z.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let mut sum = 0.0;
@@ -675,6 +730,13 @@ fn softmax(z: &mut [f32]) {
     }
 }
 
+/// `-Σ y log softmax(z)` over `(index, prob)` targets `y`.
+fn cross_entropy(z: &[f32], y: &[(usize, f32)]) -> f32 {
+    let max = z.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let lse = max + z.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
+    y.iter().map(|&(s, p)| p * (lse - z[s])).sum()
+}
+
 fn rms_norm(x: &mut [f32]) {
     let mean_sq = x.iter().map(|&v| v * v).sum::<f32>() / (x.len().max(1) as f32);
     let inv = 1.0 / (mean_sq + 1e-5).sqrt();
@@ -682,6 +744,9 @@ fn rms_norm(x: &mut [f32]) {
         *v *= inv;
     }
 }
+
+/// Step multiplier of `W_c` and `U` (node-perturbation credit) over `noise_lr`.
+const HIDDEN_LR: f32 = 0.1;
 
 /// The head and the sketches it reads, shared by every sequence.
 struct Inner {
@@ -691,13 +756,17 @@ struct Inner {
 
 impl Inner {
     /// Teacher-forced update on committed `tokens`: every (context end `p`, offset `j`) pair whose
-    /// target `tokens[p + j]` sits at index `from..` trains once.
-    fn learn(&mut self, tokens: &[u32], from: usize, max_k: usize, lr: f32) {
+    /// target `tokens[p + j]` sits at index `from..` trains once, offset `j`'s refined context
+    /// reading the committed tokens before it.
+    fn learn(&mut self, tokens: &[u32], from: usize, knobs: &DraftKnobs) {
         let Self { head, sk } = self;
         let to = tokens.len();
+        let lr = knobs.noise_lr;
         if from >= to || lr <= 0.0 {
             return;
         }
+        let max_k = knobs.max_k.clamp(1, NOISE_MAX_K);
+        let refine = knobs.denoise_steps >= 2;
         for c in head.counts.iter_mut() {
             *c *= 0.995;
         }
@@ -708,31 +777,66 @@ impl Inner {
         if head.ids.len() < 2 {
             return;
         }
+        let dirs = hadamard_perturbations(D, knobs.probes.min(D), splitmix64(head.updates));
+        // ponytail: `H_j ξ_p` is taken once per update, so later examples of a multi-token update
+        // see probe losses through slightly stale heads; recompute per example if that matters.
+        let mut hx: Vec<Option<Vec<f32>>> = vec![None; max_k];
         for p in (from + 1).saturating_sub(max_k).max(1)..to {
             let x = sk.context(&tokens[..p], head.window);
             let c = head.context(&x);
+            let mut g_c = vec![0.0f32; D];
             for j in from.saturating_sub(p)..max_k.min(to - p) {
                 let slot = slots[p + j - from];
                 // A later token of this batch may have taken the slot.
-                if head.ids[slot] == tokens[p + j] {
-                    head.delta(j, &c, slot, lr);
+                if head.ids[slot] != tokens[p + j] {
+                    continue;
+                }
+                let m = (refine && j > 0).then(|| sk.mean(&tokens[p..p + j]));
+                let cj = m.as_ref().map_or_else(|| c.clone(), |m| head.refine(&c, m));
+                let hxj = hx[j].get_or_insert_with(|| head.probe_logits(j, &dirs));
+                let g = head.train_offset(j, &cj, &[(slot, 1.0)], &dirs, hxj, knobs.noise_sigma, lr);
+                // Identity-path credit: `c_j`'s credit is `c`'s, and `U`'s through `m_j`.
+                if let Some(m) = &m {
+                    head.u.step_outer(&g, m, lr * HIDDEN_LR);
+                }
+                for (a, b) in g_c.iter_mut().zip(&g) {
+                    *a += b;
                 }
             }
+            head.w_c.step_outer(&g_c, &x, lr * HIDDEN_LR);
         }
         head.updates += 1;
     }
 
-    /// Shortlist logits (over `head.ids`) for offsets `0..k` after `ctx`.
-    fn draft(&mut self, ctx: &[u32], k: usize) -> Vec<Vec<f32>> {
-        let x = self.sk.context(ctx, self.head.window);
-        let c = self.head.context(&x);
-        (0..k)
+    /// Shortlist logits (over `head.ids`) for offsets `0..k` after `ctx`, from the last of `steps`
+    /// passes: pass `r >= 2` refines offset `j >= 1` on pass `r - 1`'s drafts before `j`
+    /// (`fixed[i]` where given, else that pass's argmax).
+    fn draft(&mut self, ctx: &[u32], k: usize, steps: usize, fixed: &[u32]) -> Vec<Vec<f32>> {
+        let Self { head, sk } = self;
+        let x = sk.context(ctx, head.window);
+        let c = head.context(&x);
+        let mut rows: Vec<Vec<f32>> = (0..k)
             .map(|j| {
                 let mut z = Vec::new();
-                self.head.logits(j, &c, &mut z);
+                head.logits(j, &c, &mut z);
                 z
             })
-            .collect()
+            .collect();
+        if head.ids.is_empty() {
+            return rows;
+        }
+        for _ in 1..steps {
+            let prev: Vec<u32> = rows
+                .iter()
+                .enumerate()
+                .map(|(j, z)| fixed.get(j).copied().unwrap_or(head.ids[argmax(z)]))
+                .collect();
+            for j in 1..k {
+                let cj = head.refine(&c, &sk.mean(&prev[..j]));
+                head.logits(j, &cj, &mut rows[j]);
+            }
+        }
+        rows
     }
 }
 
@@ -765,13 +869,14 @@ impl OnlineNoiseDrafter {
         knobs: Arc<LiveDraftKnobs>,
     ) -> Arc<Self> {
         let embeds = hidden > 0 && embed(0, &mut vec![0.0; hidden]);
+        let k = knobs.snapshot();
         Arc::new(Self {
             vocab: vocab.max(1),
             embeds,
             knobs,
             lattice: RwLock::new(SuffixLattice::new()),
             inner: Mutex::new(Inner {
-                head: NoiseBlockHead::new(vocab, CONTEXT_WINDOW, NOISE_SHORTLIST_VOCAB),
+                head: NoiseBlockHead::new(vocab, k.window, k.shortlist),
                 sk: Sketcher::new(embed, hidden),
             }),
         })
@@ -783,6 +888,16 @@ impl OnlineNoiseDrafter {
 
     pub fn online_updates(&self) -> u64 {
         self.inner.lock().head.updates
+    }
+
+    /// The shared head, rebuilt when the shortlist or window knob changed.
+    fn inner(&self, knobs: &DraftKnobs) -> parking_lot::MutexGuard<'_, Inner> {
+        let mut inner = self.inner.lock();
+        let h = &inner.head;
+        if h.window != knobs.window || h.cap != knobs.shortlist.min(h.vocab) {
+            inner.head = NoiseBlockHead::new(self.vocab, knobs.window, knobs.shortlist);
+        }
+        inner
     }
 }
 
@@ -844,12 +959,7 @@ impl Drafter for OnlineNoiseDrafter {
             self.lattice.write().observe_tokens(slice);
             if neural {
                 let from = s.seen.max(tokens.len().saturating_sub(LEARN_SPAN));
-                self.inner.lock().learn(
-                    tokens,
-                    from,
-                    knobs.max_k.clamp(1, NOISE_MAX_K),
-                    knobs.noise_lr,
-                );
+                self.inner(&knobs).learn(tokens, from, &knobs);
             }
             s.seen = tokens.len();
         }
@@ -875,10 +985,10 @@ impl Drafter for OnlineNoiseDrafter {
             .map(|(v, _)| v.as_slice())
             .unwrap_or(&[]);
 
-        // 3. The head's shortlist logits per offset.
+        // 3. The head's shortlist logits per offset, refined on the suffix drafts where they exist.
         let (ids, rows, head_updates) = if neural {
-            let mut inner = self.inner.lock();
-            let rows = inner.draft(tokens, k);
+            let mut inner = self.inner(&knobs);
+            let rows = inner.draft(tokens, k, knobs.denoise_steps, suf_slice);
             (inner.head.ids.clone(), rows, inner.head.updates)
         } else {
             (Vec::new(), Vec::new(), 0)
@@ -936,6 +1046,7 @@ impl Drafter for OnlineNoiseDrafter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::sched::Rng;
 
     /// A deterministic pseudo-random embedding table.
     fn table(hidden: usize) -> EmbedFn {
@@ -980,22 +1091,83 @@ mod tests {
         assert_eq!(drafts, vec![40, 50, 60]);
     }
 
-    /// Committed one token at a time, a repeating sequence teaches every offset its continuation.
+    /// A 16-state Markov chain (token `100 + s`) with two branch gadgets where the marginal
+    /// two-step mode disagrees with the mode after the likelier first step. Trained forward-only
+    /// for 2000 committed steps, the first draft is the chain's most likely next token, and
+    /// refinement (`denoise_steps = 2`) gets more two-token drafts accepted than one pass.
     #[test]
-    fn noise_block_head_learns_a_repeating_sequence() {
-        let mut inner = Inner {
-            head: NoiseBlockHead::new(64, CONTEXT_WINDOW, 64),
-            sk: Sketcher::new(table(48), 48),
+    fn learns_markov_chain_forward_only() {
+        let mut next: Vec<Vec<(u32, f32)>> = (0..16).map(|s| vec![((s + 1) % 16, 1.0)]).collect();
+        for base in [0, 8] {
+            next[base] = vec![(base as u32 + 1, 0.55), (base as u32 + 2, 0.45)];
+            next[base + 1] = vec![(base as u32 + 3, 0.5), (base as u32 + 4, 0.5)];
+            next[base + 2] = vec![(base as u32 + 5, 1.0)];
+            for s in base + 3..base + 6 {
+                next[s] = vec![(base as u32 + 6, 1.0)];
+            }
+        }
+        let prob = |a: u32, b: u32| -> f32 {
+            next.get(a.wrapping_sub(100) as usize)
+                .and_then(|n| n.iter().find(|e| e.0 + 100 == b))
+                .map_or(0.0, |e| e.1)
         };
-        let cycle = [5u32, 12, 19, 27, 3, 8, 40, 33];
-        let seq: Vec<u32> = cycle.iter().cycle().take(400).copied().collect();
-        for i in 2..seq.len() {
-            inner.learn(&seq[..i], i - 1, 3, 0.005);
-        }
-        let rows = inner.draft(&seq[..8 * 40 + 1], 3);
-        for (j, z) in rows.iter().enumerate() {
-            let best = z.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
-            assert_eq!(inner.head.ids[best], cycle[(j + 1) % 8], "offset {j}");
-        }
+        let walk = |seed: u64, n: usize| -> Vec<u32> {
+            let (mut rng, mut s, mut out) = (Rng::new(seed), 0u32, Vec::with_capacity(n));
+            for _ in 0..n {
+                out.push(100 + s);
+                let (u, mut acc) = (rng.uniform() as f32, 0.0);
+                let succ = &next[s as usize];
+                s = succ[succ.len() - 1].0;
+                for &(t, p) in succ {
+                    acc += p;
+                    if u <= acc {
+                        s = t;
+                        break;
+                    }
+                }
+            }
+            out
+        };
+        let (train, test) = (walk(1, 2200), walk(2, 400));
+        let run = |steps: usize| -> (f32, f32) {
+            let knobs = DraftKnobs {
+                max_k: 2,
+                denoise_steps: steps,
+                ..DraftKnobs::default()
+            }
+            .sanitized();
+            let mut inner = Inner {
+                head: NoiseBlockHead::new(256, knobs.window, knobs.shortlist),
+                sk: Sketcher::new(table(64), 64),
+            };
+            let mut i = 1;
+            while inner.head.updates < 2000 {
+                i += 1;
+                inner.learn(&train[..i], i - 1, &knobs);
+            }
+            let (mut top1, mut two) = (0.0, 0.0);
+            let n = test.len() - 8;
+            for p in 8..test.len() {
+                let rows = inner.draft(&test[..p], 2, steps, &[]);
+                let d: Vec<u32> = rows.iter().map(|z| inner.head.ids[argmax(z)]).collect();
+                let last = test[p - 1];
+                let best = next[(last - 100) as usize]
+                    .iter()
+                    .fold(0.0f32, |a, e| a.max(e.1));
+                top1 += (prob(last, d[0]) == best) as u32 as f32;
+                two += prob(last, d[0]) * prob(d[0], d[1]);
+            }
+            (top1 / n as f32, two / n as f32)
+        };
+        let (top1_one, two_one) = run(1);
+        let (top1_two, two_two) = run(2);
+        assert!(
+            top1_one >= 0.9 && top1_two >= 0.9,
+            "offset-1 top-1: {top1_one} (1 step), {top1_two} (2 steps)"
+        );
+        assert!(
+            two_two > two_one,
+            "two-token acceptance: {two_two} (2 steps) vs {two_one} (1 step)"
+        );
     }
 }
