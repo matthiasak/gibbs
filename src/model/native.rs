@@ -187,6 +187,12 @@ pub trait NativeLm: Send + Sync {
         None
     }
 
+    /// The radix prefix-cache key of prepared prompt `ids`: equal to `ids` except at media
+    /// placeholders, which get keys identifying their content.
+    fn radix_key(&self, _state: &SeqState, ids: &[u32]) -> Vec<u32> {
+        ids.to_vec()
+    }
+
     /// The chat template's thinking delimiters as `(open, close)` pairs
     /// (`runtime.thinking_delimiters`).
     fn thinking_delimiters(&self) -> Vec<(String, String)> {

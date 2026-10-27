@@ -259,6 +259,14 @@ impl ExecutableModel {
         self.0.kv_pool()
     }
 
+    /// [`NativeLm::radix_key`].
+    pub fn radix_key(&self, state: &Option<SeqState>, ids: &[u32]) -> Vec<u32> {
+        match state {
+            Some(st) => self.0.radix_key(st, ids),
+            None => ids.to_vec(),
+        }
+    }
+
     /// [`NativeLm::thinking_delimiters`].
     pub fn thinking_delimiters(&self) -> Vec<(String, String)> {
         self.0.thinking_delimiters()
@@ -489,6 +497,8 @@ pub struct Sequence {
     pub output_tokens: Vec<u32>,
     /// The radix prefix this sequence resumed from: its path stays locked until it finishes.
     pub prefix: Option<Match>,
+    /// The prompt's radix key ([`ExecutableModel::radix_key`]), set at admission.
+    pub key: Vec<u32>,
     pub params: SamplingParams,
     pub state: SequenceState,
     pub submitted: Instant,
@@ -509,6 +519,7 @@ impl Sequence {
             prompt_tokens,
             output_tokens: Vec::new(),
             prefix: None,
+            key: Vec::new(),
             params: SamplingParams::default(),
             state: SequenceState::Waiting,
             submitted: Instant::now(),
@@ -1172,9 +1183,12 @@ impl ContinuousBatchScheduler {
         let reuse = drafter.as_ref().is_none_or(|d| d.tap_layers().is_empty());
         while let Some(mut seq) = waiting.pop_front() {
             let max_reusable = seq.prompt_tokens.len().saturating_sub(1);
+            if let (Some(m), true) = (&model, seq.key.is_empty()) {
+                seq.key = m.radix_key(&seq.kv_cache, &seq.prompt_tokens);
+            }
             if let (Some(m), true, 0, None) = (&model, reuse, seq.prefilled_tokens, &seq.prefix) {
                 if max_reusable > 0 {
-                    let hit = self.radix.match_prefix(&seq.prompt_tokens[..max_reusable]);
+                    let hit = self.radix.match_prefix(&seq.key[..max_reusable]);
                     if hit.len > 0 {
                         if let Some(n) = m.kv_restore(&mut seq.kv_cache, &hit) {
                             seq.prefilled_tokens = n;
@@ -1310,7 +1324,7 @@ impl ContinuousBatchScheduler {
                     if is_last {
                         seq.state = SequenceState::Decoding;
                         if let Some(e) = m.kv_export(&seq.kv_cache, seq.prompt_tokens.len()) {
-                            self.radix.insert(&seq.prompt_tokens, e);
+                            self.radix.insert(&seq.key, e);
                         }
                         if seq.params.max_new_tokens == 0 {
                             let _ = seq.finish.set(FinishReason::Length);
@@ -1501,7 +1515,7 @@ impl ContinuousBatchScheduler {
                         let total_committed = seq.prompt_tokens.len() + committed_out;
                         if let Some(e) = m.kv_export(&seq.kv_cache, total_committed) {
                             let mut full = Vec::with_capacity(total_committed);
-                            full.extend_from_slice(&seq.prompt_tokens);
+                            full.extend_from_slice(&seq.key);
                             full.extend_from_slice(&seq.output_tokens[..committed_out]);
                             self.radix.insert(&full, e);
                         }

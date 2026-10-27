@@ -1092,13 +1092,7 @@ impl NativeLm for SpecLm {
 
     fn kv_export(&self, state: &SeqState, len: usize) -> Option<crate::kv::KvExport> {
         let seq = state.downcast_ref::<Seq>()?;
-        if len == 0
-            || seq.len < len
-            || seq.recurrent_ahead
-            || !seq.blocks.is_empty()
-            || !seq.media.media_index.is_empty()
-            || !seq.taps.is_empty()
-        {
+        if len == 0 || seq.len < len || seq.recurrent_ahead || !seq.taps.is_empty() {
             return None;
         }
         let boundary = self.needs_boundary();
@@ -1128,11 +1122,7 @@ impl NativeLm for SpecLm {
 
     fn kv_restore(&self, state: &mut SeqState, m: &crate::kv::Match) -> Option<usize> {
         let seq = Self::seq(state).ok()?;
-        if seq.len != 0
-            || !seq.blocks.is_empty()
-            || !seq.media.media_index.is_empty()
-            || !seq.taps.is_empty()
-        {
+        if seq.len != 0 || !seq.taps.is_empty() {
             return None;
         }
         let same_pool = match (&self.kv_pool, &m.pool) {
@@ -1140,7 +1130,14 @@ impl NativeLm for SpecLm {
             (a, b) => a.is_none() && b.is_none(),
         };
         let b = m.boundary.as_deref();
-        let len = if self.needs_boundary() { b?.len } else { m.len };
+        let mut len = if self.needs_boundary() { b?.len } else { m.len };
+        // Never resume inside a bidirectional block: its rows saw the whole block.
+        if let Some(blk) = seq.blocks.iter().find(|r| r.start < len && len < r.end) {
+            if self.needs_boundary() {
+                return None;
+            }
+            len = blk.start;
+        }
         if !same_pool || len == 0 || len > m.len || len > seq.prompt.len() {
             return None;
         }
@@ -1164,6 +1161,28 @@ impl NativeLm for SpecLm {
 
     fn kv_pool(&self) -> Option<Arc<crate::kv::KvPool>> {
         self.kv_pool.clone()
+    }
+
+    fn radix_key(&self, state: &SeqState, ids: &[u32]) -> Vec<u32> {
+        let mut key = ids.to_vec();
+        let Some(seq) = state.downcast_ref::<Seq>() else {
+            return key;
+        };
+        // A media placeholder's key: the FNV-1a hash of its tower row (the media content as the
+        // model sees it) plus its row index, with the top bit set (above every token id).
+        if let Some((_, w, rows)) = seq.rows.first() {
+            for (i, &q) in seq.media.media_index.iter().enumerate() {
+                let h = rows.get(i * w..(i + 1) * w).map_or(0x811c_9dc5u32, |r| {
+                    r.iter().flat_map(|x| x.to_bits().to_le_bytes()).fold(0x811c_9dc5u32, |h, b| {
+                        (h ^ b as u32).wrapping_mul(0x0100_0193)
+                    })
+                });
+                if let Some(k) = key.get_mut(q as usize) {
+                    *k = 0x8000_0000 | (h.wrapping_add(i as u32) & 0x7fff_ffff);
+                }
+            }
+        }
+        key
     }
 }
 
