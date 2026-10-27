@@ -184,7 +184,7 @@ impl GraphProgram {
         let _compiling = CompileGuard::enter();
         #[cfg(test)]
         crate::graph::shape::note(&graph);
-        crate::graph::passes::prefuse(&mut graph);
+        crate::graph::passes::prefuse(&mut graph, &weights);
         let unfused = keep_folded.then(|| weights.clone());
         crate::graph::passes::fuse(&mut graph, Some(&mut weights))?;
         let dump: Option<usize> = std::env::var("GIBBS_PLAN_DUMP_CPU")

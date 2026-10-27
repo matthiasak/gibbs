@@ -1080,13 +1080,13 @@ mod tests {
 
     type Gw = (Graph, Weights);
 
-    fn prep(g: &mut Graph) {
-        canonical::run(g);
+    fn prep(g: &mut Graph, w: &Weights) {
+        canonical::run(g, w);
         dtype_adapt::run(g);
     }
 
     fn by_egraph((mut g, mut w): Gw, rules: &[Rule], cost: &CostModel) -> (Gw, Report) {
-        prep(&mut g);
+        prep(&mut g, &w);
         let r = fuse(&mut g, Some(&mut w), rules, cost, Budget::default()).expect("egraph fusion");
         crate::graph::pattern::validate_ssa(&g).expect("SSA after egraph fusion");
         ((g, w), r)

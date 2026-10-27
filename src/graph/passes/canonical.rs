@@ -1,15 +1,107 @@
 use crate::graph::{BinaryKind, Graph, NodeId, Op, Tensor, UnaryKind, ValueId, ValueKind, Weights};
 use std::collections::{HashMap, HashSet};
-/// Canonicalization passes running before placement:
-/// 1. Arithmetic identity elimination (e.g. Add 0, Mul 1)
-/// 2. Common Subexpression Elimination (CSE)
-/// 3. Dead Code Elimination (DCE)
-pub fn run(g: &mut Graph) {
-    eliminate_common_subexpressions(g);
-    eliminate_dead_nodes(g);
+
+/// Graph-only canonical reductions every instance runs before fusion (no weight changes):
+/// 1. Identities ([`reduce_identities`]): `Scale(1)`, `Mul` by a `[1]` weight holding 1, `Add` of
+///    a `[1]` weight holding 0 and a `Reshape` to its input's shape are removed; a `Scale` or
+///    `Reshape` read only by another of its kind is folded into it.
+/// 2. Common subexpression elimination (commutative `Binary` inputs in either order).
+/// 3. Dead code elimination.
+///
+/// Repeated until a round removes no node, at most 4 rounds.
+pub fn run(g: &mut Graph, weights: &Weights) {
+    for _ in 0..4 {
+        let before = g.nodes.len();
+        reduce_identities(g, weights);
+        eliminate_common_subexpressions(g);
+        eliminate_dead_nodes(g);
+        if g.nodes.len() == before {
+            break;
+        }
+    }
 }
 
-/// Identifies identical operations on identical inputs and merges them.
+/// Remaps the readers of identity nodes to their input and folds `Scale -> Scale` /
+/// `Reshape -> Reshape` pairs whose first node has no other reader into the second; the nodes
+/// left unread go in [`eliminate_dead_nodes`]. Graph outputs keep their producer, and an identity
+/// is removed only when its input is an activation of the same dtype and shape.
+pub fn reduce_identities(g: &mut Graph, weights: &Weights) {
+    // Readers per value; a graph output counts as one.
+    let mut uses = vec![0usize; g.values.len()];
+    for n in &g.nodes {
+        for &v in &n.inputs {
+            uses[v.0 as usize] += 1;
+        }
+    }
+    for &v in &g.outputs {
+        uses[v.0 as usize] += 1;
+    }
+    let outputs: HashSet<ValueId> = g.outputs.iter().copied().collect();
+    let mut producer: HashMap<ValueId, usize> = HashMap::new();
+    let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
+    for i in 0..g.nodes.len() {
+        // Topological order: every remap target is already final.
+        for v in &mut g.nodes[i].inputs {
+            if let Some(&r) = remap.get(v) {
+                *v = r;
+            }
+        }
+        let n = &g.nodes[i];
+        let Some(&out) = n.outputs.first() else {
+            continue;
+        };
+        producer.insert(out, i);
+        let scalar = |v: ValueId, want: f32| {
+            let val = g.value(v);
+            val.kind == ValueKind::Weight
+                && val.shape == [1]
+                && matches!(weights.get(&val.name), Some(Tensor::F32(d)) if d[..] == [want])
+        };
+        let identity_of = match (&n.op, &n.inputs[..]) {
+            (Op::Unary { kind: UnaryKind::Scale(s) }, &[x]) if (s - 1.0).abs() < 1e-9 => Some(x),
+            (Op::Binary { kind: BinaryKind::Mul }, &[a, b]) if scalar(b, 1.0) => Some(a),
+            (Op::Binary { kind: BinaryKind::Mul }, &[a, b]) if scalar(a, 1.0) => Some(b),
+            (Op::Binary { kind: BinaryKind::Add }, &[a, b]) if scalar(b, 0.0) => Some(a),
+            (Op::Binary { kind: BinaryKind::Add }, &[a, b]) if scalar(a, 0.0) => Some(b),
+            (Op::Reshape { .. }, &[x]) => Some(x),
+            _ => None,
+        };
+        if let Some(x) = identity_of {
+            let (xv, ov) = (g.value(x), g.value(out));
+            if !outputs.contains(&out)
+                && matches!(xv.kind, ValueKind::Input | ValueKind::Node(_))
+                && !xv.shape.is_empty()
+                && (xv.dtype, &xv.shape, xv.layout) == (ov.dtype, &ov.shape, ov.layout)
+            {
+                remap.insert(out, x);
+                uses[x.0 as usize] += uses[out.0 as usize] - 1;
+                continue;
+            }
+        }
+        let (&[src], Some(&p)) = (&n.inputs[..], n.inputs.first().and_then(|v| producer.get(v)))
+        else {
+            continue;
+        };
+        if uses[src.0 as usize] != 1 || g.nodes[p].inputs.len() != 1 {
+            continue;
+        }
+        let first = g.nodes[p].inputs[0];
+        let op = match (&g.nodes[p].op, &n.op) {
+            (Op::Unary { kind: UnaryKind::Scale(a) }, Op::Unary { kind: UnaryKind::Scale(b) }) => {
+                Op::Unary {
+                    kind: UnaryKind::Scale(a * b),
+                }
+            }
+            (Op::Reshape { .. }, Op::Reshape { .. }) => n.op.clone(),
+            _ => continue,
+        };
+        g.nodes[i].op = op;
+        g.nodes[i].inputs[0] = first;
+    }
+}
+
+/// Identifies identical operations on identical inputs and merges them (the inputs of a
+/// commutative `Binary` in either order).
 pub fn eliminate_common_subexpressions(g: &mut Graph) {
     let mut seen: HashMap<String, ValueId> = HashMap::new();
     let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
@@ -23,7 +115,14 @@ pub fn eliminate_common_subexpressions(g: &mut Graph) {
         }
 
         // Build a structural signature for deterministic CSE
-        let key = format!("{:?}:{:?}", node.op, node.inputs);
+        let mut inputs = node.inputs.clone();
+        if let Op::Binary {
+            kind: BinaryKind::Add | BinaryKind::Mul | BinaryKind::Max | BinaryKind::Min,
+        } = node.op
+        {
+            inputs.sort_by_key(|v| v.0);
+        }
+        let key = format!("{:?}:{:?}", node.op, inputs);
         if let Some(&existing_out) = seen.get(&key) {
             if !node.outputs.is_empty() {
                 remap.insert(node.outputs[0], existing_out);
@@ -82,153 +181,6 @@ pub fn eliminate_dead_nodes(g: &mut Graph) {
     }
 }
 
-/// Folds post-`Linear`, post-`Embedding`, and post-`RmsNorm` scalar multiplies (`Unary::Scale(s)`
-/// or `Binary::Mul` with a `[1]` F32 constant) directly into exclusively consumed F32 weights/gains.
-pub fn fold_scales_and_gains(g: &mut Graph, weights: &mut Weights) {
-    let mut val_uses: HashMap<ValueId, usize> = HashMap::new();
-    for &out in &g.outputs {
-        *val_uses.entry(out).or_insert(0) += 1;
-    }
-    for node in &g.nodes {
-        for &inp in &node.inputs {
-            *val_uses.entry(inp).or_insert(0) += 1;
-        }
-    }
-
-    let scalar_of = |v: ValueId, g: &Graph, weights: &Weights| -> Option<f32> {
-        if g.value(v).kind != ValueKind::Weight {
-            return None;
-        }
-        match weights.get(&g.value(v).name)? {
-            Tensor::F32(data) if data.len() == 1 => Some(data[0]),
-            _ => None,
-        }
-    };
-
-    let mut producer_of: HashMap<ValueId, usize> = HashMap::new();
-    for (idx, node) in g.nodes.iter().enumerate() {
-        for &out in &node.outputs {
-            producer_of.insert(out, idx);
-        }
-    }
-
-    let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
-    for idx in 0..g.nodes.len() {
-        let (scale_val, src_val, out_val) = match &g.nodes[idx].op {
-            Op::Unary {
-                kind: UnaryKind::Scale(s),
-            } if g.nodes[idx].inputs.len() == 1 && !g.nodes[idx].outputs.is_empty() => {
-                (*s, g.nodes[idx].inputs[0], g.nodes[idx].outputs[0])
-            }
-            Op::Binary {
-                kind: BinaryKind::Mul,
-            } if g.nodes[idx].inputs.len() == 2 && !g.nodes[idx].outputs.is_empty() => {
-                let (a, b) = (g.nodes[idx].inputs[0], g.nodes[idx].inputs[1]);
-                if let Some(s) = scalar_of(b, g, weights) {
-                    (s, a, g.nodes[idx].outputs[0])
-                } else if let Some(s) = scalar_of(a, g, weights) {
-                    (s, b, g.nodes[idx].outputs[0])
-                } else {
-                    continue;
-                }
-            }
-            _ => continue,
-        };
-        if val_uses.get(&src_val).copied().unwrap_or(0) != 1 {
-            continue;
-        }
-        let Some(&prod_idx) = producer_of.get(&src_val) else {
-            continue;
-        };
-        let prod = &g.nodes[prod_idx];
-        match prod.op {
-            Op::RmsNorm { .. } if prod.inputs.len() == 2 => {
-                let gamma_id = prod.inputs[1];
-                if g.value(gamma_id).kind != ValueKind::Weight
-                    || val_uses.get(&gamma_id).copied().unwrap_or(0) != 1
-                {
-                    continue;
-                }
-                let g_name = g.value(gamma_id).name.clone();
-                let Some(Tensor::F32(mut data)) = weights.get(&g_name).cloned() else {
-                    continue;
-                };
-                for x in &mut data {
-                    *x *= scale_val;
-                }
-                weights.insert(g_name, Tensor::F32(data));
-                remap.insert(out_val, src_val);
-            }
-            Op::Linear | Op::Embedding if prod.inputs.len() >= 2 => {
-                let w_id = if matches!(prod.op, Op::Embedding) {
-                    prod.inputs[0]
-                } else {
-                    prod.inputs[1]
-                };
-                if g.value(w_id).kind != ValueKind::Weight
-                    || val_uses.get(&w_id).copied().unwrap_or(0) != 1
-                {
-                    continue;
-                }
-                let bias_id = if matches!(prod.op, Op::Linear) && prod.inputs.len() == 3 {
-                    let bid = prod.inputs[2];
-                    if g.value(bid).kind != ValueKind::Weight
-                        || val_uses.get(&bid).copied().unwrap_or(0) != 1
-                    {
-                        continue;
-                    }
-                    Some(bid)
-                } else {
-                    None
-                };
-                let w_name = g.value(w_id).name.clone();
-                let Some(Tensor::F32(mut w_data)) = weights.get(&w_name).cloned() else {
-                    continue;
-                };
-                let b_entry = if let Some(bid) = bias_id {
-                    let b_name = g.value(bid).name.clone();
-                    let Some(Tensor::F32(b_data)) = weights.get(&b_name).cloned() else {
-                        continue;
-                    };
-                    Some((b_name, b_data))
-                } else {
-                    None
-                };
-                for x in &mut w_data {
-                    *x *= scale_val;
-                }
-                weights.insert(w_name, Tensor::F32(w_data));
-                if let Some((b_name, mut b_data)) = b_entry {
-                    for x in &mut b_data {
-                        *x *= scale_val;
-                    }
-                    weights.insert(b_name, Tensor::F32(b_data));
-                }
-                remap.insert(out_val, src_val);
-            }
-            _ => {}
-        }
-    }
-
-    if !remap.is_empty() {
-        let resolve = |mut v: ValueId| -> ValueId {
-            while let Some(&next) = remap.get(&v) {
-                v = next;
-            }
-            v
-        };
-        for node in &mut g.nodes {
-            for inp in &mut node.inputs {
-                *inp = resolve(*inp);
-            }
-        }
-        for out in &mut g.outputs {
-            *out = resolve(*out);
-        }
-        eliminate_dead_nodes(g);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,7 +236,7 @@ mod tests {
         g.output(mul);
 
         assert_eq!(g.nodes.len(), 4);
-        run(&mut g);
+        run(&mut g, &Weights::new());
 
         // After CSE and DCE:
         // add2 is merged into add1, dead node is eliminated.
@@ -295,67 +247,60 @@ mod tests {
             .expect("producer indices follow the retained nodes");
     }
 
+    /// Identity scales, chained scales, reshape chains and commuted adds reduce to fewer nodes,
+    /// the CPU outputs stay equal and a second `run` changes nothing.
     #[test]
-    fn test_fold_scales_and_gains_linear_and_rmsnorm() {
-        use crate::graph::{cpu, StateStore, Weights};
+    fn reductions_preserve_outputs_and_reach_fixed_point() {
+        use crate::graph::{cpu, StateStore};
 
         let mut g = Graph::new();
         let x = g.input("x", vec![2, 4], DType::F32);
-        let gamma = g.weight("gamma", vec![4], DType::F32);
-        let w = g.weight("w", vec![3, 4], DType::F32);
-        let b = g.weight("b", vec![3], DType::F32);
-
-        let rn = g.add(
-            "rn",
-            Op::RmsNorm { eps: 1e-5 },
-            &[x, gamma],
-            vec![2, 4],
-            DType::F32,
-        );
-        let rn_s = g.add(
-            "rn_scale",
-            Op::Unary {
-                kind: UnaryKind::Scale(0.5),
-            },
-            &[rn],
-            vec![2, 4],
-            DType::F32,
-        );
-        let lin = g.add("lin", Op::Linear, &[rn_s, w, b], vec![2, 3], DType::F32);
-        let lin_s = g.add(
-            "lin_scale",
-            Op::Unary {
-                kind: UnaryKind::Scale(2.5),
-            },
-            &[lin],
-            vec![2, 3],
-            DType::F32,
-        );
-        g.output(lin_s);
+        let y = g.input("y", vec![4, 2], DType::F32);
+        let one = g.weight("one", vec![1], DType::F32);
+        let zero = g.weight("zero", vec![1], DType::F32);
+        let unary = |s| Op::Unary {
+            kind: UnaryKind::Scale(s),
+        };
+        let bin = |kind| Op::Binary { kind };
+        let reshape = |s: &[usize]| Op::Reshape {
+            shape: Some(s.to_vec()),
+        };
+        let v = g.add("s1", unary(1.0), &[x], vec![2, 4], DType::F32);
+        let v = g.add("m1", bin(BinaryKind::Mul), &[v, one], vec![2, 4], DType::F32);
+        let v = g.add("a0", bin(BinaryKind::Add), &[zero, v], vec![2, 4], DType::F32);
+        let v = g.add("r0", reshape(&[2, 4]), &[v], vec![2, 4], DType::F32);
+        let v = g.add("c1", unary(2.0), &[v], vec![2, 4], DType::F32);
+        let v = g.add("c2", unary(4.0), &[v], vec![2, 4], DType::F32);
+        let v = g.add("r1", reshape(&[8]), &[v], vec![8], DType::F32);
+        let v = g.add("r2", reshape(&[4, 2]), &[v], vec![4, 2], DType::F32);
+        let a = g.add("add1", bin(BinaryKind::Add), &[v, y], vec![4, 2], DType::F32);
+        let b = g.add("add2", bin(BinaryKind::Add), &[y, v], vec![4, 2], DType::F32);
+        let out = g.add("out", bin(BinaryKind::Mul), &[a, b], vec![4, 2], DType::F32);
+        g.output(out);
 
         let mut weights = Weights::new();
-        weights.insert("gamma", Tensor::F32(vec![1.0, 1.5, 0.8, 1.2]));
-        weights.insert(
-            "w",
-            Tensor::F32((0..12).map(|i| (i as f32 - 5.0) * 0.2).collect()),
-        );
-        weights.insert("b", Tensor::F32(vec![0.1, -0.2, 0.3]));
+        weights.insert("one", Tensor::F32(vec![1.0]));
+        weights.insert("zero", Tensor::F32(vec![0.0]));
+        let inp = vec![
+            Tensor::F32(vec![0.5, -1.0, 2.0, 0.25, -0.5, 1.5, -0.75, 1.25]),
+            Tensor::F32(vec![1.0, 2.0, -3.0, 0.5, 0.0, -1.5, 2.5, 4.0]),
+        ];
+        let run_cpu = |g: &Graph| {
+            cpu::run(g, &weights, &mut StateStore::new(), inp.clone()).unwrap()[0].to_f32()
+        };
+        let want = run_cpu(&g);
 
-        let inp = vec![Tensor::F32(vec![
-            0.5, -1.0, 2.0, 0.25, -0.5, 1.5, -0.75, 1.25,
-        ])];
-        let want = cpu::run(&g, &weights, &mut StateStore::new(), inp.clone()).unwrap()[0].to_f32();
+        run(&mut g, &weights);
+        let ops: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        // Scale(8) of x, one reshape to [4, 2], one add, the product.
+        assert_eq!(ops, ["c2", "r2", "add1", "out"]);
+        assert_eq!(g.nodes[0].op, unary(8.0));
+        assert_eq!(g.nodes[0].inputs, [x]);
+        crate::graph::pattern::validate_ssa(&g).expect("SSA after reductions");
+        assert_eq!(run_cpu(&g), want);
 
-        fold_scales_and_gains(&mut g, &mut weights);
-        assert_eq!(
-            g.nodes.len(),
-            2,
-            "both Scale nodes folded into gamma and w/b"
-        );
-
-        let got = cpu::run(&g, &weights, &mut StateStore::new(), inp).unwrap()[0].to_f32();
-        for (a, b) in want.iter().zip(&got) {
-            assert!((a - b).abs() < 1e-6, "{a} != {b}");
-        }
+        let reduced = format!("{:?}", g.nodes);
+        run(&mut g, &weights);
+        assert_eq!(format!("{:?}", g.nodes), reduced, "a second run is a fixed point");
     }
 }
