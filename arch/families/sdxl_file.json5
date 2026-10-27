@@ -8,32 +8,21 @@
     single_file_tensors: [["conditioner.embedders.1.model.ln_final.weight", "model.diffusion_model.input_blocks.0.0.weight"]],
     single_file_ext: ["safetensors"],
   },
+  "use_lib+": ["ldm"],
   components: {
     text_encoder: {
       family: "clip_text",
       dir: "text_encoder",
       strip: ["conditioner.embedders.0.transformer."],
       ignore: ["conditioner.embedders.1.*", "model.diffusion_model.*", "first_stage_model.*", "denoiser.*"],
-      patch: {"use_lib+": ["ldm"]},
+      patch: {use_lib: ["transformer", "ldm"]},
     },
     text_encoder_2: {
       family: "clip_text",
       dir: "text_encoder_2",
       strip: ["conditioner.embedders.1.model."],
       ignore: ["conditioner.embedders.0.*", "model.diffusion_model.*", "first_stage_model.*", "denoiser.*"],
-      patch: {"use_lib+": ["ldm"]},
-    },
-    unet: {
-      family: "sd",
-      dir: "unet",
-      ignore: ["first_stage_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
-      patch: {"use_lib+": ["ldm"]},
-    },
-    vae: {
-      family: "sd_vae",
-      dir: "vae",
-      ignore: ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
-      patch: {"use_lib+": ["ldm"]},
+      patch: {use_lib: ["transformer", "ldm"]},
     },
   },
   runtime: {
