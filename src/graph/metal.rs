@@ -2101,7 +2101,6 @@ impl Session {
             &offsets,
             self.variant_override == Some(GemvVariant::HAND),
         );
-        fuse_moe_down_wsum(graph, &mut steps, &aliases, &offsets);
         let mut arena = self.arena.lock();
         if arena
             .as_ref()
@@ -4581,85 +4580,6 @@ pub struct GemvPairLeg {
     pub variant: GemvVariant,
 }
 
-/// Folds a decode-sized (`slots < MOE_GEMM_MIN_SLOTS`) per-slot `ExpertLinear` (the MoE down
-/// projection) into the `MoeWeightedSum` right after it when that sum is its only reader: the
-/// GEMV then writes each token's routing-weighted sum (`codegen::gemv_indexed_wsum`) to the sum's
-/// output, one dispatch and no `[slots, rows]` round trip. Runs after arena allocation, so it
-/// requires the sum's output disjoint from the GEMV's inputs (their space is free from the sum on).
-fn fuse_moe_down_wsum(
-    graph: &Graph,
-    steps: &mut Vec<Planned>,
-    aliases: &HashMap<ValueId, (ValueId, usize)>,
-    offsets: &HashMap<ValueId, usize>,
-) {
-    use ext::moe::{Step as Moe, MOE_GEMM_MIN_SLOTS};
-    if !fusion_enabled() {
-        return;
-    }
-    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
-    let range_of = |v: ValueId| -> Option<(usize, usize)> {
-        let off = *offsets.get(&v)?;
-        Some((
-            off,
-            off + graph.value(v).shape.iter().product::<usize>() * 4,
-        ))
-    };
-    let overlaps = |(a0, a1): (usize, usize), (b0, b1): (usize, usize)| a0 < b1 && b0 < a1;
-    let mut i = 0;
-    while i + 1 < steps.len() {
-        let (el, sum) = (&steps[i], &steps[i + 1]);
-        let weights = match (&el.op, &sum.op) {
-            (
-                Step::Ext(ext::ExtStep::Experts(Moe::ExpertLinear {
-                    rows,
-                    slots,
-                    top_k,
-                    x_per_slot: true,
-                    wsum: None,
-                    ..
-                })),
-                &Step::MoeWeightedSum {
-                    down,
-                    weights,
-                    n,
-                    k,
-                    h,
-                },
-            ) if down == el.out
-                && k == *top_k
-                && n * k == *slots
-                && h == *rows
-                && *slots < MOE_GEMM_MIN_SLOTS
-                && el.extra_outs.is_empty()
-                && !graph.outputs.iter().any(|&o| root(o) == root(el.out))
-                && steps.iter().enumerate().all(|(j, s)| {
-                    j == i + 1 || !s.reads.iter().any(|&r| root(r) == root(el.out))
-                })
-                && range_of(sum.out).is_some_and(|o| {
-                    el.reads
-                        .iter()
-                        .chain([&weights])
-                        .filter_map(|&r| range_of(r))
-                        .all(|r| !overlaps(o, r))
-                }) =>
-            {
-                weights
-            }
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-        let sum = steps.remove(i + 1);
-        let el = &mut steps[i];
-        if let Step::Ext(ext::ExtStep::Experts(Moe::ExpertLinear { wsum, .. })) = &mut el.op {
-            *wsum = Some(weights);
-        }
-        el.out = sum.out;
-        el.reads.push(weights);
-        i += 1;
-    }
-}
 
 /// Pairs already-adjacent small-row (`rows <= 512`) `HAND` `Step::GemvPacked` projections sharing
 /// `x`, `cols`, and `format` after variant assignment and arena allocation, verifying disjoint
@@ -6045,7 +5965,6 @@ pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
     let mut steps = batch_horizontal(steps, &aliases)?;
     let (offsets, arena) = allocate(g, &steps, &aliases)?;
     pair_small_hand_gemvs(g, &mut steps, &aliases, &offsets, false);
-    fuse_moe_down_wsum(g, &mut steps, &aliases, &offsets);
     let mut out = String::new();
     let mut kinds: HashMap<String, usize> = HashMap::new();
     let (mut layer, mut dispatches, mut unassigned) = (None, 0usize, 0usize);

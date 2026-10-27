@@ -13,7 +13,7 @@ use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
 use crate::graph::codegen::{
     block_ref, device_msl, gemm_common, gemm_packed, gemm_packed_name, gemv_indexed,
-    gemv_indexed_name, gemv_indexed_wsum, gemv_indexed_wsum_name, gemv_rows_per_tg, GemvParams,
+    gemv_indexed_name, gemv_rows_per_tg, GemvParams,
 };
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
@@ -42,7 +42,7 @@ pub(super) const KERNELS: &[&str] = &[
 const ARGMAX_WIDE: usize = 8192;
 const ARGMAX_SPAN: usize = 4096;
 /// Minimum routed slot count (`m * top_k`) at which `Step::ExpertLinear` uses grouped expert GEMM.
-pub(crate) const MOE_GEMM_MIN_SLOTS: usize = 32;
+const MOE_GEMM_MIN_SLOTS: usize = 32;
 
 /// Source encoding of an embedding table.
 #[derive(Debug, Clone, Copy)]
@@ -85,9 +85,6 @@ pub enum Step {
         top_k: usize,
         experts: usize,
         x_per_slot: bool,
-        /// Routing weights `[slots]` of a fused `MoeWeightedSum` (`fuse_moe_down_wsum`):
-        /// the output is then each token's weighted sum over its `top_k` slots, `[slots / top_k, rows]`.
-        wsum: Option<ValueId>,
     },
     Embed {
         table: ValueId,
@@ -275,7 +272,6 @@ pub(super) fn plan(
                     top_k: *top_k,
                     experts: *experts,
                     x_per_slot: x_rows == slots,
-                    wsum: None,
                 },
                 slots * rows,
             ))
@@ -364,9 +360,7 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
             v
         }
         Step::GatherCols { x, idx, .. } => vec![*x, *idx],
-        Step::ExpertLinear {
-            x, bank, ids, wsum, ..
-        } => [*x, *bank, *ids].into_iter().chain(*wsum).collect(),
+        Step::ExpertLinear { x, bank, ids, .. } => vec![*x, *bank, *ids],
         Step::Embed { table, ids, .. } => vec![*table, *ids],
         Step::Qsa { score, pos, .. } => vec![*score, *pos],
     }
@@ -377,7 +371,7 @@ pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
     match st {
         Step::TopK { .. } => false,
         Step::GatherCols { idx, .. } => v == *idx,
-        Step::ExpertLinear { x, wsum, .. } => v != *x && Some(v) != *wsum,
+        Step::ExpertLinear { x, .. } => v != *x,
         Step::Embed { .. } => true,
         Step::Qsa { pos, .. } => v == *pos,
     }
@@ -459,23 +453,17 @@ fn moe_rows_per_sg(_c: &Codec) -> usize {
     // }
     2
 }
-/// Per (device, codec, rows_per_sg, weighted sum) pipelines of [`gemv_indexed`] /
-/// [`gemv_indexed_wsum`], compiled on first use.
-static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize, bool), ComputePipelineState>>> =
+/// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
+static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipelineState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn moe_gemv_pso(
-    sess: &Session,
-    c: &Codec,
-    r: usize,
-    wsum: bool,
-) -> Result<ComputePipelineState, String> {
+fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
     #[cfg(test)]
     if let Some(pso) = TEST_PSO_OVERRIDE.with(|cell| cell.borrow().clone()) {
         return Ok(pso);
     }
     let device = &sess.rt.device;
-    let key = (device.registry_id(), c.format, r, wsum);
+    let key = (device.registry_id(), c.format, r);
     if let Some(p) = MOE_GEMV.lock().get(&key) {
         return Ok(p.clone());
     }
@@ -483,15 +471,10 @@ fn moe_gemv_pso(
         rows_per_sg: r,
         ..Default::default()
     };
-    let (body, name) = if wsum {
-        (
-            gemv_indexed_wsum(c, params),
-            gemv_indexed_wsum_name(c, params),
-        )
-    } else {
-        (gemv_indexed(c, params), gemv_indexed_name(c, params))
-    };
-    let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{body}");
+    let src = format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n{}",
+        gemv_indexed(c, params)
+    );
     let opts = CompileOptions::new();
     let lib = device.new_library_with_source(&src, &opts).map_err(|e| {
         format!(
@@ -499,7 +482,7 @@ fn moe_gemv_pso(
             c.format
         )
     })?;
-    let func = lib.get_function(&name, None)?;
+    let func = lib.get_function(&gemv_indexed_name(c, params), None)?;
     let pso = device.new_compute_pipeline_state_with_function(&func)?;
     MOE_GEMV.lock().insert(key, pso.clone());
     Ok(pso)
@@ -624,11 +607,10 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             top_k,
             experts,
             x_per_slot,
-            wsum,
         } => {
             let c = bank_codec(*dtype)
                 .ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
-            if wsum.is_none() && *slots >= MOE_GEMM_MIN_SLOTS && rt.profile.mpp.is_ok() {
+            if *slots >= MOE_GEMM_MIN_SLOTS && rt.profile.mpp.is_ok() {
                 let need = (*experts + *experts * *slots) * 4;
                 let mut guard = sess.argmax_scratch.lock();
                 if guard.as_ref().is_none_or(|b| (b.length() as usize) < need) {
@@ -679,7 +661,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 );
             } else {
                 let r = moe_rows_per_sg(c);
-                let pso = moe_gemv_pso(sess, c, r, wsum.is_some())?;
+                let pso = moe_gemv_pso(sess, c, r)?;
                 enc.set_compute_pipeline_state(&pso);
                 e.bind(0, *bank);
                 e.bind(1, *x);
@@ -697,9 +679,6 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                     ],
                 );
                 e.bind(4, *ids);
-                if let Some(w) = *wsum {
-                    e.bind(5, w);
-                }
                 let rows_per_tg = gemv_rows_per_tg(GemvParams {
                     rows_per_sg: r,
                     ..Default::default()
@@ -707,7 +686,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 enc.dispatch_thread_groups(
                     MTLSize::new(
                         (*rows as u64).div_ceil(rows_per_tg as u64),
-                        (*slots / if wsum.is_some() { *top_k } else { 1 }) as u64,
+                        *slots as u64,
                         1,
                     ),
                     MTLSize::new(256, 1, 1),
@@ -1778,7 +1757,7 @@ mod tests {
             (Q::GGUF_Q6_K, 2),
         ] {
             let c = super::codec(fmt).unwrap();
-            let pso = super::moe_gemv_pso(&s, c, r, false).unwrap();
+            let pso = super::moe_gemv_pso(&s, c, r).unwrap();
             eprintln!(
                 "{fmt:?} r={r}: max_total_threads_per_threadgroup={} thread_execution_width={}",
                 pso.max_total_threads_per_threadgroup(),
@@ -1917,7 +1896,7 @@ mod tests {
             rows_per_sg: 2,
             ..Default::default()
         };
-        let real_pso = super::moe_gemv_pso(&s, c, 2, false).unwrap();
+        let real_pso = super::moe_gemv_pso(&s, c, 2).unwrap();
         let real_msl = super::gemv_indexed(c, params);
         let stub_msl = real_msl.replace(
             "IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]",
