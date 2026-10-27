@@ -1,0 +1,77 @@
+
+// ---- state.gpk: recurrent and written states ----
+
+// Element (row r, channel c) of the causal-conv window: hist state rows, then the n input rows.
+DEVFN float conv_window(GLOBAL const float* x, u32 xo, GLOBAL const float* st, u32 so, u32 has_st,
+                        u32 r, u32 c, u32 channels, u32 hist) {
+    if (r < hist) return has_st ? st[so + r * channels + c] : 0.0f;
+    return x[xo + (r - hist) * channels + c];
+}
+
+// Causal depthwise conv over [n, channels] with taps w [channels, k], dilation dl, thread per output.
+KERNEL causal_conv(GLOBAL const float* x, u32 xo, GLOBAL const float* w, u32 wo, GLOBAL const float* st,
+                   u32 so, u32 has_st, GLOBAL float* y, u32 yo, u32 n, u32 channels, u32 k, u32 dl) {
+    u32 i = GID(0);
+    if (i >= n * channels) return;
+    u32 t = i / channels, c = i % channels, hist = (k - 1u) * dl;
+    float acc = 0.0f;
+    for (u32 tap = 0; tap < k; tap++) {
+        u32 back = (k - 1u - tap) * dl;
+        u32 s = hist + t;
+        if (s >= back) acc += w[wo + c * k + tap] * conv_window(x, xo, st, so, has_st, s - back, c, channels, hist);
+    }
+    y[yo + i] = acc;
+}
+
+// The window's last hist rows (the next state) into `out`.
+KERNEL causal_conv_state(GLOBAL const float* x, u32 xo, GLOBAL const float* st, u32 so, u32 has_st,
+                         GLOBAL float* out, u32 oo, u32 n, u32 channels, u32 hist) {
+    u32 i = GID(0);
+    if (i >= hist * channels) return;
+    out[oo + i] = conv_window(x, xo, st, so, has_st, n + i / channels, i % channels, channels, hist);
+}
+
+// Gated DeltaNet recurrence: workgroup per value head h, thread per state column j (columns are
+// independent, so no synchronization); S [val_heads, kd, vd] updates in place.
+KERNEL delta_rule(GLOBAL const float* q, u32 qo, GLOBAL const float* k, u32 ko, GLOBAL const float* v,
+                  u32 vo, GLOBAL const float* beta, u32 bo, GLOBAL const float* ld, u32 lo,
+                  GLOBAL float* S, u32 so, GLOBAL float* y, u32 yo, u32 n, u32 kh, u32 vh, u32 kd,
+                  u32 vd, u32 n_beta, u32 n_ld) {
+    u32 h = GRP(0), kh_i = h / (vh / kh);
+    GLOBAL float* sh = S + so + h * kd * vd;
+    for (u32 t = 0; t < n; t++) {
+        GLOBAL const float* qt = q + qo + t * kh * kd + kh_i * kd;
+        GLOBAL const float* kt = k + ko + t * kh * kd + kh_i * kd;
+        float qn = 0.0f, kn = 0.0f;
+        for (u32 i = 0; i < kd; i++) {
+            qn += qt[i] * qt[i];
+            kn += kt[i] * kt[i];
+        }
+        float qs = (1.0f / sqrtf((float)kd)) / fmaxf(sqrtf(qn), 1e-12f);
+        float ks = 1.0f / fmaxf(sqrtf(kn), 1e-12f);
+        float b = t * vh + h < n_beta ? beta[bo + t * vh + h] : 1.0f;
+        float decay = expf(t * vh + h < n_ld ? ld[lo + t * vh + h] : 0.0f);
+        for (u32 j = LID(0); j < vd; j += LSZ(0)) {
+            float kv = 0.0f;
+            for (u32 i = 0; i < kd; i++) kv += sh[i * vd + j] * (kt[i] * ks);
+            float delta = b * (v[vo + t * vh * vd + h * vd + j] - decay * kv);
+            float o = 0.0f;
+            for (u32 i = 0; i < kd; i++) {
+                float s = decay * sh[i * vd + j] + (kt[i] * ks) * delta;
+                sh[i * vd + j] = s;
+                o += s * (qt[i] * qs);
+            }
+            y[yo + t * vh * vd + h * vd + j] = o;
+        }
+    }
+}
+
+// state[pos0 + r] = rows[r] for the m rows of width w (n = m * w values) inside `cap` elements;
+// y[0] = pos0 + m.
+KERNEL state_write(GLOBAL float* st, u32 so, GLOBAL const float* rows, u32 ro, GLOBAL const u32* pos,
+                   u32 po, GLOBAL u32* y, u32 yo, u32 n, u32 w, u32 cap) {
+    u32 i = GID(0);
+    u32 p0 = pos[po];
+    if (i == 0u) y[yo] = p0 + n / w;
+    if (i < n && p0 * w + i < cap) st[so + p0 * w + i] = rows[ro + i];
+}

@@ -39,7 +39,7 @@ impl HardwareProfile {
             Device::Cuda => Self {
                 device: Device::Cuda,
                 name: crate::graph::cuda::device_name(),
-                memory_bandwidth_gbps: 900.0,
+                memory_bandwidth_gbps: crate::graph::cuda::bandwidth_gbps().unwrap_or(0.0),
                 threadgroup_memory_bytes: 48 * 1024,
                 max_threads_per_threadgroup: 1024,
                 simd_width: 32,
@@ -55,7 +55,7 @@ impl HardwareProfile {
             Device::Rocm => Self {
                 device: Device::Rocm,
                 name: crate::graph::rocm::device_name(),
-                memory_bandwidth_gbps: 1600.0,
+                memory_bandwidth_gbps: crate::graph::rocm::bandwidth_gbps().unwrap_or(0.0),
                 threadgroup_memory_bytes: 64 * 1024,
                 max_threads_per_threadgroup: 1024,
                 simd_width: 64,
@@ -87,7 +87,7 @@ impl HardwareProfile {
             Device::IntelXpu => Self {
                 device: Device::IntelXpu,
                 name: crate::graph::intel_xpu::device_name(),
-                memory_bandwidth_gbps: 560.0,
+                memory_bandwidth_gbps: crate::graph::intel_xpu::bandwidth_gbps().unwrap_or(0.0),
                 threadgroup_memory_bytes: 64 * 1024,
                 max_threads_per_threadgroup: 1024,
                 simd_width: 16,

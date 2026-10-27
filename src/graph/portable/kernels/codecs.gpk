@@ -1,0 +1,371 @@
+
+// ---- codecs.gpk: block weight codecs, ports of the MSL `decode8` bodies in src/graph/codec.rs ----
+// dec_<FORMAT>(blk, sub, out8) writes elements [sub*8, sub*8+8) of the block at `blk` (any alignment).
+// Float operation order matches the MSL (and the CPU dequantizers) statement for statement.
+
+#ifdef __OPENCL_VERSION__
+#pragma OPENCL FP_CONTRACT OFF
+#endif
+
+DEVFN float cd_sgn(u32 s, u32 j) { return (s & (1u << j)) ? -1.0f : 1.0f; }
+DEVFN float cd_gb(u64 g, u32 j) { return (float)(u32)((g >> (8u * j)) & 0xFFu); }
+DEVFN float cd_gb_i8(u64 g, u32 j) { return (float)(i32)(i8)(u8)((g >> (8u * j)) & 0xFFu); }
+// ggml get_scale_min_k4: 6-bit (scale, min) pair j of a K-quant block's 12 scale bytes.
+DEVFN void cd_k4(u32 j, GLOBAL const u8* s, u32* sv, u32* mv) {
+    if (j < 4u) {
+        *sv = s[j] & 63u;
+        *mv = s[j + 4u] & 63u;
+    } else {
+        *sv = (s[j + 4u] & 0x0Fu) | ((u32)(s[j - 4u] >> 6) << 4);
+        *mv = (u32)(s[j + 4u] >> 4) | ((u32)(s[j] >> 6) << 4);
+    }
+}
+// E4M3FN by bit tricks: subnormals are m/512, normals are (8+m)*2^(e-10), 0x7F is NaN.
+DEVFN float cd_e4m3(u32 x) {
+    u32 m = x & 0x7Fu;
+    float v = (m < 8u) ? (float)m * (1.0f / 512.0f) : AS_FLOAT((((m >> 3) + 120u) << 23) | ((m & 7u) << 20));
+    if (m == 0x7Fu) v = AS_FLOAT(0x7FC00000u);
+    return (x & 0x80u) ? -v : v;
+}
+
+CONSTANT float BNB_NF4[16] = {
+    -1.0f, -0.6961928f, -0.52507305f, -0.3949175f, -0.28444138f, -0.18477343f, -0.091050036f, 0.0f,
+    0.0795803f, 0.1609302f, 0.2461123f, 0.33791524f, 0.44070983f, 0.562617f, 0.72295684f, 1.0f};
+CONSTANT float BNB_FP4[16] = {
+    0.0f, 0.005208333f, 0.6666667f, 1.0f, 0.33333334f, 0.5f, 0.16666667f, 0.25f,
+    -0.0f, -0.005208333f, -0.6666667f, -1.0f, -0.33333334f, -0.5f, -0.16666667f, -0.25f};
+
+DEVFN void dec_GGUF_Q4_0(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    GLOBAL const u8* q = blk + 2u + (sub & 1u) * 8u;
+    u32 sh = (sub >> 1) * 4u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = (float)((i32)((q[i] >> sh) & 0x0Fu) - 8) * d;
+}
+
+DEVFN void dec_GGUF_Q8_0(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    GLOBAL const u8* q = blk + 2u + sub * 8u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = d * (float)(i8)q[i];
+}
+
+DEVFN void dec_GGUF_Q4_1(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk), m = ld_f16(blk + 2);
+    GLOBAL const u8* q = blk + 4u + (sub & 1u) * 8u;
+    u32 sh = (sub >> 1) * 4u;
+    for (u32 i = 0; i < 8u; i++) {
+        float t = (float)((q[i] >> sh) & 0x0Fu) * d;
+        out8[i] = t + m;
+    }
+}
+
+DEVFN void dec_GGUF_Q5_0(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    u32 qh = ld_u32(blk + 2);
+    GLOBAL const u8* q = blk + 6u + (sub & 1u) * 8u;
+    u32 sh = (sub >> 1) * 4u;
+    for (u32 i = 0; i < 8u; i++) {
+        u32 v = ((q[i] >> sh) & 0x0Fu) | (((qh >> (sub * 8u + i)) & 1u) << 4);
+        out8[i] = (float)((i32)v - 16) * d;
+    }
+}
+
+DEVFN void dec_GGUF_Q5_1(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk), m = ld_f16(blk + 2);
+    u32 qh = ld_u32(blk + 4);
+    GLOBAL const u8* q = blk + 8u + (sub & 1u) * 8u;
+    u32 sh = (sub >> 1) * 4u;
+    for (u32 i = 0; i < 8u; i++) {
+        u32 v = ((q[i] >> sh) & 0x0Fu) | (((qh >> (sub * 8u + i)) & 1u) << 4);
+        float t = (float)v * d;
+        out8[i] = t + m;
+    }
+}
+
+DEVFN void dec_GGUF_Q4_K_M(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk), dmin = ld_f16(blk + 2);
+    u32 j = sub >> 2;
+    u32 sv, mv;
+    cd_k4(j, blk + 4, &sv, &mv);
+    float d0 = d * (float)sv, min0 = dmin * (float)mv;
+    GLOBAL const u8* q = blk + 16u + (j >> 1) * 32u + (sub & 3u) * 8u;
+    u32 sh = (j & 1u) * 4u;
+    for (u32 i = 0; i < 8u; i++) {
+        float t = d0 * (float)((q[i] >> sh) & 0x0Fu);
+        out8[i] = t - min0;
+    }
+}
+
+DEVFN void dec_GGUF_Q5_K_M(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk), dmin = ld_f16(blk + 2);
+    u32 j = sub >> 2;
+    u32 sv, mv;
+    cd_k4(j, blk + 4, &sv, &mv);
+    float d0 = d * (float)sv, min0 = dmin * (float)mv;
+    GLOBAL const u8* qh = blk + 16u + (sub & 3u) * 8u;
+    GLOBAL const u8* q = blk + 48u + (j >> 1) * 32u + (sub & 3u) * 8u;
+    u32 sh = (j & 1u) * 4u;
+    for (u32 i = 0; i < 8u; i++) {
+        u32 v = ((q[i] >> sh) & 0x0Fu) | ((((u32)qh[i] >> j) & 1u) << 4);
+        float t = d0 * (float)v;
+        out8[i] = t - min0;
+    }
+}
+
+DEVFN void dec_GGUF_Q6_K(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk + 208);
+    u32 n = sub >> 4;
+    u32 e = (sub & 15u) * 8u;
+    u32 qd = e >> 5;
+    u32 l0 = e & 31u;
+    GLOBAL const u8* ql = blk + n * 64u;
+    GLOBAL const u8* qh = blk + 128u + n * 32u;
+    GLOBAL const u8* sc = blk + 192u + n * 8u;
+    for (u32 i = 0; i < 8u; i++) {
+        u32 l = l0 + i;
+        u32 lo = (qd & 1u) ? (u32)ql[l + 32u] : (u32)ql[l];
+        lo = (qd >> 1) ? (lo >> 4) : (lo & 0x0Fu);
+        u32 hb = ((u32)qh[l] >> (2u * qd)) & 3u;
+        i32 qv = (i32)(lo | (hb << 4)) - 32;
+        out8[i] = d * (float)(i8)sc[(l >> 4) + 2u * qd] * (float)qv;
+    }
+}
+
+DEVFN void dec_GGUF_Q2_K(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk + 80), mn = ld_f16(blk + 82);
+    u32 sc = blk[sub >> 1];
+    float dl = d * (float)(sc & 0x0Fu), ml = mn * (float)(sc >> 4);
+    GLOBAL const u8* q = blk + 16u + (sub >> 4) * 32u + ((sub >> 1) & 1u) * 16u + (sub & 1u) * 8u;
+    u32 sh = ((sub >> 2) & 3u) * 2u;
+    for (u32 i = 0; i < 8u; i++) {
+        float t = dl * (float)((q[i] >> sh) & 3u);
+        out8[i] = t - ml;
+    }
+}
+
+DEVFN void dec_GGUF_Q3_K(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d_all = ld_f16(blk + 108);
+    u32 a0 = ld_u32(blk + 96), a1 = ld_u32(blk + 100), a2 = ld_u32(blk + 104);
+    const u32 k1 = 0x03030303u, k2 = 0x0f0f0f0fu;
+    u32 is = sub >> 1;
+    u32 w = is >> 2;
+    u32 aux = w == 0u ? ((a0 & k2) | ((a2 & k1) << 4))
+            : w == 1u ? ((a1 & k2) | (((a2 >> 2) & k1) << 4))
+            : w == 2u ? (((a0 >> 4) & k2) | (((a2 >> 4) & k1) << 4))
+                      : (((a1 >> 4) & k2) | (((a2 >> 6) & k1) << 4));
+    i32 scale = (i32)(i8)(u8)((aux >> (8u * (is & 3u))) & 0xFFu) - 32;
+    float dl = d_all * (float)scale;
+    u32 n = sub >> 4, si = (sub >> 2) & 3u, half_ = (sub >> 1) & 1u;
+    u32 m = 1u << (n * 4u + si);
+    for (u32 i = 0; i < 8u; i++) {
+        u32 k = (sub & 1u) * 8u + i + 16u * half_;
+        i32 h = (blk[k] & m) ? 0 : 4;
+        i32 qv = (i32)((blk[32u + n * 32u + k] >> (2u * si)) & 3u);
+        out8[i] = dl * (float)(qv - h);
+    }
+}
+
+DEVFN void dec_GGUF_IQ4_NL(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    GLOBAL const u8* q = blk + 2u + (sub & 1u) * 8u;
+    u32 sh = (sub >> 1) * 4u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = d * (float)KVALUES_IQ4NL[(q[i] >> sh) & 0x0Fu];
+}
+
+DEVFN void dec_GGUF_IQ4_XS(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    u32 scales_h = ld_u16(blk + 2);
+    u32 ib = sub >> 2, t = sub & 3u;
+    u32 ls = (((u32)blk[4u + (ib >> 1)] >> (4u * (ib & 1u))) & 0x0Fu) | (((scales_h >> (2u * ib)) & 3u) << 4);
+    float dl = d * (float)((i32)ls - 32);
+    GLOBAL const u8* q = blk + 8u + 16u * ib + (t & 1u) * 8u;
+    u32 sh = (t >> 1) * 4u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = dl * (float)KVALUES_IQ4NL[(q[i] >> sh) & 0x0Fu];
+}
+
+DEVFN void dec_GGUF_IQ3_XXS(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    u32 ib = sub >> 2, l = sub & 3u;
+    u32 aux = ld_u32(blk + 66u + 4u * ib);
+    float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+    u32 s = KSIGNS_IQ2XS[(aux >> (7u * l)) & 127u];
+    u64 g1 = IQ3XXS_GRID[blk[2u + 2u * sub]];
+    u64 g2 = IQ3XXS_GRID[blk[3u + 2u * sub]];
+    for (u32 j = 0; j < 4u; j++) {
+        out8[j] = db * cd_gb(g1, j) * cd_sgn(s, j);
+        out8[j + 4u] = db * cd_gb(g2, j) * cd_sgn(s, j + 4u);
+    }
+}
+
+DEVFN void dec_GGUF_IQ3_S(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    u32 ib = sub >> 2, l = sub & 3u;
+    u32 sc = ((u32)blk[106u + (ib >> 1)] >> (4u * (ib & 1u))) & 0x0Fu;
+    float db = d * (float)(1 + 2 * (i32)sc);
+    u32 h = blk[66u + ib];
+    u64 g1 = IQ3S_GRID[(u32)blk[2u + 2u * sub] | ((h << (8u - 2u * l)) & 256u)];
+    u64 g2 = IQ3S_GRID[(u32)blk[3u + 2u * sub] | ((h << (7u - 2u * l)) & 256u)];
+    u32 s = blk[74u + sub];
+    for (u32 j = 0; j < 4u; j++) {
+        out8[j] = db * cd_gb(g1, j) * cd_sgn(s, j);
+        out8[j + 4u] = db * cd_gb(g2, j) * cd_sgn(s, j + 4u);
+    }
+}
+
+DEVFN void dec_GGUF_IQ2_XXS(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    u32 ib = sub >> 2, l = sub & 3u;
+    GLOBAL const u8* q = blk + 2u + 8u * ib;
+    u32 aux1 = ld_u32(q + 4);
+    float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+    u64 g = IQ2XXS_GRID[q[l]];
+    u32 s = KSIGNS_IQ2XS[(aux1 >> (7u * l)) & 127u];
+    for (u32 j = 0; j < 8u; j++) out8[j] = db * cd_gb(g, j) * cd_sgn(s, j);
+}
+
+DEVFN void dec_GGUF_IQ2_XS(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    u32 ib = sub >> 2, l = sub & 3u;
+    u32 sc = blk[66u + ib];
+    float db = d * (0.5f + (float)((l < 2u) ? (sc & 0x0Fu) : (sc >> 4))) * 0.25f;
+    u32 q = ld_u16(blk + 2u + 2u * sub);
+    u64 g = IQ2XS_GRID[q & 511u];
+    u32 s = KSIGNS_IQ2XS[q >> 9];
+    for (u32 j = 0; j < 8u; j++) out8[j] = db * cd_gb(g, j) * cd_sgn(s, j);
+}
+
+// Also GGUF_IQ2_S (same block layout).
+DEVFN void dec_GGUF_IQ2_M(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    u32 ib = sub >> 2, l = sub & 3u;
+    u32 sc = blk[74u + ib];
+    float db = d * (0.5f + (float)((l < 2u) ? (sc & 0x0Fu) : (sc >> 4))) * 0.25f;
+    u32 idx = (u32)blk[2u + sub] | (((u32)blk[66u + ib] << (8u - 2u * l)) & 0x300u);
+    u64 g = IQ2S_GRID[idx];
+    u32 s = blk[34u + sub];
+    for (u32 j = 0; j < 8u; j++) out8[j] = db * cd_gb(g, j) * cd_sgn(s, j);
+}
+
+DEVFN void dec_GGUF_IQ1_S(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk);
+    u32 ib = sub >> 2, l = sub & 3u;
+    u32 qh = ld_u16(blk + 34u + 2u * ib);
+    float dl = d * (float)(2 * (i32)((qh >> 12) & 7u) + 1);
+    float delta = (qh & 0x8000u) ? -0.125f : 0.125f;
+    u64 g = IQ1S_GRID[(u32)blk[2u + sub] | (((qh >> (3u * l)) & 7u) << 8)];
+    for (u32 j = 0; j < 8u; j++) out8[j] = dl * (cd_gb_i8(g, j) + delta);
+}
+
+DEVFN void dec_GGUF_IQ1_M(GLOBAL const u8* blk, u32 sub, float* out8) {
+    u32 sc[4] = {ld_u16(blk + 48), ld_u16(blk + 50), ld_u16(blk + 52), ld_u16(blk + 54)};
+    u32 hb = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0u) | ((sc[2] >> 4) & 0x0f00u) | (sc[3] & 0xf000u);
+    float d = f16_bits_to_f32(hb);
+    u32 ib = sub >> 2, l = sub & 3u;
+    u32 s = sc[ib >> 1] >> (6u * (ib & 1u));
+    float dl = d * (float)(2 * (i32)((s >> (3u * (l >> 1))) & 7u) + 1);
+    u32 hh = blk[32u + 2u * ib + (l >> 1)];
+    u32 idx = (l & 1u) ? ((hh << 4) & 0x700u) : ((hh << 8) & 0x700u);
+    u32 neg = (l & 1u) ? (hh & 0x80u) : (hh & 0x08u);
+    float delta = neg ? -0.125f : 0.125f;
+    u64 g = IQ1S_GRID[(u32)blk[sub] | idx];
+    for (u32 j = 0; j < 8u; j++) out8[j] = dl * (cd_gb_i8(g, j) + delta);
+}
+
+DEVFN void dec_GGUF_TQ1_0(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk + 52);
+    for (u32 i = 0; i < 8u; i++) {
+        u32 e = sub * 8u + i, n, bi;
+        if (e < 160u) { n = e >> 5; bi = e & 31u; }
+        else if (e < 240u) { e -= 160u; n = e >> 4; bi = 32u + (e & 15u); }
+        else { e -= 240u; n = e >> 2; bi = 48u + (e & 3u); }
+        u32 p = 1u;
+        for (u32 k = 0; k < n; k++) p *= 3u;
+        u32 t = ((u32)blk[bi] * p) & 0xFFu;
+        out8[i] = ((float)((t * 3u) >> 8) - 1.0f) * d;
+    }
+}
+
+DEVFN void dec_GGUF_TQ2_0(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float d = ld_f16(blk + 64);
+    u32 e0 = sub * 8u;
+    GLOBAL const u8* q = blk + (e0 >> 7) * 32u + (e0 & 31u);
+    u32 sh = ((e0 >> 5) & 3u) * 2u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = ((float)((q[i] >> sh) & 3u) - 1.0f) * d;
+}
+
+// d = 2^(e-128). For e < 2 that scale (and every product with it) is an f32 subnormal, which GPU float
+// units may flush to zero, so that case assembles the result bits with integer ops.
+DEVFN void dec_MXFP4(GLOBAL const u8* blk, u32 sub, float* out8) {
+    u32 e = blk[0];
+    float d = AS_FLOAT(e < 2u ? 0u : ((e - 1u) << 23));
+    GLOBAL const u8* q = blk + 1u + (sub & 1u) * 8u;
+    u32 sh = (sub >> 1) * 4u;
+    for (u32 i = 0; i < 8u; i++) {
+        i32 k = KVALUES_FP4[(q[i] >> sh) & 0x0Fu];
+        if (e >= 2u) {
+            out8[i] = (float)k * d;
+        } else {
+            u32 n = (u32)(k < 0 ? -k : k) << (21u + e);  // |k| * d in units of 2^-149
+            u32 bits = n < 0x800000u ? n : (AS_UINT((float)n) - (149u << 23));
+            out8[i] = AS_FLOAT(bits | (k < 0 ? 0x80000000u : 0u));
+        }
+    }
+}
+
+// d = UE4M3(scale byte) * 0.5 (0 and 0x7F give 0), assembled from bits like the CPU reference.
+DEVFN void dec_GGUF_NVFP4(GLOBAL const u8* blk, u32 sub, float* out8) {
+    u32 x = blk[sub >> 1];
+    u32 e = (x >> 3) & 0xFu, m = x & 7u;
+    float d = (x == 0u || x == 0x7Fu) ? 0.0f : (e == 0u ? (float)m / 1024.0f : AS_FLOAT(((e + 119u) << 23) | (m << 20)));
+    GLOBAL const u8* q = blk + 4u + (sub >> 1) * 8u;
+    u32 sh = (sub & 1u) * 4u;
+    for (u32 i = 0; i < 8u; i++) out8[i] = (float)KVALUES_FP4[(q[i] >> sh) & 0x0Fu] * d;
+}
+
+// bitsandbytes: f32 absmax, then nibble bytes (element 2j in the HIGH nibble of byte j).
+DEVFN float cd_bnb_lut(u32 fp4, u32 c) { return fp4 ? BNB_FP4[c] : BNB_NF4[c]; }
+DEVFN void cd_bnb(u32 fp4, GLOBAL const u8* blk, u32 sub, float* out8) {
+    float a = AS_FLOAT(ld_u32(blk));
+    GLOBAL const u8* q = blk + 4u + sub * 4u;
+    for (u32 i = 0; i < 4u; i++) {
+        out8[2u * i] = cd_bnb_lut(fp4, q[i] >> 4) * a;
+        out8[2u * i + 1u] = cd_bnb_lut(fp4, q[i] & 0x0Fu) * a;
+    }
+}
+DEVFN void dec_BNB_NF4_B64(GLOBAL const u8* blk, u32 sub, float* out8) { cd_bnb(0u, blk, sub, out8); }
+DEVFN void dec_BNB_NF4_B128(GLOBAL const u8* blk, u32 sub, float* out8) { cd_bnb(0u, blk, sub, out8); }
+DEVFN void dec_BNB_NF4_B256(GLOBAL const u8* blk, u32 sub, float* out8) { cd_bnb(0u, blk, sub, out8); }
+DEVFN void dec_BNB_FP4_B64(GLOBAL const u8* blk, u32 sub, float* out8) { cd_bnb(1u, blk, sub, out8); }
+DEVFN void dec_BNB_FP4_B128(GLOBAL const u8* blk, u32 sub, float* out8) { cd_bnb(1u, blk, sub, out8); }
+DEVFN void dec_BNB_FP4_B256(GLOBAL const u8* blk, u32 sub, float* out8) { cd_bnb(1u, blk, sub, out8); }
+
+DEVFN void dec_FP8_E4M3_B32(GLOBAL const u8* blk, u32 sub, float* out8) {
+    float s = AS_FLOAT(ld_u32(blk + 32));
+    for (u32 i = 0; i < 8u; i++) out8[i] = cd_e4m3(blk[sub * 8u + i]) * s;
+}
+
+// 4-bit affine groups: g/2 nibble bytes (element 2i in the LOW nibble of byte i), f16 scale, f16 bias/zero.
+// MLX: n * s + z (separate multiply and add). INT4: (n - z) * s.
+DEVFN void cd_mlx(GLOBAL const u8* blk, u32 half_, u32 sub, float* out8) {
+    float s = ld_f16(blk + half_), z = ld_f16(blk + half_ + 2u);
+    GLOBAL const u8* q = blk + sub * 4u;
+    for (u32 i = 0; i < 4u; i++) {
+        float t = (float)(q[i] & 0x0Fu) * s;
+        out8[2u * i] = t + z;
+        t = (float)(q[i] >> 4) * s;
+        out8[2u * i + 1u] = t + z;
+    }
+}
+DEVFN void cd_int4(GLOBAL const u8* blk, u32 half_, u32 sub, float* out8) {
+    float s = ld_f16(blk + half_), z = ld_f16(blk + half_ + 2u);
+    GLOBAL const u8* q = blk + sub * 4u;
+    for (u32 i = 0; i < 4u; i++) {
+        out8[2u * i] = ((float)(q[i] & 0x0Fu) - z) * s;
+        out8[2u * i + 1u] = ((float)(q[i] >> 4) - z) * s;
+    }
+}
+DEVFN void dec_MLX_AFFINE4_G32(GLOBAL const u8* blk, u32 sub, float* out8) { cd_mlx(blk, 16u, sub, out8); }
+DEVFN void dec_MLX_AFFINE4_G64(GLOBAL const u8* blk, u32 sub, float* out8) { cd_mlx(blk, 32u, sub, out8); }
+DEVFN void dec_MLX_AFFINE4_G128(GLOBAL const u8* blk, u32 sub, float* out8) { cd_mlx(blk, 64u, sub, out8); }
+DEVFN void dec_INT4_G32(GLOBAL const u8* blk, u32 sub, float* out8) { cd_int4(blk, 16u, sub, out8); }
+DEVFN void dec_INT4_G64(GLOBAL const u8* blk, u32 sub, float* out8) { cd_int4(blk, 32u, sub, out8); }
+DEVFN void dec_INT4_G128(GLOBAL const u8* blk, u32 sub, float* out8) { cd_int4(blk, 64u, sub, out8); }
