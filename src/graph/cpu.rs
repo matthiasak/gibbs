@@ -120,7 +120,9 @@ pub fn run(
             ValueKind::State {
                 name: state_name, ..
             } => {
-                if let Some(t) = state.get(state_name) {
+                if state.kv.as_ref().is_some_and(|kv| kv.has(state_name)) {
+                    // Paged KV: `CachedAttention` reads and writes its pages in place.
+                } else if let Some(t) = state.get(state_name) {
                     slots[i] = Some(t.clone());
                 } else {
                     let cached_attn_only = graph.nodes.iter().all(|n| {
@@ -841,113 +843,138 @@ pub fn run(
                 let vhd = *v_head_dim;
                 let h = *heads;
                 let kvh = *kv_heads;
-                let rep = h / kvh.max(1);
                 let nq = q.len() / (h * hd).max(1);
-
-                let (k_buf, v_buf, pos_offset) = if ins.len() >= 6 {
-                    let pos = operand_u32(&bound, &slots, ins, name, 5)
-                        .map(|p| p.first().copied().unwrap_or(0) as usize)
-                        .unwrap_or(0);
-                    let k_state = operand(&bound, &slots, ins, name, 3)?;
-                    let v_state = operand(&bound, &slots, ins, name, 4)?;
-                    let mut k_all = k_state.to_vec();
-                    let mut v_all = v_state.to_vec();
-                    // A `write: false` layer reads another layer's cache, which already holds this
-                    // position; its `k`/`v` operands are placeholders and must not overwrite it.
-                    if *write {
-                        let end_k = (pos * kvh * hd) + k_in.len();
-                        if end_k > k_all.len() {
-                            k_all.resize(end_k, 0.0);
-                        }
-                        k_all[end_k - k_in.len()..end_k].copy_from_slice(k_in);
-                        let end_v = (pos * kvh * vhd) + v_in.len();
-                        if end_v > v_all.len() {
-                            v_all.resize(end_v, 0.0);
-                        }
-                        v_all[end_v - v_in.len()..end_v].copy_from_slice(v_in);
-                    }
-                    (k_all, v_all, pos)
-                } else {
-                    (k_in.to_vec(), v_in.to_vec(), 0)
+                let shape = (h, kvh, hd, vhd, *scale, *soft_cap);
+                let state_name = |k: usize| match ins.get(k).map(|&v| &graph.value(v).kind) {
+                    Some(ValueKind::State { name, .. }) => Some(name.clone()),
+                    _ => None,
                 };
                 let vis = if ins.len() >= 7 {
                     Some(operand_u32(&bound, &slots, ins, name, 6)?)
                 } else {
                     None
                 };
-                let nk = (pos_offset + nq)
-                    .max(vis.map_or(0, |v| v.iter().copied().max().unwrap_or(0) as usize))
-                    .min(k_buf.len() / (kvh * hd).max(1));
-                let mut out = vec![0.0f32; nq * h * vhd];
-                for qi in 0..nq {
-                    let current_pos = pos_offset + qi;
-                    for head in 0..h {
-                        let kv_head = head / rep;
-                        let q_vec = &q[qi * h * hd + head * hd..][..hd];
-                        let mut scores = Vec::with_capacity(nk);
-                        for ki in 0..nk {
-                            if *causal && ki >= vis.map_or(current_pos + 1, |v| v[qi] as usize) {
-                                scores.push(f32::NEG_INFINITY);
-                                continue;
+                let pos = if ins.len() >= 6 {
+                    operand_u32(&bound, &slots, ins, name, 5)
+                        .map(|p| p.first().copied().unwrap_or(0) as usize)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let paged = match (state_name(3), state_name(4), &mut state.kv) {
+                    (Some(kn), Some(vn), Some(kv)) if kv.has(&kn) && kv.has(&vn) => {
+                        Some((kn, vn, kv))
+                    }
+                    _ => None,
+                };
+                if let Some((kn, vn, kv)) = paged {
+                    // Rows in place through the page tables (`crate::kv`): stored row `kv_base + i`.
+                    let write_rows = if *write { pos..pos + nq } else { pos..pos };
+                    kv.reserve(pos + nq, write_rows)
+                        .map_err(|e| format!("node '{name}': {e}"))?;
+                    let (class, _) = kv.pool().locate(&kn).expect("paged above");
+                    let kv_base = kv.stored(class, pos);
+                    let (kr, vr) = (
+                        kv.host_rows(&kn).expect("paged above"),
+                        kv.host_rows(&vn).expect("paged above"),
+                    );
+                    if kr.elem != 4 || vr.elem != 4 {
+                        return Err(format!("node '{name}': the CPU reads f32 KV pages only"));
+                    }
+                    if *write {
+                        for i in 0..nq {
+                            kv_row_f32(&kr, kv_base + i, kvh * hd)
+                                .copy_from_slice(&k_in[i * kvh * hd..][..kvh * hd]);
+                            kv_row_f32(&vr, kv_base + i, kvh * vhd)
+                                .copy_from_slice(&v_in[i * kvh * vhd..][..kvh * vhd]);
+                        }
+                    }
+                    let shift = pos - kv_base;
+                    let all = (kv_base + nq).max(vis.map_or(0, |v| {
+                        v.iter().copied().max().unwrap_or(0) as usize - shift
+                    }));
+                    let range = |qi: usize| {
+                        let cur = kv_base + qi;
+                        let hi = match (*causal, vis) {
+                            (true, Some(v)) => v[qi] as usize - shift,
+                            (true, None) => cur + 1,
+                            (false, _) => all,
+                        };
+                        (window.map_or(0, |w| (cur + 1).saturating_sub(w)), hi)
+                    };
+                    cached_attend(
+                        q,
+                        nq,
+                        shape,
+                        range,
+                        |t, g| &kv_row_f32(&kr, t, kvh * hd)[g * hd..][..hd],
+                        |t, g| &kv_row_f32(&vr, t, kvh * vhd)[g * vhd..][..vhd],
+                    )
+                } else {
+                    let (k_buf, v_buf, pos_offset) = if ins.len() >= 6 {
+                        let k_state = operand(&bound, &slots, ins, name, 3)?;
+                        let v_state = operand(&bound, &slots, ins, name, 4)?;
+                        let mut k_all = k_state.to_vec();
+                        let mut v_all = v_state.to_vec();
+                        // A `write: false` layer reads another layer's cache, which already holds
+                        // this position; its `k`/`v` operands are placeholders and must not
+                        // overwrite it.
+                        if *write {
+                            let end_k = (pos * kvh * hd) + k_in.len();
+                            if end_k > k_all.len() {
+                                k_all.resize(end_k, 0.0);
                             }
-                            if let Some(w) = window {
-                                if ki + *w <= current_pos {
-                                    scores.push(f32::NEG_INFINITY);
-                                    continue;
+                            k_all[end_k - k_in.len()..end_k].copy_from_slice(k_in);
+                            let end_v = (pos * kvh * vhd) + v_in.len();
+                            if end_v > v_all.len() {
+                                v_all.resize(end_v, 0.0);
+                            }
+                            v_all[end_v - v_in.len()..end_v].copy_from_slice(v_in);
+                        }
+                        (k_all, v_all, pos)
+                    } else {
+                        (k_in.to_vec(), v_in.to_vec(), 0)
+                    };
+                    let nk = (pos_offset + nq)
+                        .max(vis.map_or(0, |v| v.iter().copied().max().unwrap_or(0) as usize))
+                        .min(k_buf.len() / (kvh * hd).max(1));
+                    let range = |qi: usize| {
+                        let cur = pos_offset + qi;
+                        let hi = if *causal {
+                            vis.map_or(cur + 1, |v| v[qi] as usize)
+                        } else {
+                            nk
+                        };
+                        (window.map_or(0, |w| (cur + 1).saturating_sub(w)), hi.min(nk))
+                    };
+                    let out = cached_attend(
+                        q,
+                        nq,
+                        shape,
+                        range,
+                        |t, g| &k_buf[t * kvh * hd + g * hd..][..hd],
+                        |t, g| &v_buf[t * kvh * vhd + g * vhd..][..vhd],
+                    );
+                    if *write && ins.len() >= 6 {
+                        for (slot_id, buf) in [(ins[3], &k_buf), (ins[4], &v_buf)] {
+                            if let ValueKind::State { name: sname, .. } = &graph.value(slot_id).kind
+                            {
+                                state.insert(sname, Tensor::F32(buf.clone()));
+                                // Later readers of this state (an `Attention` over the whole
+                                // cache, `write: false` layers with their own value ids) see this
+                                // step's write.
+                                for (j, v) in graph.values.iter().enumerate() {
+                                    if matches!(&v.kind, ValueKind::State { name: n, .. } if n == sname)
+                                        && slots[j].is_some()
+                                    {
+                                        slots[j] = Some(Tensor::F32(buf.clone()));
+                                    }
                                 }
-                            }
-                            let k_vec = &k_buf[ki * kvh * hd + kv_head * hd..][..hd];
-                            let dot: f32 = q_vec.iter().zip(k_vec).map(|(&a, &b)| a * b).sum();
-                            let mut s = dot * scale;
-                            if let Some(cap) = soft_cap {
-                                s = cap * (s / cap).tanh();
-                            }
-                            scores.push(s);
-                        }
-                        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let mut sum_exp = 0.0f32;
-                        let mut weights = Vec::with_capacity(nk);
-                        for &s in &scores {
-                            if s == f32::NEG_INFINITY {
-                                weights.push(0.0f32);
-                            } else {
-                                let exp = (s - max_score).exp();
-                                sum_exp += exp;
-                                weights.push(exp);
-                            }
-                        }
-                        if sum_exp > 0.0 {
-                            weights.iter_mut().for_each(|w| *w /= sum_exp);
-                        }
-                        let out_slice = &mut out[qi * h * vhd + head * vhd..][..vhd];
-                        for (ki, &w) in weights.iter().enumerate() {
-                            if w == 0.0 {
-                                continue;
-                            }
-                            let v_vec = &v_buf[ki * kvh * vhd + kv_head * vhd..][..vhd];
-                            for (o, &val) in out_slice.iter_mut().zip(v_vec) {
-                                *o += w * val;
                             }
                         }
                     }
+                    out
                 }
-                if *write && ins.len() >= 6 {
-                    for (slot_id, buf) in [(ins[3], &k_buf), (ins[4], &v_buf)] {
-                        if let ValueKind::State { name: sname, .. } = &graph.value(slot_id).kind {
-                            state.insert(sname, Tensor::F32(buf.clone()));
-                            // Later readers of this state (an `Attention` over the whole cache,
-                            // `write: false` layers with their own value ids) see this step's write.
-                            for (j, v) in graph.values.iter().enumerate() {
-                                if matches!(&v.kind, ValueKind::State { name: n, .. } if n == sname)
-                                    && slots[j].is_some()
-                                {
-                                    slots[j] = Some(Tensor::F32(buf.clone()));
-                                }
-                            }
-                        }
-                    }
-                }
-                out
             }
             Op::CausalConv1dCached { kernel, dilation } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
@@ -1558,6 +1585,62 @@ pub fn run(
                 .ok_or_else(|| format!("output '{}' was never computed", graph.value(*v).name))
         })
         .collect()
+}
+
+/// Stored row `t` of a paged f32 KV state, `w` elements.
+fn kv_row_f32<'a>(rows: &crate::kv::HostRows, t: usize, w: usize) -> &'a mut [f32] {
+    // SAFETY: `t` is a reserved row of `w` f32 in a slab the view's pool keeps alive for the
+    // executing node; no other reference to the row is live while this one is.
+    unsafe { std::slice::from_raw_parts_mut(rows.row(t) as *mut f32, w) }
+}
+
+/// Attention of `nq` query rows over cached keys: row `qi` attends keys `range(qi)` (`[lo, hi)`);
+/// `key(t, g)` / `val(t, g)` are key / value row `t` of kv head `g`. A row with no visible key
+/// outputs zeros.
+fn cached_attend<'a>(
+    q: &[f32],
+    nq: usize,
+    (h, kvh, hd, vhd, scale, soft_cap): (usize, usize, usize, usize, f32, Option<f32>),
+    range: impl Fn(usize) -> (usize, usize),
+    key: impl Fn(usize, usize) -> &'a [f32],
+    val: impl Fn(usize, usize) -> &'a [f32],
+) -> Vec<f32> {
+    let rep = (h / kvh.max(1)).max(1);
+    let mut out = vec![0.0f32; nq * h * vhd];
+    let mut w = Vec::new();
+    for qi in 0..nq {
+        let (lo, hi) = range(qi);
+        let lo = lo.min(hi);
+        for head in 0..h {
+            let g = head / rep;
+            let qv = &q[qi * h * hd + head * hd..][..hd];
+            w.clear();
+            for t in lo..hi {
+                let mut s = qv.iter().zip(key(t, g)).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                if let Some(cap) = soft_cap {
+                    s = cap * (s / cap).tanh();
+                }
+                w.push(s);
+            }
+            let max = w.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in w.iter_mut() {
+                *s = (*s - max).exp();
+                sum += *s;
+            }
+            if sum <= 0.0 {
+                continue;
+            }
+            let o = &mut out[qi * h * vhd + head * vhd..][..vhd];
+            for (t, &e) in (lo..hi).zip(&w) {
+                let e = e / sum;
+                for (x, &v) in o.iter_mut().zip(val(t, g)) {
+                    *x += e * v;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `op(a)·op(b)` over the last two dims; leading batch dims broadcast numpy-style (right-aligned).
@@ -2544,8 +2627,138 @@ fn take0(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::kv::{KvPool, KvView};
+    use std::sync::Arc;
+
+    /// `CachedAttention` over `m` rows (4 query heads, 2 kv heads, causal, soft cap) with
+    /// `[4096, 2 * hd]` k/v states and a `[m]` positions input.
+    pub(crate) fn paged_attention_graph(m: usize, hd: usize, window: Option<usize>) -> Graph {
+        let (heads, kv_heads) = (4, 2);
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let mut g = Graph::new();
+        let q = g.input("q", vec![m, q_dim], DType::F32);
+        let k = g.input("k", vec![m, kv_dim], DType::F32);
+        let v = g.input("v", vec![m, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![4096, kv_dim], DType::F32, false);
+        let vs = g.state("v_state", vec![4096, kv_dim], DType::F32, false);
+        let pos = g.input("pos", vec![m], DType::U32);
+        let op = Op::CachedAttention {
+            heads,
+            kv_heads,
+            head_dim: hd,
+            v_head_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            causal: true,
+            window,
+            soft_cap: Some(30.0),
+            write: true,
+        };
+        let out = g.add("attn", op, &[q, k, v, ks, vs, pos], vec![m, q_dim], DType::F32);
+        g.output(out);
+        g
+    }
+
+    /// Runs `g` ([`paged_attention_graph`]) in `m`-row chunks from position 0 past 330 (six
+    /// pages; windowed rings wrap) on a `pool` view with reverse-ordered page tables
+    /// (`run(true, ..)`) and on contiguous state buffers (`run(false, ..)`); every chunk's output
+    /// and, for full attention, the stored rows (`read`) must agree within `tol`.
+    pub(crate) fn paged_vs_contiguous(
+        g: &Graph,
+        m: usize,
+        pool: &Arc<KvPool>,
+        tol: f32,
+        what: &str,
+        run: impl Fn(bool, &Graph, &mut StateStore, Vec<Tensor>) -> Vec<f32>,
+        read: impl Fn(&StateStore, &str) -> Vec<f32>,
+    ) {
+        // Pages released in order are reused last-first: a view allocating after this spacer
+        // released its pages gets descending page ids.
+        let mut spacer = KvView::new(pool.clone());
+        spacer.reserve(512, 0..512).unwrap();
+        drop(spacer);
+        let mut paged = StateStore::new();
+        paged.kv = Some(KvView::new(pool.clone()));
+        let mut plain = StateStore::new();
+        let dim = |i: usize| g.value(g.inputs[i]).shape[1];
+        let mut seed = 1u64;
+        let mut rand = |n: usize| {
+            (0..n)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect::<Vec<f32>>()
+        };
+        let mut pos = 0;
+        while pos < 330 {
+            let inputs = vec![
+                Tensor::F32(rand(m * dim(0))),
+                Tensor::F32(rand(m * dim(1))),
+                Tensor::F32(rand(m * dim(2))),
+                Tensor::U32((pos as u32..(pos + m) as u32).collect()),
+            ];
+            let want = run(false, g, &mut plain, inputs.clone());
+            let got = run(true, g, &mut paged, inputs);
+            let scale = want.iter().fold(1.0f32, |a, x| a.max(x.abs()));
+            let err = want
+                .iter()
+                .zip(&got)
+                .fold(0.0f32, |a, (x, y)| a.max((x - y).abs()))
+                / scale;
+            assert!(err <= tol, "{what}: rows {pos}..{}: rel err {err}", pos + m);
+            pos += m;
+        }
+        let kv = paged.kv.as_ref().unwrap();
+        for t in &kv.tables {
+            assert!(
+                t.windows(2).all(|w| w[0] > w[1]),
+                "{what}: page table {t:?} is not reverse-ordered"
+            );
+        }
+        if kv.pool().classes[0].window.is_none() {
+            for name in ["k_state", "v_state"] {
+                let rows = pos * dim(1);
+                assert_eq!(read(&paged, name), read(&plain, name)[..rows], "{what}: {name}");
+            }
+        }
+    }
+
+    /// Paged KV through reverse-ordered page tables equals the contiguous cache: m ∈ {1, 7, 64,
+    /// 130}, head_dim ∈ {64, 128, 256}, window ∈ {None, 100} (CPU pages are f32).
+    #[test]
+    fn paged_attention_matches_contiguous() {
+        for hd in [64, 128, 256] {
+            for window in [None, Some(100)] {
+                for m in [1, 7, 64, 130] {
+                    let g = paged_attention_graph(m, hd, window);
+                    let pool = KvPool::host(&crate::graph::paged_states(&g));
+                    paged_vs_contiguous(
+                        &g,
+                        m,
+                        &pool,
+                        1e-6,
+                        &format!("hd {hd} window {window:?} m {m}"),
+                        |_, g, st, inputs| {
+                            run(g, &Weights::new(), st, inputs)
+                                .unwrap()
+                                .remove(0)
+                                .into_f32()
+                                .unwrap()
+                        },
+                        |st, name| match &st.kv {
+                            Some(kv) => kv.gather(name).unwrap(),
+                            None => st.get(name).unwrap().as_f32().unwrap().to_vec(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_rel_pos_bias_and_state_reorder() {
         let mut g = Graph::new();

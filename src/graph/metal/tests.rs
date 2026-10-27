@@ -4561,3 +4561,51 @@ fn multi_row_recurrent_ops_with_state_match_cpu() {
         assert!(rel_err(&states[0].0, &states[0].1) < 1e-6, "conv state");
     }
 }
+
+/// Paged KV (`crate::kv`) through reverse-ordered page tables equals the contiguous state
+/// buffers: m ∈ {1, 7, 64, 130} (decode GQA, flash and MPP kernels), head_dim ∈ {64, 128, 256},
+/// window ∈ {None, 100} (a wrapping ring), f32 and f16 KV.
+#[test]
+fn paged_attention_matches_contiguous() {
+    use crate::graph::cpu::tests::{paged_attention_graph, paged_vs_contiguous};
+    for kv_f16 in [false, true] {
+        for hd in [64, 128, 256] {
+            for window in [None, Some(100)] {
+                for m in [1, 7, 64, 130] {
+                    let g = paged_attention_graph(m, hd, window);
+                    let mut plain = Session::new(rt(), &Weights::new()).unwrap();
+                    let mut paged = Session::new(rt(), &Weights::new()).unwrap();
+                    plain.set_kv_f16(kv_f16);
+                    paged.set_kv_f16(kv_f16);
+                    let pool = paged
+                        .new_kv_pool(&crate::graph::paged_states(&g))
+                        .unwrap();
+                    let (plan_plain, plan_paged) =
+                        (plain.prepare_plan(&g).unwrap(), paged.prepare_plan(&g).unwrap());
+                    paged_vs_contiguous(
+                        &g,
+                        m,
+                        &pool,
+                        // Paged MPP key tiles start on a multiple of 32 (contiguous ones at the
+                        // block's first key): f16 rounds the tile probabilities differently.
+                        if kv_f16 { 1e-4 } else { 1e-5 },
+                        &format!("f16 {kv_f16} hd {hd} window {window:?} m {m}"),
+                        |p, g, st, inputs| {
+                            let (s, plan) = if p {
+                                (&paged, &plan_paged)
+                            } else {
+                                (&plain, &plan_plain)
+                            };
+                            s.run_prepared(g, plan, Some(st), inputs)
+                                .unwrap()
+                                .remove(0)
+                                .into_f32()
+                                .unwrap()
+                        },
+                        |st, name| st.read_metal(name).unwrap(),
+                    );
+                }
+            }
+        }
+    }
+}

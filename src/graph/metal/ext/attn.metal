@@ -317,7 +317,8 @@ static inline void flash_attn_mm_f32(device const float* q, device const float* 
                                      threadgroup float* tg_corr,
                                      threadgroup uint* tg_row_lo, threadgroup uint* tg_row_hi,
                                      threadgroup uint* tg_bounds,
-                                     uint2 tgp, uint sg, uint lane) {
+                                     uint2 tgp, uint sg, uint lane,
+                                     uint paged = 0, uint ring = 0) {
     constexpr uint C = 32;
     constexpr uint ROWS_PER_SG = QB / 4;
     const uint hd = head_dim;
@@ -342,7 +343,9 @@ static inline void flash_attn_mm_f32(device const float* q, device const float* 
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint tg_lo = tg_bounds[0];
+    // Paged K/V (`kv_row`): key tiles start on a multiple of C, so none straddles a 64-row page
+    // (keys below a row's `lo` are masked).
+    const uint tg_lo = paged ? (tg_bounds[0] & ~(C - 1)) : tg_bounds[0];
     const uint tg_hi = tg_bounds[1];
 
     float m_row[ROWS_PER_SG];
@@ -379,7 +382,7 @@ static inline void flash_attn_mm_f32(device const float* q, device const float* 
 
     for (uint t0 = tg_lo; t0 < tg_hi; t0 += C) {
         const uint n_keys = min(C, tg_hi - t0);
-        auto tk_v = tensor((device float*)(k + (ulong)t0 * kv_stride + kv_head_off),
+        auto tk_v = tensor((device float*)(kv_row(k, paged, ring, t0, kv_stride) + kv_head_off),
                            dextents<int32_t, 2>(int(hd), int(n_keys)),
                            array<int, 2>({1, int(kv_stride)}));
         auto cs = op_qk.template get_destination_cooperative_tensor<decltype(tq_v), decltype(tk_v), float>();
@@ -448,13 +451,13 @@ static inline void flash_attn_mm_f32(device const float* q, device const float* 
         }
         auto tp_v = tensor(ts, dextents<int32_t, 2>(int(n_keys), int(q_ext)), array<int, 2>({1, int(C)}));
         const uint hd0 = min(PV_N, hd);
-        auto tv_v0 = tensor((device float*)(v + (ulong)t0 * kv_stride + kv_head_off),
+        auto tv_v0 = tensor((device float*)(kv_row(v, paged, ring, t0, kv_stride) + kv_head_off),
                             dextents<int32_t, 2>(int(hd0), int(n_keys)),
                             array<int, 2>({1, int(kv_stride)}));
         op_pv.run(tp_v, tv_v0, co0);
         if (PV_TILES > 1 && hd > PV_N) {
             const uint hd1 = min(PV_N, hd - PV_N);
-            auto tv_v1 = tensor((device float*)(v + (ulong)t0 * kv_stride + kv_head_off + PV_N),
+            auto tv_v1 = tensor((device float*)(kv_row(v, paged, ring, t0, kv_stride) + kv_head_off + PV_N),
                                 dextents<int32_t, 2>(int(hd1), int(n_keys)),
                                 array<int, 2>({1, int(kv_stride)}));
             op_pv.run(tp_v, tv_v1, co1);
@@ -500,7 +503,8 @@ static inline void flash_attn_mm_f16(device const float* q, device const half* k
                                      threadgroup float* tg_corr,
                                      threadgroup uint* tg_row_lo, threadgroup uint* tg_row_hi,
                                      threadgroup uint* tg_bounds,
-                                     uint2 tgp, uint sg, uint lane) {
+                                     uint2 tgp, uint sg, uint lane,
+                                     uint paged, uint ring) {
     constexpr uint C = 32;
     constexpr uint ROWS_PER_SG = QB / 4;
     const uint hd = head_dim;
@@ -534,7 +538,7 @@ static inline void flash_attn_mm_f16(device const float* q, device const half* k
             : half(0.0h);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint tg_lo = tg_bounds[0];
+    const uint tg_lo = paged ? (tg_bounds[0] & ~(C - 1)) : tg_bounds[0];
     const uint tg_hi = tg_bounds[1];
 
     float m_row[ROWS_PER_SG];
@@ -569,7 +573,7 @@ static inline void flash_attn_mm_f16(device const float* q, device const half* k
 
     for (uint t0 = tg_lo; t0 < tg_hi; t0 += C) {
         const uint n_keys = min(C, tg_hi - t0);
-        auto tk_v = tensor((device half*)(k + (ulong)t0 * kv_stride + kv_head_off),
+        auto tk_v = tensor((device half*)(kv_row(k, paged, ring, t0, kv_stride) + kv_head_off),
                            dextents<int32_t, 2>(int(hd), int(n_keys)),
                            array<int, 2>({1, int(kv_stride)}));
         auto cs = op_qk.template get_destination_cooperative_tensor<decltype(tq_v), decltype(tk_v), float>();
@@ -631,13 +635,13 @@ static inline void flash_attn_mm_f16(device const float* q, device const half* k
         }
         auto tp_v = tensor(tp, dextents<int32_t, 2>(int(n_keys), int(q_ext)), array<int, 2>({1, int(C)}));
         const uint hd0 = min(PV_N, hd);
-        auto tv_v0 = tensor((device half*)(v + (ulong)t0 * kv_stride + kv_head_off),
+        auto tv_v0 = tensor((device half*)(kv_row(v, paged, ring, t0, kv_stride) + kv_head_off),
                             dextents<int32_t, 2>(int(hd0), int(n_keys)),
                             array<int, 2>({1, int(kv_stride)}));
         op_pv.run(tp_v, tv_v0, co0);
         if (PV_TILES > 1 && hd > PV_N) {
             const uint hd1 = min(PV_N, hd - PV_N);
-            auto tv_v1 = tensor((device half*)(v + (ulong)t0 * kv_stride + kv_head_off + PV_N),
+            auto tv_v1 = tensor((device half*)(kv_row(v, paged, ring, t0, kv_stride) + kv_head_off + PV_N),
                                 dextents<int32_t, 2>(int(hd1), int(n_keys)),
                                 array<int, 2>({1, int(kv_stride)}));
             op_pv.run(tp_v, tv_v1, co1);
@@ -717,8 +721,8 @@ kernel void NAME(device const float* q [[buffer(0)]],                           
     uint lo = UINT_MAX, hi = 0;                                                                  \
     const uint qi = tgp.x * QB + lane;                                                           \
     if (lane < QB && qi < p.m) {                                                                 \
-        const uint cur_pos = p.start_pos + qi;                                                   \
-        hi = p.has_vis ? vis[qi] : (cur_pos + 1);                                                \
+        const uint cur_pos = p.kv_base + qi;                                                     \
+        hi = p.has_vis ? vis[qi] - (p.start_pos - p.kv_base) : (cur_pos + 1);                    \
         lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;            \
         if (lo >= hi) { lo = UINT_MAX; hi = 0; }                                                 \
     }                                                                                            \
@@ -727,7 +731,8 @@ kernel void NAME(device const float* q [[buffer(0)]],                           
     flash_attn_mm_f32<HD, QB>(q, kc, vc, nullptr, out, p.m, 0, p.n_heads, kv_heads,              \
                               p.head_dim, q_stride, (ulong)p.stride, p.scale,                    \
                               p.softcap > 0.0f, p.softcap, 0, lo, hi,                            \
-                              ts, tg_corr, tg_row_lo, tg_row_hi, tg_bounds, tgp, sg, lane);      \
+                              ts, tg_corr, tg_row_lo, tg_row_hi, tg_bounds, tgp, sg, lane,       \
+                              p.paged, p.ring_pages);                                            \
 }
 
 #define FLASH_ATTN_CACHED_MM_F16_KERNEL(NAME, HD, QB)                                            \
@@ -750,8 +755,8 @@ kernel void NAME(device const float* q [[buffer(0)]],                           
     uint lo = UINT_MAX, hi = 0;                                                                  \
     const uint qi = tgp.x * QB + lane;                                                           \
     if (lane < QB && qi < p.m) {                                                                 \
-        const uint cur_pos = p.start_pos + qi;                                                   \
-        hi = p.has_vis ? vis[qi] : (cur_pos + 1);                                                \
+        const uint cur_pos = p.kv_base + qi;                                                     \
+        hi = p.has_vis ? vis[qi] - (p.start_pos - p.kv_base) : (cur_pos + 1);                    \
         lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;            \
         if (lo >= hi) { lo = UINT_MAX; hi = 0; }                                                 \
     }                                                                                            \
@@ -761,7 +766,7 @@ kernel void NAME(device const float* q [[buffer(0)]],                           
                               q_stride, (ulong)p.stride, p.scale,                                \
                               p.softcap > 0.0f, p.softcap, lo, hi,                               \
                               tq, ts, tp, tg_corr, tg_row_lo, tg_row_hi, tg_bounds,              \
-                              tgp, sg, lane);                                                    \
+                              tgp, sg, lane, p.paged, p.ring_pages);                             \
 }
 
 FLASH_ATTN_MM_KERNEL(32, 32)
