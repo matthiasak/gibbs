@@ -434,7 +434,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Device::Rocm => gibbs_engine::graph::rocm::device_name(),
             Device::Xla => gibbs_engine::graph::xla::device_name(),
             Device::IntelXpu => gibbs_engine::graph::intel_xpu::device_name(),
-            Device::Extropic => gibbs_engine::graph::extropic::device_name(),
         },
     };
     // GPU-only tripwire: from here on, any CPU compute outside `--backend cpu` panics.

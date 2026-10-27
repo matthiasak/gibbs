@@ -100,22 +100,6 @@ impl HardwareProfile {
                 compute_capability: None,
                 max_systolic_tile: Some([8, 16, 16, 1]),
             },
-            Device::Extropic => Self {
-                device: Device::Extropic,
-                name: crate::graph::extropic::device_name(),
-                memory_bandwidth_gbps: 512.0,
-                threadgroup_memory_bytes: 32 * 1024,
-                max_threads_per_threadgroup: 256,
-                simd_width: 32,
-                m_tile: 1,
-                n_tile: 32,
-                k_tile: 32,
-                vector_width_bits: 128,
-                compute_units: 16,
-                has_unified_memory: true,
-                compute_capability: None,
-                max_systolic_tile: None,
-            },
         }
     }
 

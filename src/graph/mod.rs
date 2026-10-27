@@ -13,7 +13,6 @@ pub mod codegen;
 pub mod cpu;
 pub mod cuda;
 pub mod egraph;
-pub mod extropic;
 pub mod intel_xpu;
 #[cfg(target_os = "macos")]
 pub mod metal;
@@ -761,8 +760,10 @@ pub fn paged_states(graph: &Graph) -> Vec<PagedState> {
         Some(&w) if ws.iter().all(|&x| x == w) => w,
         _ => None,
     };
-    let mut window: BTreeMap<&str, Option<usize>> =
-        found.iter().map(|(n, (_, ws))| (*n, window_of(ws))).collect();
+    let mut window: BTreeMap<&str, Option<usize>> = found
+        .iter()
+        .map(|(n, (_, ws))| (*n, window_of(ws)))
+        .collect();
     // A node's two states are read by one kernel: both paged with one window, or neither.
     loop {
         let mut changed = false;

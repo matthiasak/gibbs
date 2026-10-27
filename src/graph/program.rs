@@ -1,9 +1,9 @@
 //! Execution of placed computational graphs: one device per program.
 
+use crate::graph::passes::fusion::FuseWeights;
 use crate::graph::placement::{
     device_supports_op, place_graph, placement_rows, PlacementPlan, PlacementRow,
 };
-use crate::graph::passes::fusion::FuseWeights;
 use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, ValueId, Weights};
 use crate::hardware::{available_devices, Device, PlacementMode};
 
@@ -29,10 +29,6 @@ pub enum CompiledSegment {
         graph: Graph,
         session: crate::graph::xla::XlaSession,
     },
-    Extropic {
-        graph: Graph,
-        session: crate::graph::extropic::ExtropicSession,
-    },
 }
 
 impl CompiledSegment {
@@ -43,16 +39,14 @@ impl CompiledSegment {
             Self::Metal { .. } => Device::Metal,
             Self::Portable { device, .. } => *device,
             Self::Xla { .. } => Device::Xla,
-            Self::Extropic { .. } => Device::Extropic,
         }
     }
 
     pub fn graph(&self) -> &Graph {
         match self {
-            Self::Cpu { graph, .. }
-            | Self::Portable { graph, .. }
-            | Self::Xla { graph, .. }
-            | Self::Extropic { graph, .. } => graph,
+            Self::Cpu { graph, .. } | Self::Portable { graph, .. } | Self::Xla { graph, .. } => {
+                graph
+            }
             #[cfg(target_os = "macos")]
             Self::Metal { graph, .. } => graph,
         }
@@ -266,10 +260,6 @@ impl GraphProgram {
                 let session = crate::graph::xla::XlaSession::compile(&graph, weights)?;
                 CompiledSegment::Xla { graph, session }
             }
-            Device::Extropic => {
-                let session = crate::graph::extropic::ExtropicSession::compile(&graph, weights)?;
-                CompiledSegment::Extropic { graph, session }
-            }
             _ => CompiledSegment::Cpu { graph, weights },
         };
 
@@ -360,7 +350,6 @@ impl GraphProgram {
             Device::Rocm => crate::graph::rocm::device_name(),
             Device::Xla => crate::graph::xla::device_name(),
             Device::IntelXpu => crate::graph::intel_xpu::device_name(),
-            Device::Extropic => crate::graph::extropic::device_name(),
             other => format!("{other}"),
         }
     }
@@ -458,12 +447,12 @@ impl GraphProgram {
                 session.run_reshaped(graph, &mut self.state, inputs)
             }
             CompiledSegment::Xla { session, .. } => session.run(graph, &mut self.state, inputs),
-            CompiledSegment::Extropic { session, .. } => {
-                session.run(graph, &mut self.state, inputs)
-            }
             #[cfg(target_os = "macos")]
             CompiledSegment::Metal { session, .. } => {
-                let plan = r.plan.as_ref().expect("a Metal program plans its instances");
+                let plan = r
+                    .plan
+                    .as_ref()
+                    .expect("a Metal program plans its instances");
                 session.run_prepared(graph, plan, Some(&mut self.state), inputs)
             }
         }
@@ -485,9 +474,6 @@ impl GraphProgram {
             }
             CompiledSegment::Portable { session, .. } => session.run(&mut self.state, inputs),
             CompiledSegment::Xla { graph, session } => session.run(graph, &mut self.state, inputs),
-            CompiledSegment::Extropic { graph, session } => {
-                session.run(graph, &mut self.state, inputs)
-            }
             #[cfg(target_os = "macos")]
             CompiledSegment::Metal {
                 graph,
@@ -1964,7 +1950,11 @@ mod tests {
                 }
                 if gpu.kv_pool.is_some() {
                     let kv = gpu.state.kv.as_ref().expect("paged state attached");
-                    assert!(kv.tables.iter().any(|t| !t.is_empty()), "{}: no KV pages", case.name);
+                    assert!(
+                        kv.tables.iter().any(|t| !t.is_empty()),
+                        "{}: no KV pages",
+                        case.name
+                    );
                 }
                 for n in &case.graph.nodes {
                     let e = worst.entry(n.op.name().to_string()).or_default();
