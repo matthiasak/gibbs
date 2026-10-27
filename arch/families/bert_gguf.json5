@@ -57,15 +57,11 @@
         {use: "layer_norm", args: {w: "'embeddings.LayerNorm'"}, in: ["x"], out: "x", name: "emb.ln"},
         {repeat: "i", count: "layers", body: [
           {let: {p: "fmt('encoder.layer.{i}')"}},
-          {use: "attn_full", in: ["x"], out: "y", name: "l{i}.attn", args: {causal: false,
+          {use: "post_ln_encoder_layer", in: ["x"], out: "x", name: "l{i}", args: {
             wq: "fmt('{p}.attention.self.query')", wk: "fmt('{p}.attention.self.key')",
-            wv: "fmt('{p}.attention.self.value')", wo: "fmt('{p}.attention.output.dense')"}},
-          {use: "residual", in: ["y", "x"], out: "x", name: "l{i}.res1"},
-          {use: "layer_norm", args: {w: "fmt('{p}.attention.output.LayerNorm')"}, in: ["x"], out: "x", name: "l{i}.ln1"},
-          {use: "mlp_plain", in: ["x"], out: "m", name: "l{i}.mlp", args: {act: "'GeluErf'",
-            up: "fmt('{p}.intermediate.dense')", down: "fmt('{p}.output.dense')"}},
-          {use: "residual", in: ["m", "x"], out: "x", name: "l{i}.res2"},
-          {use: "layer_norm", args: {w: "fmt('{p}.output.LayerNorm')"}, in: ["x"], out: "x", name: "l{i}.ln2"},
+            wv: "fmt('{p}.attention.self.value')", wo: "fmt('{p}.attention.output.dense')",
+            ln1: "fmt('{p}.attention.output.LayerNorm')", up: "fmt('{p}.intermediate.dense')",
+            down: "fmt('{p}.output.dense')", ln2: "fmt('{p}.output.LayerNorm')"}},
           {tap: "layer.{i}", in: "x"},
         ]},
         {block: [

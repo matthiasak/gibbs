@@ -10,25 +10,14 @@
     single_file_tensors: [["cond_stage_model.transformer.text_model.final_layer_norm.weight", "model.diffusion_model.input_blocks.0.0.weight"]],
     single_file_ext: ["safetensors"],
   },
+  "use_lib+": ["ldm"],
   components: {
     text_encoder: {
       family: "clip_text",
       dir: "text_encoder",
       strip: ["cond_stage_model.transformer."],
       ignore: ["model.diffusion_model.*", "first_stage_model.*"],
-      patch: {"use_lib+": ["ldm"]},
-    },
-    unet: {
-      family: "sd",
-      dir: "unet",
-      ignore: ["first_stage_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
-      patch: {"use_lib+": ["ldm"]},
-    },
-    vae: {
-      family: "sd_vae",
-      dir: "vae",
-      ignore: ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
-      patch: {"use_lib+": ["ldm"]},
+      patch: {use_lib: ["transformer", "ldm"]},
     },
   },
   runtime: {

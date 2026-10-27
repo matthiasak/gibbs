@@ -13,16 +13,16 @@
   config: {
     rope_alpha: "first(rope.alpha, first(gguf['rope.scaling.alpha'], 0) > 0 ? gguf['rope.scaling.alpha'] : null, 1)",
     rope_kind: "rope_alpha != 1 ? 'ntk_alpha' : 'default'",
+    // Dynamic (alpha) RoPE is `rope_kind` 'ntk_alpha', so qwen3's rope-type check passes it.
+    rope_type: "contains(['default', 'dynamic'], first(rope.rope_type, rope.type, 'default')) ? 'default' : first(rope.rope_type, rope.type)",
     qk_norm: "'after'",
     q_norm_name: "'query_layernorm'",
     k_norm_name: "'key_layernorm'",
   },
-  checks: [
+  // Appended to qwen3's checks.
+  "checks+": [
     {expr: "first(rope.rope_type, rope.type, 'default') == 'dynamic' && rope.alpha == null",
      error: "HunYuan dynamic RoPE without `alpha` is not implemented"},
-    {expr: "!contains(['default', 'dynamic'], first(rope.rope_type, rope.type, 'default'))",
-     error: "rope type '{first(rope.rope_type, rope.type)}' is not implemented"},
-    {expr: "first(gguf['rope.scaling.type'], 'none') != 'none'", error: "{gguf_arch} RoPE scaling '{gguf['rope.scaling.type']}' is not implemented"},
     {expr: "tc.use_cla == true", error: "HunYuan `use_cla: true` is not implemented"},
     {expr: "tc.mlp_bias == true", error: "HunYuan `mlp_bias: true` is not implemented"},
     {expr: "tc.use_qk_norm == false", error: "HunYuan `use_qk_norm: false` is not implemented"},

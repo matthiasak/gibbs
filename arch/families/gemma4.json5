@@ -15,6 +15,7 @@
     gguf_arch: ["gemma4"],
   },
   pipeline: "causal_lm",
+  use_lib: ["transformer"],
   config: {
     tc: "first(cfg.text_config, cfg)",
     gguf_arch: "first(gguf['general.architecture'], '')",
@@ -265,8 +266,6 @@
            {glob: "model.vision_tower.*", when: "has_vision && !vision_on"},
            {glob: "model.embed_vision.*", when: "has_vision && !vision_on"}],
   macros: {
-    // `[x]` unchanged under another name.
-    alias: {params: ["x"], body: [], returns: "x"},
     // ClippableLinear `p` (stem): `{p}.linear.weight` between the optional scalar clamps
     // `{p}.input_min` / `input_max` / `output_min` / `output_max` (a missing bound is the f32 limit).
     clipped_linear: {params: ["x"], body: [
@@ -391,15 +390,15 @@
                  rope: "sl ? 'rope.sliding' : 'rope.full'", ones: "sl ? 'ones.sliding' : 'ones.full'",
                  win: "sl ? window : null"}},
           {use: "alias", in: ["i:visible_end"], out: "ve.{i}", when: "sl && rows > 1"},
-          {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{p}.input_layernorm.weight"], out: "a", name: "{n}.input_ln"},
+          {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "a", name: "{n}.input_ln"},
           {op: "Linear", in: ["a", "w:{p}.self_attn.q_proj.weight"], out: "q", name: "{n}.attn.q"},
-          {op: "RmsNorm", args: {eps: "eps"}, in: ["q", "w:{p}.self_attn.q_norm.weight"], out: "q", name: "{n}.attn.q_norm"},
+          {use: "rms_norm", args: {w: "fmt('{p}.self_attn.q_norm')"}, in: ["q"], out: "q", name: "{n}.attn.q_norm"},
           // Pairs (i, i + head_dim/2) over the whole head; proportional rope is the zero tail of
           // inv_freq (identity rotations), not a shorter rotary_dim.
           {op: "Rope", args: {head_dim: "hd", rotary_dim: "hd", variant: "HalfSplit", mscale: 1}, in: ["q", "i:positions", "c:{rope}"], out: "q", name: "{n}.attn.q_rope"},
           {block: [
             {op: "Linear", in: ["a", "w:{p}.self_attn.k_proj.weight"], out: "k", name: "{n}.attn.k"},
-            {op: "RmsNorm", args: {eps: "eps"}, in: ["k", "w:{p}.self_attn.k_norm.weight"], out: "kn", name: "{n}.attn.k_norm"},
+            {use: "rms_norm", args: {w: "fmt('{p}.self_attn.k_norm')"}, in: ["k"], out: "kn", name: "{n}.attn.k_norm"},
             {op: "Rope", args: {head_dim: "hd", rotary_dim: "hd", variant: "HalfSplit", mscale: 1}, in: ["kn", "i:positions", "c:{rope}"], out: "kn", name: "{n}.attn.k_rope"},
             {op: "Linear", in: ["a", "w:{p}.self_attn.v_proj.weight"], out: "v", name: "{n}.attn.v", when: "has(fmt('{p}.self_attn.v_proj.weight'))"},
             // attention_k_eq_v: the value is the raw key projection.
@@ -417,16 +416,12 @@
              in: ["q", "q", "q", "s:kv.{src}.k", "s:kv.{src}.v", "i:positions", "v?:ve.{i}"], out: "att", name: "{n}.attn"},
           ], when: "i >= first_shared"},
           {op: "Linear", in: ["att", "w:{p}.self_attn.o_proj.weight"], out: "o", name: "{n}.attn.o"},
-          {op: "RmsNorm", args: {eps: "eps"}, in: ["o", "w:{p}.post_attention_layernorm.weight"], out: "o", name: "{n}.post_attn_ln"},
-          {op: "Binary", args: {kind: "Add"}, in: ["x", "o"], out: "x", name: "{n}.residual_attn"},
-          {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{p}.pre_feedforward_layernorm.weight"], out: "f", name: "{n}.pre_ff_ln"},
-          {op: "Linear", in: ["f", "w:{p}.mlp.gate_proj.weight"], out: "g", name: "{n}.mlp.gate"},
-          {op: "Linear", in: ["f", "w:{p}.mlp.up_proj.weight"], out: "u", name: "{n}.mlp.up"},
-          {op: "GeGlu", in: ["g", "u"], out: "g", name: "{n}.mlp.act"},
-          {op: "Linear", in: ["g", "w:{p}.mlp.down_proj.weight"], out: "d", name: "{n}.mlp.down"},
+          {use: "sandwich", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x", "o"], out: "x", name: "{n}.post_attn"},
+          {use: "rms_norm", args: {w: "fmt('{p}.pre_feedforward_layernorm')"}, in: ["x"], out: "f", name: "{n}.pre_ff_ln"},
+          {use: "mlp_glu", in: ["f"], out: "d", name: "{n}.mlp", args: {act: "'GeluTanh'",
+            gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
           {use: "gemma4_moe", args: {p: "p"}, in: ["x", "d"], out: "d", name: "{n}.moe", when: "moe"},
-          {op: "RmsNorm", args: {eps: "eps"}, in: ["d", "w:{p}.post_feedforward_layernorm.weight"], out: "d", name: "{n}.post_ff_ln"},
-          {op: "Binary", args: {kind: "Add"}, in: ["x", "d"], out: "x", name: "{n}.residual_ff"},
+          {use: "sandwich", args: {w: "fmt('{p}.post_feedforward_layernorm')"}, in: ["x", "d"], out: "x", name: "{n}.post_ff"},
           {block: [
             {op: "Slice", args: {axis: 1, start: "i * ple_dim", end: "(i + 1) * ple_dim"}, in: ["ple"], out: "pl", name: "{n}.ple.slice"},
             {op: "Linear", in: ["x", "w:{p}.per_layer_input_gate.weight"], out: "pg", name: "{n}.ple.gate"},

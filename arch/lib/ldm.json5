@@ -1,4 +1,8 @@
-// Shared LDM single-file / GGUF training and scheduler buffers ignored by component specs.
+// LDM single-file / GGUF checkpoints. `ignore`: training and scheduler buffers every component
+// spec over the whole file skips. `components`: the UNet and VAE references the single-file
+// families (`"use_lib+": ["ldm"]`) share, each ignoring the other parts' prefixes.
+// A nested `k+` key is resolved when its family merges, so component patches list the referenced
+// family's whole `use_lib` (`"use_lib+"` there would replace it).
 {
   ignore: [
     "model_ema.*",
@@ -9,4 +13,18 @@
     "sqrt_*",
     "logvar",
   ],
+  components: {
+    unet: {
+      family: "sd",
+      dir: "unet",
+      ignore: ["first_stage_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
+      patch: {use_lib: ["unet", "ldm"]},
+    },
+    vae: {
+      family: "sd_vae",
+      dir: "vae",
+      ignore: ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
+      patch: {use_lib: ["vae", "ldm"]},
+    },
+  },
 }
