@@ -16,14 +16,13 @@
 pub mod mil;
 pub mod runtime;
 
-pub use mil::{lower, rope_table, supports_op, IoBinding, IoLayout, IoSource};
+pub use mil::{check, lower, rope_table, supports_op, IoBinding, IoLayout, IoSource};
 pub use runtime::{programs_compiled, AneProgram, EvalEntry, Surface, ANE_MAX_PROGRAMS};
 
 use crate::graph::{DType, Graph, Op, Tensor, Weights};
 use crate::hardware::QuantFormat;
 use objc::runtime::{BOOL, NO};
 use objc::{msg_send, sel, sel_impl};
-use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
 /// The probed ANE: device facts, the eval entry point that worked, and per weight form either
@@ -94,15 +93,14 @@ pub fn run(
                 rope_table(&node.op, input(node.inputs[1])?.as_u32()?, &inv, b.spatial)?
             }
         };
-        prog.input(i).write(|d| b.pack(&data, d));
+        prog.input(i).write(|d| b.pack(&data, d))?;
     }
     prog.eval()?;
-    Ok(io
-        .outputs
+    io.outputs
         .iter()
         .enumerate()
-        .map(|(i, b)| Tensor::F32(prog.output(i).read(|s| b.unpack(s))))
-        .collect())
+        .map(|(i, b)| Ok(Tensor::F32(prog.output(i).read(|s| b.unpack(s))?)))
+        .collect()
 }
 
 /// Relative RMS error of `got` against `want`.
@@ -179,17 +177,45 @@ fn probe_forms() -> [(QuantFormat, AneInfo); 3] {
     ]
 }
 
+/// FNV-1a 64 over `parts` (each length-prefixed): a hash stable across builds and toolchains.
+fn fnv64(parts: &[&[u8]]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for p in parts {
+        for &b in (p.len() as u64).to_le_bytes().iter().chain(p.iter()) {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// `(hasANE, cores, architecture)` from `_ANEDeviceInfo` (no compile).
+fn device_info() -> Result<(bool, u32, String), String> {
+    runtime::framework()?;
+    objc::rc::autoreleasepool(|| unsafe {
+        let di = runtime::class("_ANEDeviceInfo")?;
+        let has: BOOL = msg_send![di, hasANE];
+        let cores: u32 = msg_send![di, numANECores];
+        let arch: runtime::Id = msg_send![di, aneArchitectureType];
+        Ok((has != NO, cores, runtime::string(arch)))
+    })
+}
+
+/// The probe result from `<cache>/host/ane-<os build>-<key>.json`, keyed by the chip, the ANE
+/// architecture and the probe programs, or measured and stored there.
 fn probe_cached() -> Result<AneInfo, String> {
-    let mut h = std::hash::DefaultHasher::new();
+    let (_, _, arch) = device_info()?;
+    let os = crate::hardware::sysctl::string(c"kern.osversion").unwrap_or_default();
+    let chip = crate::hardware::sysctl::string(c"machdep.cpu.brand_string").unwrap_or_default();
+    let mut parts: Vec<Vec<u8>> = vec![chip.into_bytes(), arch.into_bytes()];
     for (f, info) in probe_forms() {
         let (g, w, _, _) = probe_case(f);
         let (text, blob, _) = lower(&g, &w, &info)?;
-        (text, blob).hash(&mut h);
+        parts.extend([text.into_bytes(), blob]);
     }
-    let os = crate::hardware::sysctl::string(c"kern.osversion").unwrap_or_default();
+    let key = fnv64(&parts.iter().map(Vec::as_slice).collect::<Vec<_>>());
     let path = crate::hardware::default_cache_dir()?
         .join("host")
-        .join(format!("ane-{os}-{:016x}.json", h.finish()));
+        .join(format!("ane-{os}-{key:016x}.json"));
     if let Some(info) = std::fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice::<AneInfo>(&b).ok())
@@ -209,15 +235,8 @@ fn probe_cached() -> Result<AneInfo, String> {
 /// Reads the device facts, then compiles and evaluates the probe in its three weight forms; fp16
 /// picks the first eval entry point that works.
 fn measure() -> Result<AneInfo, String> {
-    runtime::framework()?;
-    let (has, cores, arch) = objc::rc::autoreleasepool(|| unsafe {
-        let di = runtime::class("_ANEDeviceInfo")?;
-        let has: BOOL = msg_send![di, hasANE];
-        let cores: u32 = msg_send![di, numANECores];
-        let arch: runtime::Id = msg_send![di, aneArchitectureType];
-        Ok::<_, String>((has, cores, runtime::string(arch)))
-    })?;
-    if has == NO {
+    let (has, cores, arch) = device_info()?;
+    if !has {
         return Err("no Apple Neural Engine on this host".into());
     }
     let [fp16, int8, int4] = probe_forms();
@@ -241,9 +260,9 @@ fn measure() -> Result<AneInfo, String> {
                  want: &[f32],
                  entry|
      -> Result<f32, String> {
-        prog.input(0).write(|d| io.inputs[0].pack(&x.to_f32(), d));
+        prog.input(0).write(|d| io.inputs[0].pack(&x.to_f32(), d))?;
         prog.eval_with(entry)?;
-        let got = prog.output(0).read(|s| io.outputs[0].unpack(s));
+        let got = prog.output(0).read(|s| io.outputs[0].unpack(s))?;
         let err = rel_rms(&got, want);
         if err <= PROBE_TOL {
             Ok(err)

@@ -71,7 +71,6 @@ pub fn device_supports_op(device: Device, op: &Op, dtype: DType) -> bool {
         Device::Rocm => crate::graph::rocm::supports_op(op, dtype),
         Device::Xla => crate::graph::xla::supports_op(op, dtype),
         Device::IntelXpu => crate::graph::intel_xpu::supports_op(op, dtype),
-        Device::Extropic => crate::graph::extropic::supports_op(op, dtype),
     }
 }
 

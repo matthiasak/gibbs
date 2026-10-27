@@ -1,6 +1,8 @@
 // Qwen3 dense and MoE decoders (transformers `qwen3`, `qwen3_moe`; llama.cpp `qwen3`, `qwen3moe`):
 // llama-style layers with per-head q/k RMSNorm before RoPE; MoE layers route top-k of the
-// `mlp.experts.{e}` SwiGLU experts (no shared expert). `hunyuan` and `qwen3_vl` extend this.
+// `mlp.experts.{e}` SwiGLU experts (no shared expert). Layers with `linear_attn` weights mix
+// tokens with Gated DeltaNet (`qwen_mixer`, the hybrid `qwen3_5` stack). `hunyuan`, `qwen3_vl` and
+// `qwen3_5` extend this.
 {
   family: "qwen3",
   match: {
@@ -97,7 +99,10 @@
         {repeat: "i", count: "layers", body: [
           {let: {p: "fmt('model.layers.{i}')"}},
           {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.input_layernorm"},
-          {use: "qwen_attn", in: ["h"], out: "a", name: "layers.{i}.self_attn",
+          {let: {linear: "has(fmt('{p}.linear_attn.in_proj_qkv.weight'))"}},
+          {use: "qwen_mixer", in: ["h"], out: "a", name: "layers.{i}.mixer", when: "linear",
+           args: {p: "fmt('{p}.linear_attn')", layer: "i"}},
+          {use: "qwen_attn", in: ["h"], out: "a", name: "layers.{i}.self_attn", when: "!linear",
            args: {p: "fmt('{p}.self_attn')", layer: "i", q_norm_name: "first(q_norm_name)", k_norm_name: "first(k_norm_name)",
                   rope_pos: "has_vision ? 'rope_positions' : 'positions'", rope_variant: "has_vision ? mrope_variant : 'HalfSplit'",
                   key_mask: "first(masked, false) ? 'key_mask' : ''"}},

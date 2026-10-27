@@ -13,7 +13,6 @@ pub mod codegen;
 pub mod cpu;
 pub mod cuda;
 pub mod egraph;
-pub mod extropic;
 pub mod intel_xpu;
 #[cfg(target_os = "macos")]
 pub mod metal;
@@ -21,6 +20,7 @@ pub mod passes;
 pub mod pattern;
 pub mod placement;
 pub mod plan;
+pub mod portable;
 pub mod program;
 pub mod rocm;
 pub mod shape;
@@ -760,8 +760,10 @@ pub fn paged_states(graph: &Graph) -> Vec<PagedState> {
         Some(&w) if ws.iter().all(|&x| x == w) => w,
         _ => None,
     };
-    let mut window: BTreeMap<&str, Option<usize>> =
-        found.iter().map(|(n, (_, ws))| (*n, window_of(ws))).collect();
+    let mut window: BTreeMap<&str, Option<usize>> = found
+        .iter()
+        .map(|(n, (_, ws))| (*n, window_of(ws)))
+        .collect();
     // A node's two states are read by one kernel: both paged with one window, or neither.
     loop {
         let mut changed = false;
@@ -807,6 +809,8 @@ pub struct StateStore {
     /// The greedy decode stream in flight on this state, if any (a clone starts without one).
     #[cfg(target_os = "macos")]
     pub stream: crate::graph::metal::StreamSlot,
+    /// States resident on a portable GPU (CUDA, ROCm, Intel XPU), by name.
+    pub device: HashMap<String, std::sync::Arc<portable::exec::DevState>>,
     /// The paged KV states' page tables ([`crate::kv`]); the program attaches it on first run.
     pub kv: Option<crate::kv::KvView>,
 }
@@ -833,7 +837,11 @@ impl StateStore {
     /// `recurrent` (e.g. [`program::GraphProgram::recurrent_states`]) cannot rewind and errs:
     /// `restore` a [`Self::snapshot`] taken at `pos` instead.
     pub fn truncate(&mut self, pos: usize, recurrent: &[String]) -> Result<(), String> {
-        let names = self.buffers.keys().chain(self.metal_names());
+        let names = self
+            .buffers
+            .keys()
+            .chain(self.metal_names())
+            .chain(self.device.keys());
         match names.into_iter().find(|n| recurrent.contains(n)) {
             Some(n) => Err(format!(
                 "cannot rewind recurrent state {n} to position {pos}: restore a snapshot"
@@ -887,6 +895,10 @@ impl StateStore {
                 snap.insert(name.to_string(), Tensor::F32(v));
                 continue;
             }
+            if let Some(v) = self.device.get(name).and_then(|d| d.read_f32().ok()) {
+                snap.insert(name.to_string(), Tensor::F32(v));
+                continue;
+            }
             if let Some(t) = self.buffers.get(name) {
                 snap.insert(name.to_string(), t.clone());
             }
@@ -924,6 +936,14 @@ impl StateStore {
                     self.buffers.remove(&name);
                     continue;
                 }
+            }
+            if let (Some(d), Tensor::F32(v)) = (self.device.get(&name), &t) {
+                // As for Metal: the device state may have grown past the snapshot.
+                if let Err(e) = d.write_f32(v) {
+                    panic!("restoring state {name}: {e}");
+                }
+                self.buffers.remove(&name);
+                continue;
             }
             self.buffers.insert(name, t);
         }
@@ -965,6 +985,11 @@ impl StateStore {
             }
             mb
         };
+        let device = self
+            .device
+            .iter()
+            .map(|(name, d)| Ok((name.clone(), std::sync::Arc::new(d.copy_grown(d.elems)?))))
+            .collect::<Result<_, String>>()?;
         Ok(Self {
             buffers: self.buffers.clone(),
             #[cfg(target_os = "macos")]
@@ -973,6 +998,7 @@ impl StateStore {
             metal_f16: self.metal_f16.clone(),
             #[cfg(target_os = "macos")]
             stream: crate::graph::metal::StreamSlot::default(),
+            device,
             kv: self.kv.as_ref().map(|v| v.fork(len)).transpose()?,
         })
     }

@@ -1503,6 +1503,8 @@ pub fn write_tiny_artifact(path: &Path) -> Result<HashMap<String, usize>, String
         use crate::hardware::{cpu_compute, Device, PlacementMode};
         use crate::model::native::NativeLm;
         let _g = cpu_compute::allow();
+        // The CPU program is the exact reference.
+        let _exact = crate::model::qdot::exact();
         let (_dir, path, _) = write_tiny();
         let a = ModelArtifacts {
             model_id: "x/tiny".into(),

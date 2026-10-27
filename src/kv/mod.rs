@@ -147,6 +147,28 @@ pub struct KvPool {
     evictors: Mutex<Vec<std::sync::Weak<RadixPrefixCache>>>,
     #[cfg(target_os = "macos")]
     metal: Option<MetalMem>,
+    /// Pages held in an executor's device memory instead of slabs ([`KvPool::device`]).
+    device: Option<Arc<dyn DevicePages>>,
+}
+
+/// Page memory a portable GPU executor holds for a [`KvPool::device`] pool: the pool keeps page
+/// ids, refcounts and the budget, the executor one buffer per paged name holding every page.
+pub trait DevicePages: Send + Sync {
+    /// `class` grew to `pages` pages: every name's buffer must hold them, keeping their rows.
+    fn grow(&self, class: usize, cls: &PageClass, pages: usize) -> Result<(), String>;
+    /// Copies every name's rows of page `src` of `class` into page `dst`.
+    fn copy_page(&self, class: usize, cls: &PageClass, src: u32, dst: u32) -> Result<(), String>;
+    /// Row `row` (`< PAGE_TOKENS`) of page `pg` of name `name` of `class`, as f32.
+    fn read_row(
+        &self,
+        class: usize,
+        name: usize,
+        pg: u32,
+        row: usize,
+        out: &mut [f32],
+    ) -> Result<(), String>;
+    /// The device buffer (an executor handle) holding name `name` of `class`, once it has pages.
+    fn buffer(&self, class: usize, name: usize) -> Option<u64>;
 }
 
 // SAFETY: slab pointers address memory the pool owns for its lifetime; page contents are only
@@ -168,6 +190,18 @@ impl KvPool {
     /// Host-memory pool (CPU executor): f32 elements.
     pub fn host(states: &[PagedState]) -> Arc<Self> {
         Arc::new(Self::build(states, |_| 4))
+    }
+
+    /// Pool whose pages live in `pages` (a portable GPU's memory): f32 elements, no host slabs.
+    pub fn device(states: &[PagedState], pages: Arc<dyn DevicePages>) -> Arc<Self> {
+        let mut pool = Self::build(states, |_| 4);
+        pool.device = Some(pages);
+        Arc::new(pool)
+    }
+
+    /// The device buffer of paged name `name` of `class` ([`KvPool::device`] pools only).
+    pub fn device_buffer(&self, class: usize, name: usize) -> Option<u64> {
+        self.device.as_ref()?.buffer(class, name)
     }
 
     /// Pool of shared-storage Metal buffers on `device`, its slabs resident on `queue`; states in
@@ -249,6 +283,7 @@ impl KvPool {
             evictors: Mutex::new(Vec::new()),
             #[cfg(target_os = "macos")]
             metal: None,
+            device: None,
         }
     }
 
@@ -385,8 +420,11 @@ impl KvPool {
     }
 
     /// Copies every name's rows of page `src` into page `dst` (host memcpy: unified memory, and
-    /// no GPU work writes a shared page).
-    fn copy_page(&self, class: usize, src: u32, dst: u32) {
+    /// no GPU work writes a shared page; a device pool copies on its device).
+    fn copy_page(&self, class: usize, src: u32, dst: u32) -> Result<(), String> {
+        if let Some(d) = &self.device {
+            return d.copy_page(class, &self.classes[class], src, dst);
+        }
         let mem = self.mem.lock();
         for (i, n) in self.classes[class].names.iter().enumerate() {
             let bytes = PAGE_TOKENS * n.row_width * n.elem;
@@ -397,6 +435,7 @@ impl KvPool {
             // SAFETY: two distinct pages of `bytes` bytes inside live slabs.
             unsafe { std::ptr::copy_nonoverlapping(s, d, bytes) };
         }
+        Ok(())
     }
 
     /// Adds one slab to every name of `class` within the process budget.
@@ -418,7 +457,18 @@ impl KvPool {
         }
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         let cm = &mut mem[class];
+        if let Some(d) = &self.device {
+            let pages = cm.refcount.len() + SLAB_PAGES;
+            if let Err(e) = d.grow(class, cls, pages) {
+                KV_USED.fetch_sub(bytes, Ordering::Relaxed);
+                self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
         for (i, n) in cls.names.iter().enumerate() {
+            if self.device.is_some() {
+                break;
+            }
             let len = cls.slab_bytes(n);
             #[cfg(target_os = "macos")]
             if let Some(m) = &self.metal {
@@ -684,7 +734,7 @@ impl KvView {
                         let old = self.tables[c][lp];
                         if pool.refcount(c, old) > 1 {
                             let fresh = pool.alloc(c)?;
-                            pool.copy_page(c, old, fresh);
+                            pool.copy_page(c, old, fresh)?;
                             pool.release(c, &[old]);
                             self.tables[c][lp] = fresh;
                             changed = true;
@@ -723,7 +773,7 @@ impl KvView {
                     class,
                     old[lp % old.len()],
                     self.tables[class][lp % want],
-                );
+                )?;
             }
         }
         self.pool.release(class, &old);
@@ -748,7 +798,7 @@ impl KvView {
             } else if !t.is_empty() {
                 v.tables[c] = self.pool.alloc_n(c, t.len())?;
                 for (&s, &d) in t.iter().zip(&v.tables[c]) {
-                    self.pool.copy_page(c, s, d);
+                    self.pool.copy_page(c, s, d)?;
                 }
                 v.lens[c] = len;
             }
@@ -803,7 +853,7 @@ impl KvView {
         for (c, ring) in rings {
             v.tables[*c] = pool.alloc_n(*c, ring.len())?;
             for (&s, &d) in ring.iter().zip(&v.tables[*c]) {
-                pool.copy_page(*c, s, d);
+                pool.copy_page(*c, s, d)?;
             }
             v.lens[*c] = len;
         }
@@ -854,8 +904,11 @@ impl KvView {
         self.gen[c] += 1;
     }
 
-    /// Host addresses of `name`'s rows.
+    /// Host addresses of `name`'s rows (`None` for a device pool's pages).
     pub fn host_rows(&self, name: &str) -> Option<HostRows<'_>> {
+        if self.pool.device.is_some() {
+            return None;
+        }
         let (c, i) = self.pool.locate(name)?;
         let n = &self.pool.classes[c].names[i];
         let mem = self.pool.mem.lock();
@@ -873,9 +926,18 @@ impl KvView {
     pub fn gather(&self, name: &str) -> Option<Vec<f32>> {
         let (c, i) = self.pool.locate(name)?;
         let w = self.pool.classes[c].names[i].row_width;
-        let rows = self.host_rows(name)?;
         let n = self.lens[c];
         let mut out = vec![0.0f32; n * w];
+        if let Some(d) = &self.pool.device {
+            let ring = self.ring(c);
+            for (t, row) in out.chunks_exact_mut(w).enumerate() {
+                let lp = t / PAGE_TOKENS;
+                let pg = self.tables[c][if ring > 0 { lp % ring } else { lp }];
+                d.read_row(c, i, pg, t % PAGE_TOKENS, row).ok()?;
+            }
+            return Some(out);
+        }
+        let rows = self.host_rows(name)?;
         for (t, row) in out.chunks_exact_mut(w).enumerate() {
             rows.read(t, row);
         }

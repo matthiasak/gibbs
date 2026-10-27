@@ -1,8 +1,9 @@
-// Full attention of the Qwen decoders over the KV cache `kv.{layer}.{k,v}`: q/k/v projections
-// (optional bias), per-head q/k RMSNorm before or after RoPE (`qk_norm`), and with `attn_gate` an
-// output gate interleaved with q per head in `q_proj` ([q; gate] per head), applied as a sigmoid
-// after attention. Variables: heads, kv_heads, head_dim, rotary_dim, eps, ctx, qk_norm
-// ('before' | 'after' | 'none'), attn_gate.
+// Token mixers of the Qwen decoders. `qwen_attn`: full attention over the KV cache
+// `kv.{layer}.{k,v}`: q/k/v projections (optional bias), per-head q/k RMSNorm before or after RoPE
+// (`qk_norm`), and with `attn_gate` an output gate interleaved with q per head in `q_proj`
+// ([q; gate] per head), applied as a sigmoid after attention. Variables: heads, kv_heads,
+// head_dim, rotary_dim, eps, ctx, qk_norm ('before' | 'after' | 'none'), attn_gate. `qwen_mixer`:
+// the linear-attention layers of the hybrid stacks (Qwen3.5).
 {
   macros: {
     // args: p (stem: `{p}.{q,k,v,o}_proj`, `{p}.{qn,kn}` norms, default q_norm / k_norm); layer
@@ -58,6 +59,11 @@
         {op: "Binary", args: {kind: "'Mul'"}, in: ["a", "g"], out: "a", name: "gated_core"},
       ], when: "attn_gate"},
       {op: "Linear", in: ["a", "w:{p}.o_proj.weight", "w?:{p}.o_proj.bias"], out: "out", name: "o"},
+    ]},
+    // Gated DeltaNet linear attention (lib `deltanet`) at stem `p`, recurrent states `layer`;
+    // `out_tiled`: llama.cpp's tiled value-head order in `out_proj`.
+    qwen_mixer: {params: ["x"], body: [
+      {use: "gated_deltanet", args: {tiled: "out_tiled"}, in: ["x"], out: "out", name: ""},
     ]},
   },
 }

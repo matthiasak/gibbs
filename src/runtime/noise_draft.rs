@@ -408,9 +408,9 @@ const SKETCH_DIM: usize = 256;
 /// Token sketches cached (least recently used evicted).
 const SKETCH_CACHE: usize = 4096;
 
-/// Fixed random features of the target's token embeddings: a seeded sign flip, the normalized fast
-/// Walsh-Hadamard transform over `hidden` zero-padded to a power of two, and its first
-/// [`SKETCH_DIM`] coordinates, rescaled to unit RMS so features do not depend on the table's scale.
+/// Fixed random features of the target's token embeddings: a seeded sign flip, the fast
+/// Walsh-Hadamard transform over `hidden` zero-padded to a power of two `n` (scaled by
+/// `1/sqrt(n)`), and its first [`SKETCH_DIM`] coordinates.
 struct Sketcher {
     embed: EmbedFn,
     hidden: usize,
@@ -455,8 +455,7 @@ impl Sketcher {
                 *v *= s;
             }
             fwht_in_place(&mut self.buf);
-            let mut s: Box<[f32]> = self.buf[..SKETCH_DIM].into();
-            rms_norm(&mut s);
+            let s: Box<[f32]> = self.buf[..SKETCH_DIM].into();
             if self.cache.len() >= SKETCH_CACHE {
                 // ponytail: O(cache) scan per eviction; an intrusive LRU list if misses dominate.
                 if let Some(old) = self.cache.iter().min_by_key(|e| e.1 .0).map(|e| *e.0) {

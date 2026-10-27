@@ -19,6 +19,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 /// answers such a request with 503 (retry) rather than 500.
 pub const MODEL_SWAPPED: &str = "model swapped to ";
 
+/// Top-k every stochastic sampler draws from: the scheduler's, speculative verification's and the
+/// Metal stream's (`GraphProgram::stream_next_sampled`), so all draw from one distribution.
+pub(crate) const SAMPLE_TOP_K: usize = 50;
+
 /// Label for CPU execution, shared by the banner, logs, and TUI.
 pub fn cpu_backend_label() -> String {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -103,7 +107,6 @@ impl ExecutableModel {
     }
 
     /// Device decode stream supporting both greedy (`temp <= 1e-4`) and stochastic (`temp > 1e-4`) sampling.
-    #[allow(clippy::too_many_arguments)]
     pub fn stream_token(
         &self,
         last: u32,
@@ -111,14 +114,10 @@ impl ExecutableModel {
         max_new: usize,
         temp: f32,
         top_p: f32,
-        all_tokens: &[u32],
         state: &mut Option<SeqState>,
     ) -> Result<Option<u32>, String> {
         match state {
-            Some(st) => {
-                self.0
-                    .stream_token(last, pos - 1, max_new, temp, top_p, recent(all_tokens), st)
-            }
+            Some(st) => self.0.stream_token(last, pos - 1, max_new, temp, top_p, st),
             None => Ok(None),
         }
     }
@@ -171,7 +170,7 @@ impl ExecutableModel {
         self.prefill_logits(&ids, 0, &mut st)
     }
 
-    /// Top-k 50 / top-p sampling without repetition penalty; `temp <= 0` is greedy argmax.
+    /// Top-[`SAMPLE_TOP_K`] / top-p sampling without repetition penalty; `temp <= 0` is greedy argmax.
     fn sample(&self, logits: &[f32], recent: &[u32], temp: f32, top_p: f32) -> u32 {
         let vocab = self.0.tokenizer().vocab_size();
         let valid = if vocab > 0 {
@@ -179,7 +178,7 @@ impl ExecutableModel {
         } else {
             logits.len()
         };
-        sample_logits(&logits[..valid], recent, temp, 50, top_p, 1.0)
+        sample_logits(&logits[..valid], recent, temp, SAMPLE_TOP_K, top_p)
     }
 
     /// One-shot generation through a private [`ContinuousBatchScheduler`]: (text, decode-step
@@ -1485,7 +1484,6 @@ impl ContinuousBatchScheduler {
                                     .min(limit.saturating_sub(all.len())),
                                 temp,
                                 top_p,
-                                &all,
                                 &mut seq.kv_cache,
                             )
                         } else {

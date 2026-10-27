@@ -1,7 +1,7 @@
 //! Subgraph fusion optimization passes for Graph IR.
 
 use crate::graph::pattern::{GraphRewriter, MatchContext};
-use crate::graph::{DType, Graph, Op, Tensor, Weights};
+use crate::graph::{DType, Graph, Op, Tensor, ValueKind, Weights};
 use crate::model::weights::Mat;
 
 /// Concatenates 2D weight tensors along axis 0 (rows).
@@ -87,6 +87,43 @@ fn fused_name(g: &Graph, node: &str, weight: &str, kind: &str) -> String {
     }
 }
 
+/// What the fusion rewriters do with the tensors behind the weights they fuse.
+pub enum FuseWeights<'a> {
+    /// Concatenate each fused tensor into the weights (unpacked originals are dropped).
+    Materialize(&'a mut Weights),
+    /// Never concatenate: fuse only onto a weight the compiled program (a graph of the same
+    /// network, fused with [`FuseWeights::Materialize`]) already binds under the fused name with
+    /// the fused dtype and shape. Reshaped instances of a compiled program fuse this way.
+    ReuseOnly(&'a Graph),
+    /// Rewrite the graph only.
+    None,
+}
+
+impl FuseWeights<'_> {
+    pub(crate) fn reborrow(&mut self) -> FuseWeights<'_> {
+        match self {
+            FuseWeights::Materialize(w) => FuseWeights::Materialize(w),
+            FuseWeights::ReuseOnly(g) => FuseWeights::ReuseOnly(g),
+            FuseWeights::None => FuseWeights::None,
+        }
+    }
+
+    /// The tensors a [`FuseWeights::Materialize`] fusion concatenates.
+    pub(crate) fn tensors(&self) -> Option<&Weights> {
+        match self {
+            FuseWeights::Materialize(w) => Some(w),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `program` binds weight `name` as `dtype` with `shape` ([`FuseWeights::ReuseOnly`]).
+fn binds(program: &Graph, name: &str, dtype: DType, shape: [usize; 2]) -> bool {
+    program.values.iter().any(|v| {
+        v.kind == ValueKind::Weight && v.name == name && v.dtype == dtype && v.shape == shape
+    })
+}
+
 /// Validates that `tensor` matches the declared graph `dtype`.
 pub(crate) fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
     match (dtype, tensor) {
@@ -105,7 +142,7 @@ pub(crate) fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
 pub(crate) fn rewrite_qkv(
     graph: &mut Graph,
     matches: &[MatchContext],
-    mut weights: Option<&mut Weights>,
+    mut weights: FuseWeights<'_>,
 ) -> usize {
     if matches.is_empty() {
         return 0;
@@ -169,26 +206,32 @@ pub(crate) fn rewrite_qkv(
 
         let fused_w_name = fused_name(g, &q_name, &g.value(q_w_id).name, "qkv");
 
-        // If weights are provided, we MUST be able to fuse the weight tensors
-        if let Some(ref w_store) = weights {
-            let q_t = w_store.get(&g.value(q_w_id).name)?;
-            let k_t = w_store.get(&g.value(k_w_id).name)?;
-            let v_t = w_store.get(&g.value(v_w_id).name)?;
-            let fused_tensor = concat_weight_tensors(&[q_t, k_t, v_t])?;
-            if !matches_dtype(dtype, &fused_tensor) {
-                return None;
+        match &weights {
+            // The weight tensors MUST fuse.
+            FuseWeights::Materialize(w_store) => {
+                let q_t = w_store.get(&g.value(q_w_id).name)?;
+                let k_t = w_store.get(&g.value(k_w_id).name)?;
+                let v_t = w_store.get(&g.value(v_w_id).name)?;
+                let fused_tensor = concat_weight_tensors(&[q_t, k_t, v_t])?;
+                if !matches_dtype(dtype, &fused_tensor) {
+                    return None;
+                }
+                // Loader Mats stay bound: a reshaped instance of the same program whose fusion
+                // is rejected still reads them, and mapped ones cost no memory.
+                let old_names = match q_t {
+                    Tensor::Mat(_) => Vec::new(),
+                    _ => vec![
+                        g.value(q_w_id).name.clone(),
+                        g.value(k_w_id).name.clone(),
+                        g.value(v_w_id).name.clone(),
+                    ],
+                };
+                weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
             }
-            // Loader Mats stay bound: a reshaped instance of the same program (other row
-            // counts, unfused) still reads them, and mapped ones cost no memory.
-            let old_names = match q_t {
-                Tensor::Mat(_) => Vec::new(),
-                _ => vec![
-                    g.value(q_w_id).name.clone(),
-                    g.value(k_w_id).name.clone(),
-                    g.value(v_w_id).name.clone(),
-                ],
-            };
-            weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
+            FuseWeights::ReuseOnly(p) if !binds(p, &fused_w_name, dtype, [total_out, in_features]) => {
+                return None
+            }
+            FuseWeights::ReuseOnly(_) | FuseWeights::None => {}
         }
 
         let fused_w = g.weight(fused_w_name, vec![total_out, in_features], dtype);
@@ -245,7 +288,7 @@ pub(crate) fn rewrite_qkv(
         Some((vec![q_id, k_id, v_id], vec![q_slice, k_slice, v_slice]))
     });
 
-    if let Some(ref mut w_store) = weights {
+    if let FuseWeights::Materialize(w_store) = &mut weights {
         for (name, tensor, old_names) in weight_updates {
             w_store.insert(name, tensor);
             for old in old_names {
@@ -263,7 +306,7 @@ pub(crate) fn rewrite_qkv(
 pub(crate) fn rewrite_gate_up(
     graph: &mut Graph,
     matches: &[MatchContext],
-    mut weights: Option<&mut Weights>,
+    mut weights: FuseWeights<'_>,
 ) -> usize {
     if matches.is_empty() {
         return 0;
@@ -329,22 +372,28 @@ pub(crate) fn rewrite_gate_up(
 
         let fused_w_name = fused_name(g, &gate_name, &g.value(gate_w_id).name, "gate_up");
 
-        // If weights are provided, we MUST be able to fuse the weight tensors
-        if let Some(ref w_store) = weights {
-            let gate_t = w_store.get(&g.value(gate_w_id).name)?;
-            let up_t = w_store.get(&g.value(up_w_id).name)?;
-            let fused_tensor = concat_weight_tensors(&[gate_t, up_t])?;
-            if !matches_dtype(dtype, &fused_tensor) {
-                return None;
+        match &weights {
+            // The weight tensors MUST fuse.
+            FuseWeights::Materialize(w_store) => {
+                let gate_t = w_store.get(&g.value(gate_w_id).name)?;
+                let up_t = w_store.get(&g.value(up_w_id).name)?;
+                let fused_tensor = concat_weight_tensors(&[gate_t, up_t])?;
+                if !matches_dtype(dtype, &fused_tensor) {
+                    return None;
+                }
+                let old_names = match gate_t {
+                    Tensor::Mat(_) => Vec::new(),
+                    _ => vec![
+                        g.value(gate_w_id).name.clone(),
+                        g.value(up_w_id).name.clone(),
+                    ],
+                };
+                weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
             }
-            let old_names = match gate_t {
-                Tensor::Mat(_) => Vec::new(),
-                _ => vec![
-                    g.value(gate_w_id).name.clone(),
-                    g.value(up_w_id).name.clone(),
-                ],
-            };
-            weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
+            FuseWeights::ReuseOnly(p) if !binds(p, &fused_w_name, dtype, [total_out, in_features]) => {
+                return None
+            }
+            FuseWeights::ReuseOnly(_) | FuseWeights::None => {}
         }
 
         let fused_w = g.weight(fused_w_name, vec![total_out, in_features], dtype);
@@ -389,7 +438,7 @@ pub(crate) fn rewrite_gate_up(
         Some((vec![gate_id, up_id], vec![gate_slice, up_slice]))
     });
 
-    if let Some(ref mut w_store) = weights {
+    if let FuseWeights::Materialize(w_store) = &mut weights {
         for (name, tensor, old_names) in weight_updates {
             w_store.insert(name, tensor);
             for old in old_names {
@@ -437,7 +486,7 @@ mod tests {
         weights.insert("w_k", Tensor::F32(vec![2.0; 32 * 64]));
         weights.insert("w_v", Tensor::F32(vec![3.0; 32 * 64]));
 
-        let rewrites = fuse_rule(&mut g, Some(&mut weights), Rule::Qkv);
+        let rewrites = fuse_rule(&mut g, FuseWeights::Materialize(&mut weights), Rule::Qkv);
         assert_eq!(rewrites, 1);
         assert!(validate_ssa(&g).is_ok());
 
@@ -465,7 +514,7 @@ mod tests {
         weights.insert("w_g", Tensor::F32(vec![0.5; 128 * 64]));
         weights.insert("w_u", Tensor::F32(vec![0.75; 128 * 64]));
 
-        let rewrites = fuse_rule(&mut g, Some(&mut weights), Rule::GateUp);
+        let rewrites = fuse_rule(&mut g, FuseWeights::Materialize(&mut weights), Rule::GateUp);
         assert_eq!(rewrites, 1);
         assert!(validate_ssa(&g).is_ok());
         assert!(weights.get("gate_fused_gate_up_w").is_some());
@@ -536,8 +585,9 @@ mod tests {
         // 2. Run passes
         let mut opt_g = g.clone();
         let mut opt_w = weights.clone();
-        let qkv_rewrites = fuse_rule(&mut opt_g, Some(&mut opt_w), Rule::Qkv);
-        let glu_rewrites = fuse_rule(&mut opt_g, Some(&mut opt_w), Rule::GateUp);
+        let qkv_rewrites = fuse_rule(&mut opt_g, FuseWeights::Materialize(&mut opt_w), Rule::Qkv);
+        let glu_rewrites =
+            fuse_rule(&mut opt_g, FuseWeights::Materialize(&mut opt_w), Rule::GateUp);
         assert_eq!(qkv_rewrites, 1);
         assert_eq!(glu_rewrites, 1);
         assert!(validate_ssa(&opt_g).is_ok());
@@ -663,7 +713,7 @@ mod tests {
         let (g, w, input) = qkv_graph(dts);
         let base = run_stateless(&g, &w, input.clone()).unwrap();
         let (mut fg, mut fw) = (g.clone(), w.clone());
-        assert_eq!(fuse_rule(&mut fg, Some(&mut fw), Rule::Qkv), 1);
+        assert_eq!(fuse_rule(&mut fg, FuseWeights::Materialize(&mut fw), Rule::Qkv), 1);
         assert!(validate_ssa(&fg).is_ok());
         let fused = run_stateless(&fg, &fw, input).unwrap();
         assert_eq!(base.len(), fused.len());
@@ -685,7 +735,11 @@ mod tests {
         let (h, f) = (DType::F16, DType::F32);
         for dts in [[h, h, f], [f, h, h]] {
             let (mut g, mut w, _) = qkv_graph(dts);
-            assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0, "{dts:?}");
+            assert_eq!(
+                fuse_rule(&mut g, FuseWeights::Materialize(&mut w), Rule::Qkv),
+                0,
+                "{dts:?}"
+            );
         }
     }
 

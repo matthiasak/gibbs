@@ -51,8 +51,6 @@ pub enum Device {
     Xla,
     /// Intel Arc / Data Center Max XPU through OpenCL / Level Zero (`libOpenCL` / `libze_loader`).
     IntelXpu,
-    /// Extropic Thermodynamic Sampling Unit (`TSU` / `XTR-0` or Gibbs-Boltzmann Langevin engine).
-    Extropic,
 }
 
 impl Device {
@@ -66,7 +64,6 @@ impl Device {
             Device::Rocm => "rocm",
             Device::Xla => "xla",
             Device::IntelXpu => "intel-xpu",
-            Device::Extropic => "extropic",
         }
     }
 }
@@ -88,9 +85,8 @@ impl std::str::FromStr for Device {
             "rocm" | "hip" | "amd" => Ok(Device::Rocm),
             "xla" | "tpu" | "stablehlo" | "pjrt" => Ok(Device::Xla),
             "intel-xpu" | "xpu" | "intel_xpu" | "sycl" | "opencl" => Ok(Device::IntelXpu),
-            "extropic" | "tsu" | "xtr0" => Ok(Device::Extropic),
             other => Err(format!(
-                "unknown --backend '{other}' (expected auto, cpu, metal, ane, cuda, rocm, xla, intel-xpu, or extropic)"
+                "unknown --backend '{other}' (expected auto, cpu, metal, ane, cuda, rocm, xla, or intel-xpu)"
             )),
         }
     }
@@ -163,9 +159,6 @@ pub fn available_devices() -> Vec<Device> {
     }
     if crate::graph::intel_xpu::is_available() {
         devices.push(Device::IntelXpu);
-    }
-    if crate::graph::extropic::is_available() {
-        devices.push(Device::Extropic);
     }
     devices
 }

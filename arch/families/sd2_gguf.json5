@@ -1,35 +1,15 @@
 // SD 2.1 turbo GGUF (gpustack/stable-diffusion-v2-1-turbo-GGUF, stable-diffusion.cpp naming: the
-// OpenCLIP-H tower converted to HF names under `cond_stage_model.transformer.`): configs from
-// stabilityai/sd-turbo (Euler trailing), no CFG. 4 steps: 1-step Euler multiplies eps error by
-// sigma_max (~14.6), which turns quantized-UNet error into noise (`sd.rs` `SdPipeline::load`).
+// OpenCLIP-H tower converted to HF names under `cond_stage_model.transformer.`, so the components
+// are `sd1_file`'s): configs from stabilityai/sd-turbo (Euler trailing), no CFG. 4 steps: 1-step
+// Euler multiplies eps error by sigma_max (~14.6), which turns quantized-UNet error into noise
+// (`sd.rs` `SdPipeline::load`).
 {
   family: "sd2_gguf",
-  extends: "sd",
+  extends: "sd1_file",
   match: {
     diffusers_class: [],
     single_file_tensors: [["cond_stage_model.transformer.text_model.final_layer_norm.weight", "model.diffusion_model.input_blocks.0.0.weight"]],
     single_file_ext: ["gguf"],
-  },
-  components: {
-    text_encoder: {
-      family: "clip_text",
-      dir: "text_encoder",
-      strip: ["cond_stage_model.transformer."],
-      ignore: ["model.diffusion_model.*", "first_stage_model.*"],
-      patch: {"use_lib+": ["ldm"]},
-    },
-    unet: {
-      family: "sd",
-      dir: "unet",
-      ignore: ["first_stage_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
-      patch: {"use_lib+": ["ldm"]},
-    },
-    vae: {
-      family: "sd_vae",
-      dir: "vae",
-      ignore: ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
-      patch: {"use_lib+": ["ldm"]},
-    },
   },
   runtime: {
     reference: "'stabilityai/sd-turbo'",

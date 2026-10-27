@@ -596,6 +596,8 @@ pub fn render_snapcompact_pages(text: &str) -> Vec<ImageBuffer> {
 /// Generates Tier 3 summaries. Implementations decode greedily, so the same transcript always
 /// gives the same summary.
 pub trait Summarizer {
+    /// The model that summarizes (its id): summaries are cached per summarizer.
+    fn id(&self) -> String;
     fn summarize(&self, transcript: &str, max_tokens: usize) -> Result<String, String>;
 }
 
@@ -605,8 +607,9 @@ const SUMMARY_PROMPT: &str = "Summarize the conversation below so it can be cont
 /// Tokens reserved beside the transcript and the summary (template, instruction).
 const SUMMARY_OVERHEAD: usize = 256;
 
-/// The summary of `transcript`, cached as artifact `summary-<fnv64 of transcript>.txt` so every
-/// later compaction of the same turns re-renders a byte-identical prefix.
+/// The summary of `transcript` by `s`, cached as artifact `summary-<fnv64 of summarizer id and
+/// transcript>.txt` so every later compaction of the same turns re-renders a byte-identical
+/// prefix, and one model's summary never serves another.
 fn cached_summary(
     s: &dyn Summarizer,
     transcript: &str,
@@ -614,10 +617,8 @@ fn cached_summary(
     tok: &Tokenizer,
     ctx: usize,
 ) -> Result<String, String> {
-    let path = artifacts_dir()?.join(format!(
-        "summary-{:016x}.txt",
-        fnv64(transcript.as_bytes())
-    ));
+    let key = [s.id().as_bytes(), &[0], transcript.as_bytes()].concat();
+    let path = artifacts_dir()?.join(format!("summary-{:016x}.txt", fnv64(&key)));
     if let Ok(text) = std::fs::read_to_string(&path) {
         return Ok(text);
     }
@@ -680,10 +681,11 @@ pub struct ModelTraits {
 #[derive(Debug, Clone)]
 pub struct Compacted {
     pub messages: Vec<ChatMessage>,
-    /// SnapCompact pages (PNG): the first media items of the compacted request.
+    /// SnapCompact pages (PNG) of the summary turn, in request media order at `folded_media`.
     pub media: Vec<MediaInput>,
-    /// Leading request media items that belonged to folded turns and are gone.
-    pub folded_media: usize,
+    /// Request media items (in order) that belonged to folded turns and are gone; the pages
+    /// take their place.
+    pub folded_media: std::ops::Range<usize>,
     pub report: CompactionReport,
 }
 
@@ -707,7 +709,7 @@ pub fn compact_chat_session(
     let mut done = Compacted {
         messages: messages.to_vec(),
         media: Vec::new(),
-        folded_media: 0,
+        folded_media: 0..0,
         report: CompactionReport::unchanged(before_tokens),
     };
     if cfg.mode == CompactionMode::Off
@@ -734,13 +736,17 @@ pub fn compact_chat_session(
     }
 
     // Tier 3: the turns between the leading system messages and the kept turns fold into one
-    // summary turn plus an assistant acknowledgement; the kept part starts at a user message, so
-    // roles keep alternating.
+    // summary turn plus an assistant acknowledgement. The folded slice grows in steps of
+    // `2 x keep_recent_turns` messages (the kept turns float between `keep_recent_turns` and twice
+    // that), so a client resending its whole history folds the same slice on consecutive turns:
+    // the cached summary is reused and the compacted prefix renders byte-identical. The kept part
+    // starts at a user message, so roles keep alternating.
     let first = out
         .iter()
         .position(|m| m.role != "system")
         .unwrap_or(out.len());
-    let mut fold_end = out.len().saturating_sub(cfg.keep_recent_turns * 2);
+    let step = cfg.keep_recent_turns * 2;
+    let mut fold_end = first + (out.len() - first).saturating_sub(step) / step * step;
     while fold_end > first && out[fold_end].role != "user" {
         fold_end -= 1;
     }
@@ -774,7 +780,8 @@ pub fn compact_chat_session(
         report.snapcompact_png_bytes = pages.iter().map(Vec::len).sum();
         done.media = pages.into_iter().map(MediaInput::Image).collect();
     }
-    done.folded_media = folded.iter().map(media_parts).sum();
+    let system_media: usize = out[..first].iter().map(media_parts).sum();
+    done.folded_media = system_media..system_media + folded.iter().map(media_parts).sum::<usize>();
     report.tier3_turns_summarized = folded.len().div_ceil(2);
     out.splice(
         first..fold_end,
@@ -834,6 +841,10 @@ fn summarize_on(
 pub struct SchedulerSummarizer(pub Arc<ContinuousBatchScheduler>);
 
 impl Summarizer for SchedulerSummarizer {
+    fn id(&self) -> String {
+        self.0.model_id()
+    }
+
     fn summarize(&self, transcript: &str, max_tokens: usize) -> Result<String, String> {
         if !self.0.has_model() {
             return Err("no text model is loaded to summarize with".into());
@@ -844,7 +855,10 @@ impl Summarizer for SchedulerSummarizer {
 
 /// Summarizes with another model (`--compact-summarizer <id>`), loaded once and kept in a
 /// one-entry cache keyed by id.
-pub struct LocalModelSummarizer(ExecutableModel);
+pub struct LocalModelSummarizer {
+    id: String,
+    model: ExecutableModel,
+}
 
 impl LocalModelSummarizer {
     /// Loads `id` as the CLI loads models: default device, saved re-encode policy, `HF_TOKEN`.
@@ -853,7 +867,10 @@ impl LocalModelSummarizer {
             parking_lot::Mutex::new(None);
         let mut cache = CACHE.lock();
         if let Some((_, m)) = cache.as_ref().filter(|(c, _)| c == id) {
-            return Ok(Self(m.clone()));
+            return Ok(Self {
+                id: id.to_string(),
+                model: m.clone(),
+            });
         }
         let hub = crate::model::hub::HuggingFaceHub::new().with_budget(usize::MAX);
         let token = std::env::var("HF_TOKEN").ok();
@@ -878,13 +895,20 @@ impl LocalModelSummarizer {
             return Err(format!("summarizer '{id}' is not a text generation model"));
         };
         *cache = Some((id.to_string(), model.clone()));
-        Ok(Self(model))
+        Ok(Self {
+            id: id.to_string(),
+            model,
+        })
     }
 }
 
 impl Summarizer for LocalModelSummarizer {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn summarize(&self, transcript: &str, max_tokens: usize) -> Result<String, String> {
-        summarize_on(&self.0.one_shot_scheduler(), true, transcript, max_tokens)
+        summarize_on(&self.model.one_shot_scheduler(), true, transcript, max_tokens)
     }
 }
 
@@ -927,7 +951,8 @@ pub fn compact_for_scheduler(
             c.report.before_tokens = n;
         }
     }
-    media.splice(..c.folded_media.min(media.len()), c.media);
+    let folded = c.folded_media.start.min(media.len())..c.folded_media.end.min(media.len());
+    media.splice(folded, c.media);
     if !media.is_empty() {
         if let Ok(n) = sched.prompt_len(media, render(&c.messages)) {
             c.report.after_tokens = n;
@@ -942,10 +967,14 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    /// Returns a fixed summary and counts its calls.
-    struct Counting(Cell<usize>, &'static str);
+    /// Returns a fixed summary (field 1) under an id (field 2) and counts its calls.
+    struct Counting(Cell<usize>, &'static str, &'static str);
 
     impl Summarizer for Counting {
+        fn id(&self) -> String {
+            self.2.to_string()
+        }
+
         fn summarize(&self, transcript: &str, max_tokens: usize) -> Result<String, String> {
             assert!(!transcript.is_empty() && (64..=1024).contains(&max_tokens));
             self.0.set(self.0.get() + 1);
@@ -1067,41 +1096,52 @@ mod tests {
         msgs
     }
 
-    /// The summary is generated once per folded transcript; repeating the compaction (the next
-    /// request of an agent that resends its history) reuses it and renders identical bytes.
+    /// The summary is generated once per folded transcript and summarizer. Repeating the
+    /// compaction, or extending the history by a turn (a client that resends its whole
+    /// uncompacted history), folds the same slice: no new summary, byte-identical prefix.
     #[test]
     fn summary_cached_and_prefix_stable() {
         let tok = Tokenizer::default_bpe();
-        let msgs = session("summary_cached_and_prefix_stable");
+        let mut msgs = session("summary_cached_and_prefix_stable");
         let cfg = CompactionConfig {
             mode: CompactionMode::Aggressive,
-            keep_recent_turns: 1,
+            keep_recent_turns: 2,
             ..CompactionConfig::default()
         };
-        let s = Counting(Cell::new(0), "The user asked six thermodynamics questions.");
-        let run = || {
-            compact_chat_session(&msgs, &tok, 4096, &cfg, &ModelTraits::default(), &s, true)
+        let s = Counting(Cell::new(0), "The user asked six thermodynamics questions.", "org/a");
+        let run = |msgs: &[ChatMessage], s: &Counting| {
+            compact_chat_session(msgs, &tok, 4096, &cfg, &ModelTraits::default(), s, true)
                 .unwrap()
         };
-        let (a, b) = (run(), run());
+        let json = |m: &[ChatMessage]| serde_json::to_string(m).unwrap();
+        let (a, b) = (run(&msgs, &s), run(&msgs, &s));
         assert_eq!(s.0.get(), 1);
-        assert_eq!(
-            serde_json::to_string(&a.messages).unwrap(),
-            serde_json::to_string(&b.messages).unwrap()
-        );
-        assert_eq!(a.messages.len(), 5, "system, summary, ack, last turn");
+        assert_eq!(json(&a.messages), json(&b.messages));
+        assert_eq!(a.messages.len(), 7, "system, summary, ack, last two turns");
         assert!(a.messages[1]
             .text()
             .ends_with("The user asked six thermodynamics questions."));
-        assert_eq!(a.report.tier3_turns_summarized, 5);
+        assert_eq!(a.report.tier3_turns_summarized, 4);
         assert!(a.report.after_tokens < a.report.before_tokens);
+        // The next turn of a client that never adopted the compacted history.
+        msgs.push(ChatMessage::new("user", "And the third law?"));
+        msgs.push(ChatMessage::new("assistant", "Entropy goes to a constant at 0 K."));
+        let c = run(&msgs, &s);
+        assert_eq!(s.0.get(), 1, "the folded slice did not move");
+        assert_eq!(c.messages.len(), 9);
+        assert_eq!(json(&c.messages[..3]), json(&a.messages[..3]));
+        // Another summarizer never reuses this one's summary.
+        let other = Counting(Cell::new(0), "Other.", "org/b");
+        let d = run(&msgs, &other);
+        assert_eq!(other.0.get(), 1);
+        assert!(d.messages[1].text().ends_with("Other."));
     }
 
     #[test]
     fn full_pipeline_gates_on_trigger_and_attaches_snapcompact_pages() {
         let tok = Tokenizer::default_bpe();
         let msgs = session("full_pipeline");
-        let s = Counting(Cell::new(0), "Six questions on Gibbs free energy.");
+        let s = Counting(Cell::new(0), "Six questions on Gibbs free energy.", "org/a");
         let vision = ModelTraits {
             delimiters: Vec::new(),
             has_vision: true,

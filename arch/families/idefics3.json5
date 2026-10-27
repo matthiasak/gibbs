@@ -37,7 +37,7 @@
     shuffle: "first(cfg.scale_factor, 2)",
     tokens_per_tile: "v_n // (shuffle * shuffle)",
   },
-  checks: [
+  "checks+": [
     {expr: "first(cfg.vision_config.hidden_act, 'gelu_pytorch_tanh') != 'gelu_pytorch_tanh'", error: "SigLIP hidden_act {cfg.vision_config.hidden_act} is not supported"},
     {expr: "v_size % v_patch != 0 || v_grid % shuffle != 0", error: "scale_factor {shuffle} does not divide the {v_grid}-patch grid"},
     {expr: "json.preprocessor_config.max_image_size.longest_edge != v_size", error: "max_image_size {json.preprocessor_config.max_image_size.longest_edge} differs from the vision encoder's image_size {v_size}"},
@@ -104,40 +104,8 @@
       ],
       outputs: ["rows"],
     },
-    text: {
-      vars: ["rows", "head"],
-      inputs: [
-        {name: "token_ids", dtype: "u32", shape: ["rows"]},
-        {name: "positions", dtype: "u32", shape: ["rows"]},
-        {name: "media_rows", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0"},
-        {name: "media_index", dtype: "u32", shape: ["media"], when: "first(media, 0) > 0"},
-      ],
-      body: [
-        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
-        {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", name: "media", when: "first(media, 0) > 0"},
-        {repeat: "i", count: "layers", body: [
-          {let: {p: "fmt('model.layers.{i}')"}},
-          {use: "norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
-          {use: "attn_cached", in: ["h"], out: "a", name: "l{i}.attn", args: {
-            layer: "i", wq: "fmt('{p}.self_attn.q_proj')", wk: "fmt('{p}.self_attn.k_proj')",
-            wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.o_proj')",
-            q_norm: "fmt('{p}.self_attn.q_norm')", k_norm: "fmt('{p}.self_attn.k_norm')"}},
-          {use: "residual", in: ["x", "a"], out: "x", name: "l{i}.res1"},
-          {use: "norm", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
-          {use: "mlp_glu", in: ["h"], out: "m", name: "l{i}.mlp", args: {
-            gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
-          {use: "residual", in: ["x", "m"], out: "x", name: "l{i}.res2"},
-          {tap: "layer.{i}", in: "x"},
-        ]},
-        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
-        {use: "norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
-        {use: "lm_head", args: {w: "head_w", logit_scale: "1"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
-      ],
-      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
-    },
   },
   runtime: {
-    ffn_weights: ["model.layers.*.mlp.*"],
     media: {image: {
       component: "vision",
       preprocess: {kind: "tile_longest_edge",

@@ -115,11 +115,16 @@
       inputs: [
         {name: "token_ids", dtype: "u32", shape: ["rows"]},
         {name: "positions", dtype: "u32", shape: ["rows"]},
+        // Media rows (a vision tower's `rows`, `idefics3`) and the rows they fill; `media` =
+        // SpecLm's instance var (media rows this pass, 0 / absent on text passes).
+        {name: "media_rows", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0"},
+        {name: "media_index", dtype: "u32", shape: ["media"], when: "first(media, 0) > 0"},
         {name: "last_index", dtype: "u32", shape: [1], when: "head == 'score'"},
       ],
       body: [
         {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
         {op: "Unary", args: {kind: {Scale: "embed_mult"}}, in: ["x"], out: "x", name: "embed_scale", when: "embed_mult != 1"},
+        {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", name: "media_scatter", when: "first(media, 0) > 0"},
         {repeat: "i", count: "layers", body: [
           {let: {p: "fmt('model.layers.{i}')"}},
           {use: "norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},

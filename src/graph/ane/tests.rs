@@ -105,6 +105,7 @@ fn ane_error(c: &Case, info: &AneInfo) -> Result<f32, String> {
 
 /// The CPU executor's result for `c` (the reference every case compares against).
 fn cpu_reference(c: &Case) -> Result<Vec<Tensor>, String> {
+    let _exact = crate::model::qdot::exact();
     crate::graph::cpu::run(&c.g, &c.w, &mut StateStore::new(), c.inputs.clone())
 }
 
@@ -487,6 +488,225 @@ fn cases() -> Vec<Case> {
         );
         v.push(c.out(&[r0, r1, r2, r3, tr, rs, sl, s0, ti, pd, sq, t4, mm, mt]));
     }
+    {
+        let mut c = Case::new("per-head rms_norm + layer_norm");
+        let x = c.input("x", vec![5, 64], 3.0);
+        let w = c.weight("w", vec![64, 64], 0.2);
+        let h = c.op("h", Op::Linear, &[x, w]);
+        let (g, b) = (c.weight("g", vec![16], 1.0), c.weight("b", vec![16], 1.0));
+        let rn = c.op("rn", Op::RmsNorm { eps: 1e-6 }, &[h, g]);
+        let ln = c.op("ln", Op::LayerNorm { eps: 1e-5 }, &[x, g, b]);
+        let r0 = c.op("r0", Op::RmsNorm { eps: 1e-6 }, &[x]);
+        v.push(c.out(&[rn, ln, r0]));
+    }
+    {
+        let mut c = Case::new("binary on token-form operands");
+        let x = c.input("x", vec![6, 32], 1.0);
+        let w = c.weight("w", vec![32, 32], 0.2);
+        let t = c.op("t", Op::Linear, &[x, w]);
+        let x3 = c.input("x3", vec![2, 3, 32], 1.0);
+        let t3 = c.op("t3", Op::Linear, &[x3, w]);
+        let col = c.input("col", vec![6, 1], 1.0);
+        let row = c.input("row", vec![1, 32], 1.0);
+        let bias = c.weight("bias", vec![32], 1.0);
+        let k = c.weight_data("k", vec![1], vec![1.5]);
+        let col3 = c.input("col3", vec![2, 3, 1], 1.0);
+        let mid = c.input("mid", vec![3, 32], 1.0);
+        let bin = |c: &mut Case, n: &str, kind, a, b| c.op(n, Op::Binary { kind }, &[a, b]);
+        let outs = vec![
+            bin(&mut c, "tcol", BinaryKind::Mul, t, col),
+            bin(&mut c, "colt", BinaryKind::Sub, col, t),
+            bin(&mut c, "trow", BinaryKind::Add, t, row),
+            bin(&mut c, "tbias", BinaryKind::Add, bias, t),
+            bin(&mut c, "tk", BinaryKind::Mul, t, k),
+            bin(&mut c, "tt", BinaryKind::Max, t, t),
+            bin(&mut c, "t3b", BinaryKind::Mul, t3, bias),
+            bin(&mut c, "t3c", BinaryKind::Mul, t3, col3),
+            bin(&mut c, "t3m", BinaryKind::Sub, t3, mid),
+            bin(&mut c, "t3x", BinaryKind::Add, t3, x3),
+        ];
+        // Non-numpy forms the CPU executor accepts: row scale and flat tiling.
+        let rs_x = c.input("rs_x", vec![6, 4, 8], 1.0);
+        let rs = c.g.add(
+            "rs",
+            Op::Binary {
+                kind: BinaryKind::Mul,
+            },
+            &[rs_x, col],
+            vec![6, 4, 8],
+            DType::F32,
+        );
+        let rs2 = c.g.add(
+            "rs2",
+            Op::Binary {
+                kind: BinaryKind::Mul,
+            },
+            &[col, rs_x],
+            vec![6, 4, 8],
+            DType::F32,
+        );
+        let ta = c.input("ta", vec![24], 1.0);
+        let tb = c.input("tb", vec![6], 1.0);
+        let tl = c.g.add(
+            "tl",
+            Op::Binary {
+                kind: BinaryKind::Sub,
+            },
+            &[ta, tb],
+            vec![24],
+            DType::F32,
+        );
+        let tc = c.input("tc", vec![2, 12], 1.0);
+        let td = c.input("td", vec![3, 4], 1.0);
+        let tm = c.g.add(
+            "tm",
+            Op::Binary {
+                kind: BinaryKind::Div,
+            },
+            &[td, tc],
+            vec![2, 12],
+            DType::F32,
+        );
+        let mut outs = outs;
+        outs.extend([rs, rs2, tl, tm]);
+        v.push(c.out(&outs));
+    }
+    {
+        let mut c = Case::new("reduce keep_dims=false consumers + pad + batched matmul");
+        let x = c.input("x", vec![4, 6, 8], 1.0);
+        let r = c.op(
+            "r",
+            Op::Reduce {
+                kind: ReduceKind::Sum,
+                axes: vec![1],
+                keep_dims: false,
+            },
+            &[x],
+        );
+        let rt = c.op("rt", Op::Transpose { perm: vec![1, 0] }, &[r]);
+        let u = c.input("u", vec![4, 8], 1.0);
+        let sg = c.op("sg", Op::SwiGlu, &[r, u]);
+        let un = c.op(
+            "un",
+            Op::Unary {
+                kind: UnaryKind::Tanh,
+            },
+            &[r],
+        );
+        let ad = c.op(
+            "ad",
+            Op::Binary {
+                kind: BinaryKind::Add,
+            },
+            &[un, u],
+        );
+        let p = c.input("p", vec![3, 5, 6], 1.0);
+        let pd = c.op(
+            "pd",
+            Op::Pad {
+                padding: vec![1, 0, 2, 1],
+                value: -0.5,
+            },
+            &[p],
+        );
+        let a = c.input("a", vec![2, 5, 16], 1.0);
+        let b = c.input("b", vec![16, 7], 1.0);
+        let mm = c.op(
+            "mm",
+            Op::MatMul {
+                transpose_a: false,
+                transpose_b: false,
+            },
+            &[a, b],
+        );
+        v.push(c.out(&[r, rt, sg, ad, pd, mm]));
+    }
+    v
+}
+
+/// Nodes [`lower`] refuses, each built so `cpu::run` could run it: `supports_op` must refuse
+/// them too.
+fn rejected() -> Vec<Case> {
+    let mut v = Vec::new();
+    {
+        let mut c = Case::new("batched conv2d");
+        let x = c.input("x", vec![2, 4, 6, 6], 1.0);
+        let w = c.weight("w", vec![4, 4, 3, 3], 0.2);
+        let op = Op::Conv2d {
+            stride: [1, 1],
+            padding: [1, 1, 1, 1],
+            dilation: [1, 1],
+            groups: 1,
+        };
+        let y = c.g.add("y", op, &[x, w], vec![2, 4, 6, 6], DType::F32);
+        v.push(c.out(&[y]));
+    }
+    {
+        let mut c = Case::new("3-D upsample");
+        let x = c.input("x", vec![2, 3, 4, 5], 1.0);
+        let y = c.g.add(
+            "y",
+            Op::Upsample {
+                scale: 2,
+                mode: UpsampleMode::Nearest,
+            },
+            &[x],
+            vec![2, 6, 8, 10],
+            DType::F32,
+        );
+        v.push(c.out(&[y]));
+    }
+    {
+        let mut c = Case::new("matmul batch mismatch");
+        let a = c.input("a", vec![2, 5, 16], 1.0);
+        let b = c.input("b", vec![3, 16, 7], 1.0);
+        let y = c.g.add(
+            "y",
+            Op::MatMul {
+                transpose_a: false,
+                transpose_b: false,
+            },
+            &[a, b],
+            vec![2, 5, 7],
+            DType::F32,
+        );
+        v.push(c.out(&[y]));
+    }
+    {
+        let mut c = Case::new("attention row without keys");
+        let q = c.input("q", vec![9, 32], 1.0);
+        let k = c.input("k", vec![3, 32], 1.0);
+        let vv = c.input("v", vec![3, 32], 1.0);
+        let op = Op::Attention {
+            heads: 2,
+            kv_heads: 2,
+            causal: false,
+            window: Some(2),
+            soft_cap: None,
+            scale: None,
+        };
+        let y = c.op("y", op, &[q, k, vv]);
+        v.push(c.out(&[y]));
+    }
+    {
+        let mut c = Case::new("ln");
+        let x = c.input("x", vec![4, 8], 1.0);
+        let y = c.op(
+            "y",
+            Op::Unary {
+                kind: UnaryKind::Ln,
+            },
+            &[x],
+        );
+        v.push(c.out(&[y]));
+    }
+    {
+        let mut c = Case::new("softmax axis out of range");
+        let x = c.input("x", vec![4, 8], 1.0);
+        let y =
+            c.g.add("y", Op::Softmax { axis: 2 }, &[x], vec![4, 8], DType::F32);
+        v.push(c.out(&[y]));
+    }
     v
 }
 
@@ -525,6 +745,24 @@ fn lowering_matches_cpu_per_op() {
         per_channel,
     ));
     let mut failed = Vec::new();
+    for c in rejected() {
+        let node = &c.g.nodes[c.g.nodes.len() - 1];
+        if supports_op(&c.g, node) || lower(&c.g, &c.w, &info).is_ok() {
+            failed.push(format!("{}: accepted", c.name));
+        }
+    }
+    for (c, _) in &cases {
+        for node in &c.g.nodes {
+            if !supports_op(&c.g, node) {
+                failed.push(format!(
+                    "{}: supports_op rejects '{}': {:?}",
+                    c.name,
+                    node.name,
+                    check(&c.g, node)
+                ));
+            }
+        }
+    }
     for (c, info) in &cases {
         match ane_error(c, info) {
             Ok(e) if e <= 2e-2 => eprintln!("{:<40} relative RMS {e:.2e}", c.name),

@@ -1,0 +1,123 @@
+
+// ---- weights.gpk: per-encoding kernels, instantiated once per encoding (CODEC, BLOCK_ELEMS and
+// BLOCK_BYTES are substituted). A weight row of `cols` elements is `row_bytes` bytes of blocks;
+// element c of a row is in block c / BLOCK_ELEMS, 8-element sub-block (c % BLOCK_ELEMS) / 8.
+
+DEVFN void ld8_CODEC(GLOBAL const u8* row, u32 c, float* out8) {
+    dec_CODEC(row + (u64)(c / BLOCK_ELEMS) * BLOCK_BYTES, (c % BLOCK_ELEMS) / 8u, out8);
+}
+
+// y[r, j] = x[r, :] . w[j, :] (+ bias[j]) for rows <= 8: one 64-thread workgroup per column j.
+KERNEL gemv_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_bytes,
+                  GLOBAL const float* bias, u32 bo, u32 has_bias, GLOBAL float* y, u32 yo,
+                  u32 rows, u32 in_f, u32 out_f) {
+    LOCAL float red[8 * 64];
+    u32 j = GRP(0), t = LID(0);
+    float acc[8];
+    for (u32 r = 0; r < 8u; r++) acc[r] = 0.0f;
+    GLOBAL const u8* wr = w + (u64)j * row_bytes;
+    GLOBAL const float* xr = x + xo;
+    for (u32 c = t * 8u; c < in_f; c += 64u * 8u) {
+        float wv[8];
+        ld8_CODEC(wr, c, wv);
+        u32 nv = in_f - c < 8u ? in_f - c : 8u;
+        for (u32 r = 0; r < rows; r++) {
+            float s = 0.0f;
+            for (u32 i = 0; i < nv; i++) s += wv[i] * xr[r * in_f + c + i];
+            acc[r] += s;
+        }
+    }
+    for (u32 r = 0; r < 8u; r++) red[r * 64u + t] = acc[r];
+    BARRIER();
+    for (u32 s = 32u; s > 0u; s >>= 1) {
+        if (t < s)
+            for (u32 r = 0; r < 8u; r++) red[r * 64u + t] += red[r * 64u + t + s];
+        BARRIER();
+    }
+    if (t < rows) {
+        float b = has_bias ? bias[bo + j] : 0.0f;
+        y[yo + t * out_f + j] = red[t * 64u] + b;
+    }
+}
+
+// The same product for any rows: 32x32 output tiles, 256 threads, 2x2 outputs each.
+KERNEL gemm_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_bytes,
+                  GLOBAL const float* bias, u32 bo, u32 has_bias, GLOBAL float* y, u32 yo,
+                  u32 rows, u32 in_f, u32 out_f) {
+    LOCAL float xs[32 * 33];
+    LOCAL float ws[32 * 33];
+    u32 t = LID(0), tx = t % 16u, ty = t / 16u;
+    u32 j0 = GRP(0) * 32u, r0 = GRP(1) * 32u;
+    float a00 = 0.0f, a01 = 0.0f, a10 = 0.0f, a11 = 0.0f;
+    for (u32 k0 = 0; k0 < in_f; k0 += 32u) {
+        for (u32 e = t; e < 1024u; e += 256u) {
+            u32 rr = e / 32u, kk = e % 32u;
+            u32 r = r0 + rr, k = k0 + kk;
+            xs[rr * 33u + kk] = (r < rows && k < in_f) ? x[xo + r * in_f + k] : 0.0f;
+        }
+        if (t < 128u) {
+            u32 jj = t / 4u, s = t % 4u, c = k0 + s * 8u;
+            float wv[8];
+            for (u32 i = 0; i < 8u; i++) wv[i] = 0.0f;
+            if (j0 + jj < out_f && c < in_f) ld8_CODEC(w + (u64)(j0 + jj) * row_bytes, c, wv);
+            for (u32 i = 0; i < 8u; i++) ws[jj * 33u + s * 8u + i] = (c + i < in_f) ? wv[i] : 0.0f;
+        }
+        BARRIER();
+        for (u32 kk = 0; kk < 32u; kk++) {
+            float x0 = xs[(ty * 2u) * 33u + kk], x1 = xs[(ty * 2u + 1u) * 33u + kk];
+            float w0 = ws[(tx * 2u) * 33u + kk], w1 = ws[(tx * 2u + 1u) * 33u + kk];
+            a00 += x0 * w0;
+            a01 += x0 * w1;
+            a10 += x1 * w0;
+            a11 += x1 * w1;
+        }
+        BARRIER();
+    }
+    u32 r = r0 + ty * 2u, j = j0 + tx * 2u;
+    float b0 = (has_bias && j < out_f) ? bias[bo + j] : 0.0f;
+    float b1 = (has_bias && j + 1u < out_f) ? bias[bo + j + 1u] : 0.0f;
+    if (r < rows && j < out_f) y[yo + r * out_f + j] = a00 + b0;
+    if (r < rows && j + 1u < out_f) y[yo + r * out_f + j + 1u] = a01 + b1;
+    if (r + 1u < rows && j < out_f) y[yo + (r + 1u) * out_f + j] = a10 + b0;
+    if (r + 1u < rows && j + 1u < out_f) y[yo + (r + 1u) * out_f + j + 1u] = a11 + b1;
+}
+
+// y[r, :] = table[ids[r], :d]: one thread per 8 columns of a row; ids out of range give zeros.
+KERNEL embed_CODEC(GLOBAL const u8* w, u64 row_bytes, u32 table_rows, GLOBAL const u32* ids,
+                   u32 io, GLOBAL float* y, u32 yo, u32 n, u32 d) {
+    u32 c = GID(0) * 8u, r = GRP(1);
+    if (c >= d || r >= n) return;
+    u32 id = ids[io + r];
+    float wv[8];
+    for (u32 i = 0; i < 8u; i++) wv[i] = 0.0f;
+    if (id < table_rows) ld8_CODEC(w + (u64)id * row_bytes, c, wv);
+    u32 nv = d - c < 8u ? d - c : 8u;
+    for (u32 i = 0; i < nv; i++) y[yo + r * d + c + i] = wv[i];
+}
+
+// MoeLinear: slot s multiplies its x row by row j of expert ids[s]: one workgroup per (j, s).
+KERNEL moe_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_bytes,
+                 GLOBAL const u32* ids, u32 io, GLOBAL float* y, u32 yo, u32 top_k, u32 in_f,
+                 u32 out_f, u32 per_slot, u32 experts) {
+    LOCAL float red[64];
+    u32 j = GRP(0), s = GRP(1), t = LID(0);
+    u32 e = ids[io + s];
+    GLOBAL const float* xr = x + xo + (per_slot ? s : s / top_k) * in_f;
+    float acc = 0.0f;
+    if (e < experts) {
+        GLOBAL const u8* wr = w + (u64)(e * out_f + j) * row_bytes;
+        for (u32 c = t * 8u; c < in_f; c += 64u * 8u) {
+            float wv[8];
+            ld8_CODEC(wr, c, wv);
+            u32 nv = in_f - c < 8u ? in_f - c : 8u;
+            for (u32 i = 0; i < nv; i++) acc += wv[i] * xr[c + i];
+        }
+    }
+    red[t] = acc;
+    BARRIER();
+    for (u32 k = 32u; k > 0u; k >>= 1) {
+        if (t < k) red[t] += red[t + k];
+        BARRIER();
+    }
+    if (t == 0u) y[yo + s * out_f + j] = red[0];
+}

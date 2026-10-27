@@ -2,8 +2,8 @@
 //!
 //! Computes exact SSA value liveness intervals `[first_def, last_use]` for any [`Graph`] and packs
 //! non-aliasing intermediate tensors into a single aligned arena buffer (256-byte alignment by
-//! default) using best-fit free-span recycling. Shared across Metal, CUDA, ROCm, Intel XPU, XLA,
-//! and Extropic backends.
+//! default) using best-fit free-span recycling. Used by the portable (CUDA, ROCm, Intel XPU)
+//! executor.
 
 use crate::graph::{DType, Graph, ValueId, ValueKind};
 use std::collections::HashMap;

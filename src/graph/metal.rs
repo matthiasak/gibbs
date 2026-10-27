@@ -52,7 +52,7 @@ pub fn new_shared_buffer(device: &Device, bytes: usize) -> Result<Buffer, String
     Ok(buf)
 }
 
-pub fn set_bytes<T>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
+pub(crate) fn set_bytes<T>(enc: &Counted, index: u64, value: &T) {
     enc.set_bytes(
         index,
         std::mem::size_of::<T>() as u64,
@@ -60,11 +60,18 @@ pub fn set_bytes<T>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
     );
 }
 
-/// Compute encoder that counts `dispatch_thread_groups` calls (the only dispatch form used).
-/// Everything else goes through `Deref` to the raw encoder.
+/// Buffer argument slots of a compute encoder (Metal's limit).
+const ENC_SLOTS: usize = 31;
+
+/// Compute encoder that counts `dispatch_thread_groups` calls (the only dispatch form used) and
+/// skips redundant bindings: a pipeline equal to the bound one, a `(buffer, offset)` equal to the
+/// slot's binding (an offset-only change uses `setBufferOffset:atIndex:`). Everything else goes
+/// through `Deref` to the raw encoder; bindings must go through these methods to keep the cache true.
 pub(crate) struct Counted<'a> {
     inner: &'a ComputeCommandEncoderRef,
     dispatches: std::cell::Cell<u32>,
+    pso: std::cell::Cell<*const ComputePipelineStateRef>,
+    bufs: [std::cell::Cell<(*const BufferRef, u64)>; ENC_SLOTS],
 }
 
 impl<'a> Counted<'a> {
@@ -72,6 +79,8 @@ impl<'a> Counted<'a> {
         Self {
             inner,
             dispatches: std::cell::Cell::new(0),
+            pso: std::cell::Cell::new(std::ptr::null()),
+            bufs: std::array::from_fn(|_| std::cell::Cell::new((std::ptr::null(), 0))),
         }
     }
     pub(crate) fn dispatches(&self) -> u32 {
@@ -80,6 +89,32 @@ impl<'a> Counted<'a> {
     pub(crate) fn dispatch_thread_groups(&self, groups: MTLSize, threads: MTLSize) {
         self.dispatches.set(self.dispatches.get() + 1);
         self.inner.dispatch_thread_groups(groups, threads);
+    }
+    pub(crate) fn set_compute_pipeline_state(&self, pso: &ComputePipelineStateRef) {
+        if !std::ptr::eq(self.pso.get(), pso) {
+            self.pso.set(pso);
+            self.inner.set_compute_pipeline_state(pso);
+        }
+    }
+    pub(crate) fn set_buffer(&self, index: u64, buffer: Option<&BufferRef>, offset: u64) {
+        let b = buffer.map_or(std::ptr::null(), |b| b as *const BufferRef);
+        let Some(slot) = self.bufs.get(index as usize) else {
+            return self.inner.set_buffer(index, buffer, offset);
+        };
+        let (bound, bound_off) = slot.get();
+        slot.set((b, offset));
+        if b.is_null() || b != bound {
+            self.inner.set_buffer(index, buffer, offset);
+        } else if offset != bound_off {
+            // SAFETY: `setBufferOffset:atIndex:` on a slot holding a buffer (bound above).
+            let () = unsafe { msg_send![self.inner, setBufferOffset: offset atIndex: index] };
+        }
+    }
+    pub(crate) fn set_bytes(&self, index: u64, length: u64, bytes: *const c_void) {
+        if let Some(slot) = self.bufs.get(index as usize) {
+            slot.set((std::ptr::null(), 0));
+        }
+        self.inner.set_bytes(index, length, bytes);
     }
 }
 
@@ -161,18 +196,32 @@ pub(crate) fn profile_requested() -> bool {
     PROFILE_NEXT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A greedy decode stream ([`Session::submit_fed`]): each token's command buffers are queued before
-/// the previous token is read back, and token ids flow between tokens on the device through `ring`.
+/// A sampled fed stream's sampler: top-`top_k` at `1 / inv_temp`, nucleus `top_p`.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleGpuSpec {
     pub vocab: u32,
     pub top_k: u32,
     pub inv_temp: f32,
     pub top_p: f32,
-    pub rep_penalty: f32,
     pub rng_seed: u64,
 }
 
+/// `SampleGpuParams` of `sample_topk_part` / `sample_topk_final` (`metal_kernels.metal`).
+#[repr(C)]
+struct SampleGpuParams {
+    vocab: u32,
+    top_k: u32,
+    inv_temp: f32,
+    top_p: f32,
+    rng_seed: u64,
+}
+
+/// Logits one `sample_topk_part` threadgroup covers (`SAMPLE_SPAN` in the MSL).
+const SAMPLE_SPAN: usize = 4096;
+
+/// A greedy or sampled decode stream ([`Session::submit_fed`]): each token's command buffers are
+/// queued before the previous token is read back, and token ids flow between tokens on the device
+/// through `ring`.
 pub struct FedStream {
     /// Slot `t % 4` (16 bytes at `16 * (t % 4)`) holds token `t`'s `[position, picked token, -, -]`;
     /// byte 64 holds the stream's first input token.
@@ -189,8 +238,6 @@ pub struct FedStream {
     /// When the last [`Session::wait_fed`] returned.
     last_wait: Option<Instant>,
     pub(crate) sample_spec: Option<SampleGpuSpec>,
-    pub(crate) recent_buf: Option<Buffer>,
-    pub(crate) recent_len: u32,
 }
 impl FedStream {
     pub(crate) fn in_flight(&self) -> usize {
@@ -258,10 +305,10 @@ use metal::foreign_types::ForeignType;
 use metal::objc::runtime::Object;
 use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
-    BinaryArchiveDescriptor, Buffer, CommandBufferRef, CommandQueue, CompileOptions,
+    BinaryArchiveDescriptor, Buffer, BufferRef, CommandBufferRef, CommandQueue, CompileOptions,
     ComputeCommandEncoderRef, ComputePipelineDescriptor, ComputePipelineDescriptorRef,
-    ComputePipelineState, Device, DeviceRef, Library, MTLComputePipelineState, MTLPipelineOption,
-    MTLResourceOptions, MTLSize, URL,
+    ComputePipelineState, ComputePipelineStateRef, Device, DeviceRef, Library,
+    MTLComputePipelineState, MTLPipelineOption, MTLResourceOptions, MTLSize, URL,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -402,22 +449,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::RelPosBias { .. }
         | Op::StateReorder
         | Op::L2Normalize => dtype == DType::F32,
-        Op::Megakernel(_) => {
-            matches!(
-                dtype,
-                DType::F32
-                    | DType::F16
-                    | DType::BF16
-                    | DType::Quant(QuantFormat::GGUF_Q4_0)
-                    | DType::Quant(QuantFormat::GGUF_Q8_0)
-                    | DType::Quant(QuantFormat::GGUF_IQ4_XS)
-                    | DType::Quant(QuantFormat::GGUF_IQ2_M)
-                    | DType::Quant(QuantFormat::GGUF_IQ2_S)
-                    | DType::Quant(QuantFormat::GGUF_Q4_K_M)
-                    | DType::Quant(QuantFormat::GGUF_Q2_K)
-                    | DType::Quant(QuantFormat::GGUF_IQ3_S)
-            )
-        }
+        Op::Megakernel(_) => crate::graph::passes::megakernel::megakernel_dtype(dtype),
         _ => false,
     }
 }
@@ -472,7 +504,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 76] = [
+const BASE_KERNELS: [&str; 77] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -548,7 +580,8 @@ const BASE_KERNELS: [&str; 76] = [
     "attn_cached_merge_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
-    "sample_logits_gpu",
+    "sample_topk_part",
+    "sample_topk_final",
 ];
 const MPP_KERNELS: [&str; 18] = [
     "gemm_mpp_none",
@@ -1970,14 +2003,9 @@ impl Session {
                 *v = match self.variant_override {
                     Some(o) if allowed.contains(&o) => o,
                     Some(_) => f.default_variant(),
-                    None if !matches!(f, WeightFormat::Q4_0 | WeightFormat::Q4_K)
-                        && tune::enabled()
-                        && allowed.len() > 1 =>
-                    {
-                        *chosen
-                            .entry((f, rows, cols))
-                            .or_insert_with(|| self.rt.tuned_variant(f, rows, cols))
-                    }
+                    None if tune::enabled() && allowed.len() > 1 => *chosen
+                        .entry((f, rows, cols))
+                        .or_insert_with(|| self.rt.tuned_variant(f, rows, cols)),
                     None => f.default_variant(),
                 };
             }
@@ -2073,6 +2101,7 @@ impl Session {
             &offsets,
             self.variant_override == Some(GemvVariant::HAND),
         );
+        fuse_moe_down_wsum(graph, &mut steps, &aliases, &offsets);
         let mut arena = self.arena.lock();
         if arena
             .as_ref()
@@ -2325,7 +2354,11 @@ impl Session {
         write: std::ops::Range<usize>,
     ) -> Result<Vec<Arc<Buffer>>, String> {
         let mut state_bufs: Vec<Arc<Buffer>> = Vec::with_capacity(plan.state_vars.len());
-        if plan.state_vars.iter().any(|(_, n)| self.kv_paged.contains(n)) {
+        if plan
+            .state_vars
+            .iter()
+            .any(|(_, n)| self.kv_paged.contains(n))
+        {
             let view = state
                 .as_mut()
                 .and_then(|st| st.kv.as_mut())
@@ -2499,8 +2532,13 @@ impl Session {
                 _ => None,
             })
             .fold((usize::MAX, 0), |(s, e), (a, b)| (s.min(a), e.max(b)));
-        let state_bufs =
-            self.resolve_state_bufs(graph, plan, state, need_rows, start.min(need_rows)..need_rows)?;
+        let state_bufs = self.resolve_state_bufs(
+            graph,
+            plan,
+            state,
+            need_rows,
+            start.min(need_rows)..need_rows,
+        )?;
 
         let size = plan.arena_size;
         let mut arena = self.arena.lock();
@@ -2574,7 +2612,7 @@ impl Session {
                 *LAST_PROFILE.lock() = Some((Instant::now(), rows));
             } else {
                 let (cbs, dispatches, encode_dur) =
-                    self.encode_chunks(steps, &loc, mlp_scratch_buf.as_ref())?;
+                    self.encode_chunks(steps, &loc, mlp_scratch_buf.as_ref(), None)?;
                 let last = cbs.last().expect("a plan has at least one step");
                 commit_and_wait(last)?;
                 for cb in &cbs[..cbs.len() - 1] {
@@ -2661,7 +2699,7 @@ impl Session {
         pos: u32,
         budget: usize,
     ) -> Result<FedStream, String> {
-        self.new_fed_stream_with_sample(graph, plan, state, last, pos, budget, None, &[])
+        self.new_fed_stream_with_sample(graph, plan, state, last, pos, budget, None)
     }
 
     pub(crate) fn new_fed_stream_with_sample(
@@ -2673,27 +2711,15 @@ impl Session {
         pos: u32,
         budget: usize,
         sample_spec: Option<SampleGpuSpec>,
-        recent: &[u32],
     ) -> Result<FedStream, String> {
+        // Greedy streams bind output 0 to the ring word, so a step must write it (not a view of it).
+        let out = graph.outputs.first();
+        if sample_spec.is_none() && !plan.steps.iter().any(|st| Some(&st.out) == out) {
+            return Err("a greedy fed stream needs output 0 written by a step".into());
+        }
         let ring = new_shared_buffer(&self.rt.device, 128)?;
         // SAFETY: a fresh 128-byte shared buffer no command buffer uses yet.
         unsafe { *(ring.contents() as *mut u32).add(16) = last };
-        let (recent_buf, recent_len) = if sample_spec.is_some() {
-            let buf = new_shared_buffer(&self.rt.device, 64 * 4)?;
-            let n = recent.len().min(64);
-            if n > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        recent[recent.len() - n..].as_ptr(),
-                        buf.contents() as *mut u32,
-                        n,
-                    );
-                }
-            }
-            (Some(buf), n as u32)
-        } else {
-            (None, 0)
-        };
         let at = pos as usize;
         let state_bufs =
             self.resolve_state_bufs(graph, plan, Some(state), at + budget, at..at + 1)?;
@@ -2708,14 +2734,12 @@ impl Session {
             last,
             last_wait: None,
             sample_spec,
-            recent_buf,
-            recent_len,
         })
     }
 
     /// Encodes and commits the stream's next token: its id is the previous token's device pick
-    /// (the first token's from the ring), its position host-written into its ring slot; a blit
-    /// copies the picked id (output 0) into that slot. Nothing waits.
+    /// (the first token's from the ring), its position host-written into its ring slot; the picked
+    /// id lands in that slot (greedy: output 0's step writes it; sampled: the sampler does). Nothing waits.
     pub(crate) fn submit_fed(
         &self,
         graph: &Graph,
@@ -2744,7 +2768,11 @@ impl Session {
             let arena = arena.as_ref().expect("allocated above");
             let mlp_scratch_buf = self.mlp_scratch_for(plan)?;
             let (ring, state_bufs) = (&s.ring, &s.state_bufs);
+            let direct = s.sample_spec.is_none();
             let loc = |v: ValueId| -> (&Buffer, usize) {
+                if direct && v == out {
+                    return (ring, 16 * slot + 4);
+                }
                 if let Some(&(_, i, off)) = plan.input_views.iter().find(|x| x.0 == v) {
                     return (ring, if i == 0 { ids_at } else { 16 * slot } + off);
                 }
@@ -2758,54 +2786,33 @@ impl Session {
                     }
                 }
             };
+            let sample = |enc: &Counted| -> Result<(), String> {
+                let Some(sp) = s.sample_spec else {
+                    return Ok(());
+                };
+                let p = SampleGpuParams {
+                    vocab: sp.vocab,
+                    top_k: sp.top_k,
+                    inv_temp: sp.inv_temp,
+                    top_p: sp.top_p,
+                    rng_seed: sp
+                        .rng_seed
+                        .wrapping_add((t as u64).wrapping_mul(0x9E3779B97F4A7C15)),
+                };
+                self.encode_sample(enc, loc(out), (ring, 16 * slot + 4), &p)
+            };
             metal::objc::rc::autoreleasepool(|| {
                 use std::sync::atomic::Ordering::Relaxed;
                 self.fed_ids.store(true, Relaxed);
-                let r = self.encode_chunks(&plan.steps, &loc, mlp_scratch_buf.as_ref());
+                let r = self.encode_chunks(
+                    &plan.steps,
+                    &loc,
+                    mlp_scratch_buf.as_ref(),
+                    (!direct).then_some(&sample as &dyn Fn(&Counted) -> Result<(), String>),
+                );
                 self.fed_ids.store(false, Relaxed);
-                let (cbs, mut dispatches, encode_dur) = r?;
+                let (cbs, dispatches, encode_dur) = r?;
                 let last = cbs.last().expect("encode_chunks returns a buffer");
-                let (ob, oo) = loc(out);
-                if let (Some(sp), Some(rb)) = (s.sample_spec, s.recent_buf.as_ref()) {
-                    #[repr(C)]
-                    struct SampleGpuParams {
-                        vocab: u32,
-                        top_k: u32,
-                        inv_temp: f32,
-                        top_p: f32,
-                        rep_penalty: f32,
-                        n_recent: u32,
-                        rng_seed: u64,
-                    }
-                    let enc = last.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(self.rt.pso("sample_logits_gpu")?);
-                    enc.set_buffer(0, Some(ob), oo as u64);
-                    enc.set_buffer(1, Some(ring), (16 * slot + 4) as u64);
-                    enc.set_buffer(2, Some(rb), 0);
-                    let p = SampleGpuParams {
-                        vocab: sp.vocab,
-                        top_k: sp.top_k,
-                        inv_temp: sp.inv_temp,
-                        top_p: sp.top_p,
-                        rep_penalty: sp.rep_penalty,
-                        n_recent: s.recent_len.max(1).min(64),
-                        rng_seed: sp
-                            .rng_seed
-                            .wrapping_add((t as u64).wrapping_mul(0x9E3779B97F4A7C15)),
-                    };
-                    enc.set_bytes(
-                        3,
-                        std::mem::size_of::<SampleGpuParams>() as u64,
-                        &p as *const SampleGpuParams as *const c_void,
-                    );
-                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-                    enc.end_encoding();
-                    dispatches += 1;
-                } else {
-                    let blit = last.new_blit_command_encoder();
-                    blit.copy_from_buffer(ob, oo as u64, ring, (16 * slot + 4) as u64, 4);
-                    blit.end_encoding();
-                }
                 last.commit();
                 *self.fed_tail.lock() = Some(last.clone());
                 Ok::<_, String>((cbs, dispatches, encode_dur))
@@ -2819,6 +2826,36 @@ impl Session {
             started,
         });
         s.submitted += 1;
+        Ok(())
+    }
+
+    /// Encodes the exact top-k sampler over `p.vocab` f32 `logits`: `sample_topk_part` writes each
+    /// 4096-wide span's top-k to `argmax_scratch`, `sample_topk_final` draws from their top-k and
+    /// writes the id to `out` and the kept `(id, prob)` list to scratch offset 0.
+    fn encode_sample(
+        &self,
+        enc: &Counted,
+        logits: (&Buffer, usize),
+        out: (&Buffer, usize),
+        p: &SampleGpuParams,
+    ) -> Result<(), String> {
+        let parts = (p.vocab as usize).div_ceil(SAMPLE_SPAN);
+        let need = parts * (p.top_k as usize).clamp(1, 64) * 8;
+        let mut guard = self.argmax_scratch.lock();
+        if guard.as_ref().is_none_or(|b| (b.length() as usize) < need) {
+            *guard = Some(new_shared_buffer(&self.rt.device, need)?);
+        }
+        let scratch = guard.as_ref().expect("allocated above");
+        enc.set_compute_pipeline_state(self.rt.pso("sample_topk_part")?);
+        enc.set_buffer(0, Some(logits.0), logits.1 as u64);
+        enc.set_buffer(1, Some(scratch), 0);
+        set_bytes(enc, 2, p);
+        enc.dispatch_thread_groups(MTLSize::new(parts as u64, 1, 1), MTLSize::new(256, 1, 1));
+        // Slot 2 (params) stays bound.
+        enc.set_compute_pipeline_state(self.rt.pso("sample_topk_final")?);
+        enc.set_buffer(0, Some(scratch), 0);
+        enc.set_buffer(1, Some(out.0), out.1 as u64);
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         Ok(())
     }
 
@@ -2840,7 +2877,7 @@ impl Session {
                 cb.status()
             ));
         }
-        // SAFETY: the token's blit wrote this word and its command buffers completed.
+        // SAFETY: the token's last step wrote this word and its command buffers completed.
         let tok = unsafe { *(s.ring.contents() as *const u32).add(4 * f.slot + 1) };
         let span = gpu_span_seconds(&f.cbs[0], last);
         self.last_gpu_s
@@ -2879,12 +2916,14 @@ impl Session {
     }
 
     /// Encodes `steps` into command buffers cut into chunks, committing every chunk but the last as
-    /// soon as it is encoded; returns the buffers (the last uncommitted), dispatches and encode time.
+    /// soon as it is encoded; `tail` encodes into the last chunk's encoder after the steps. Returns
+    /// the buffers (the last uncommitted), dispatches and encode time.
     fn encode_chunks<'a>(
         &self,
         steps: &[Planned],
         loc: &dyn Fn(ValueId) -> (&'a Buffer, usize),
         mlp_scratch: Option<&Buffer>,
+        tail: Option<&dyn Fn(&Counted) -> Result<(), String>>,
     ) -> Result<(Vec<metal::CommandBuffer>, u32, std::time::Duration), String> {
         // The GPU runs the first `CB_FIRST_STEPS` steps while the host encodes the rest (encoding costs
         // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
@@ -2900,8 +2939,8 @@ impl Session {
         let mut err = None;
         let mut dispatches = 0u32;
         let encode_start = std::time::Instant::now();
-        let mut at = 0;
-        while at < steps.len() && err.is_none() {
+        let mut at = 0usize;
+        loop {
             let end = if cbs.is_empty() {
                 first
             } else {
@@ -2917,6 +2956,9 @@ impl Session {
                     break;
                 }
             }
+            if let (true, None, Some(t)) = (end == steps.len(), &err, tail) {
+                err = t(&counted).err();
+            }
             enc.end_encoding();
             dispatches += counted.dispatches();
             if end < steps.len() && err.is_none() {
@@ -2924,6 +2966,9 @@ impl Session {
             }
             cbs.push(cb);
             at = end;
+            if at == steps.len() || err.is_some() {
+                break;
+            }
         }
         let encode_dur = encode_start.elapsed();
         if let Some(e) = err {
@@ -2932,11 +2977,6 @@ impl Session {
                 cbs[cbs.len() - 2].wait_until_completed();
             }
             return Err(e);
-        }
-        if cbs.is_empty() {
-            let cb = self.rt.queue.new_command_buffer().to_owned();
-            cb.new_compute_command_encoder().end_encoding();
-            cbs.push(cb);
         }
         Ok((cbs, dispatches, encode_dur))
     }
@@ -4461,8 +4501,7 @@ fn assign_kv_dtypes(graph: &Graph, steps: &mut [Planned]) -> HashSet<String> {
             ..
         } = &mut s.op
         {
-            *kv_f16 =
-                matches!(&graph.value(*k).kind, ValueKind::State { name, .. } if f16.contains(name));
+            *kv_f16 = matches!(&graph.value(*k).kind, ValueKind::State { name, .. } if f16.contains(name));
         }
     }
     f16
@@ -4540,6 +4579,86 @@ pub struct GemvPairLeg {
     pub rows: usize,
     pub out: ValueId,
     pub variant: GemvVariant,
+}
+
+/// Folds a decode-sized (`slots < MOE_GEMM_MIN_SLOTS`) per-slot `ExpertLinear` (the MoE down
+/// projection) into the `MoeWeightedSum` right after it when that sum is its only reader: the
+/// GEMV then writes each token's routing-weighted sum (`codegen::gemv_indexed_wsum`) to the sum's
+/// output, one dispatch and no `[slots, rows]` round trip. Runs after arena allocation, so it
+/// requires the sum's output disjoint from the GEMV's inputs (their space is free from the sum on).
+fn fuse_moe_down_wsum(
+    graph: &Graph,
+    steps: &mut Vec<Planned>,
+    aliases: &HashMap<ValueId, (ValueId, usize)>,
+    offsets: &HashMap<ValueId, usize>,
+) {
+    use ext::moe::{Step as Moe, MOE_GEMM_MIN_SLOTS};
+    if !fusion_enabled() {
+        return;
+    }
+    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
+    let range_of = |v: ValueId| -> Option<(usize, usize)> {
+        let off = *offsets.get(&v)?;
+        Some((
+            off,
+            off + graph.value(v).shape.iter().product::<usize>() * 4,
+        ))
+    };
+    let overlaps = |(a0, a1): (usize, usize), (b0, b1): (usize, usize)| a0 < b1 && b0 < a1;
+    let mut i = 0;
+    while i + 1 < steps.len() {
+        let (el, sum) = (&steps[i], &steps[i + 1]);
+        let weights = match (&el.op, &sum.op) {
+            (
+                Step::Ext(ext::ExtStep::Experts(Moe::ExpertLinear {
+                    rows,
+                    slots,
+                    top_k,
+                    x_per_slot: true,
+                    wsum: None,
+                    ..
+                })),
+                &Step::MoeWeightedSum {
+                    down,
+                    weights,
+                    n,
+                    k,
+                    h,
+                },
+            ) if down == el.out
+                && k == *top_k
+                && n * k == *slots
+                && h == *rows
+                && *slots < MOE_GEMM_MIN_SLOTS
+                && el.extra_outs.is_empty()
+                && !graph.outputs.iter().any(|&o| root(o) == root(el.out))
+                && steps.iter().enumerate().all(|(j, s)| {
+                    j == i + 1 || !s.reads.iter().any(|&r| root(r) == root(el.out))
+                })
+                && range_of(sum.out).is_some_and(|o| {
+                    el.reads
+                        .iter()
+                        .chain([&weights])
+                        .filter_map(|&r| range_of(r))
+                        .all(|r| !overlaps(o, r))
+                }) =>
+            {
+                weights
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let sum = steps.remove(i + 1);
+        let el = &mut steps[i];
+        if let Step::Ext(ext::ExtStep::Experts(Moe::ExpertLinear { wsum, .. })) = &mut el.op {
+            *wsum = Some(weights);
+        }
+        el.out = sum.out;
+        el.reads.push(weights);
+        i += 1;
+    }
 }
 
 /// Pairs already-adjacent small-row (`rows <= 512`) `HAND` `Step::GemvPacked` projections sharing
@@ -5926,6 +6045,7 @@ pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
     let mut steps = batch_horizontal(steps, &aliases)?;
     let (offsets, arena) = allocate(g, &steps, &aliases)?;
     pair_small_hand_gemvs(g, &mut steps, &aliases, &offsets, false);
+    fuse_moe_down_wsum(g, &mut steps, &aliases, &offsets);
     let mut out = String::new();
     let mut kinds: HashMap<String, usize> = HashMap::new();
     let (mut layer, mut dispatches, mut unassigned) = (None, 0usize, 0usize);

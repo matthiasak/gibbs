@@ -99,41 +99,6 @@ mod tests {
         let d = GemvParams::default();
         assert_eq!(gemv_packed_name(c, d), "gemvgen_GGUF_Q4_K_M_r2");
     }
-
-    #[test]
-    fn multi_dialect_codegen_emits_valid_msl_cuda_hip_and_opencl_kernels() {
-        let c = codec(QuantFormat::GGUF_Q4_K_M).expect("Q4_K_M codec");
-        for dialect in [
-            ShaderDialect::Msl,
-            ShaderDialect::Cuda,
-            ShaderDialect::Hip,
-            ShaderDialect::OpenClSycl,
-        ] {
-            let mega = mlp_megakernel_for_dialect(c, false, dialect);
-            assert!(!mega.is_empty());
-            match dialect {
-                ShaderDialect::Msl => {
-                    assert!(mega.contains("kernel void mlp_mega_"));
-                    assert!(mega.contains("[[buffer(0)]]"));
-                }
-                ShaderDialect::Cuda => {
-                    assert!(mega.contains("extern \"C\" __global__ void mlp_mega_"));
-                    assert!(mega.contains("__shfl_xor_sync"));
-                    assert!(!mega.contains("[[buffer("));
-                }
-                ShaderDialect::Hip => {
-                    assert!(mega.contains("extern \"C\" __global__ void mlp_mega_"));
-                    assert!(mega.contains("__shfl_xor("));
-                    assert!(!mega.contains("[[buffer("));
-                }
-                ShaderDialect::OpenClSycl => {
-                    assert!(mega.contains("__kernel void mlp_mega_"));
-                    assert!(mega.contains("sub_group_reduce_add"));
-                    assert!(!mega.contains("[[buffer("));
-                }
-            }
-        }
-    }
 }
 
 /// Rows one threadgroup of [`gemv_packed`] covers: `simdgroups` × `rows_per_sg`.
@@ -898,254 +863,85 @@ kernel void {name}(
     )
 }
 
-/// Name of the cooperative decode MLP megakernel for `(codec, is_geglu)`.
-pub fn mlp_megakernel_name(codec: &Codec, is_geglu: bool) -> String {
-    let act = if is_geglu { "geglu" } else { "swiglu" };
-    format!("mlp_mega_{:?}_{act}", codec.format)
+/// Name of the kernel [`gemv_indexed_wsum`] emits for `codec` with `p`.
+pub fn gemv_indexed_wsum_name(codec: &Codec, p: GemvParams) -> String {
+    format!("gemvgen_{:?}_r{}_ixw", codec.format, p.rows_per_sg)
 }
 
-/// Cooperative decode MLP megakernel (`m == 1`, `hidden <= 4096`): each threadgroup normalizes
-/// `x * norm_w` into `threadgroup float shared_x[4096]` and computes a tile of `SwiGLU(gate(shared_x), up(shared_x))`.
-pub fn mlp_megakernel_msl(codec: &Codec, is_geglu: bool) -> String {
-    let name = mlp_megakernel_name(codec, is_geglu);
+/// [`gemv_indexed`] (`x_per_slot`) fused with the routing-weighted sum over each token's `top_k`
+/// slots: threadgroup `(i, t)` multiplies row `t * top_k + j` of `x` by matrix `ids[t * top_k + j]`
+/// for every `j` and writes row `t` of `y` (`[slots / top_k, rows]`) as `Σ_j weights[slot] * row`
+/// in slot order (as `moe_weighted_sum_f32`; a slot whose id is not below `experts` adds zero).
+/// Buffers `w, x, y, MoeGemvParams, ids, weights`; grid `(ceil(rows / gemv_rows_per_tg), slots / top_k)`.
+pub fn gemv_indexed_wsum(codec: &Codec, p: GemvParams) -> String {
+    let name = gemv_indexed_wsum_name(codec, p);
     let dec = format!("decode8_{:?}", codec.format);
     let codec_msl = device_msl(codec).replace("decode8", &dec);
-    let (be, subs) = (codec.block_elems, codec.block_elems / 8);
-    let gate_br = block_ref(codec, "gate_w", "row * blocks_per_row + b");
-    let up_br = block_ref(codec, "up_w", "row * blocks_per_row + b");
-    let act_expr = if is_geglu {
-        "u * (0.5f * g * (1.0f + tanh(0.7978845608f * (g + 0.044715f * g * g * g))))"
-    } else {
-        "u * (g / (1.0f + exp(-g)))"
+    let r = p.rows_per_sg;
+    let be = codec.block_elems;
+    let decl = |v: &str| {
+        (0..r)
+            .map(|i| format!("float {v}{i} = 0.0f;"))
+            .collect::<Vec<_>>()
+            .join(" ")
     };
+    let loop_src = gemv_loop(codec, p, &dec, "(bank_row + row0", false);
+    let sums: String = (0..r)
+        .map(|i| format!("        out{i} += simd_sum(acc{i}) * wt;\n"))
+        .collect();
+    let store: String = (0..r)
+        .map(|i| {
+            format!("        if (row0 + {i} < p.rows) y[(ulong)tok * p.rows + row0 + {i}] = out{i};\n")
+        })
+        .collect();
     format!(
         r#"
 {codec_msl}
+{wide_msl}
 
-struct MlpMegaParams {{
-    uint hidden;
-    uint inter;
-    float eps;
+struct MoeGemvWsumParams {{
+    uint rows;
+    uint cols;
+    uint slots;
+    uint top_k;
+    uint experts;
+    uint x_per_slot;
 }};
 
 kernel void {name}(
-    device const float* x [[buffer(0)]],
-    device const float* norm_w [[buffer(1)]],
-    device const uchar* gate_w [[buffer(2)]],
-    device const uchar* up_w [[buffer(3)]],
-    device float* inter_out [[buffer(4)]],
-    constant MlpMegaParams& p [[buffer(5)]],
-    uint tg [[threadgroup_position_in_grid]],
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant MoeGemvWsumParams& p [[buffer(3)]],
+    device const uint* ids [[buffer(4)]],
+    device const float* weights [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint tid [[thread_index_in_threadgroup]]
+    uint lane [[thread_index_in_simdgroup]]
 ) {{
-    threadgroup float shared_x[4096];
-    threadgroup float sq_part[8];
-    float sq = 0.0f;
-    for (uint i = tid; i < p.hidden; i += 256) {{
-        float v = x[i];
-        sq += v * v;
-    }}
-    sq = simd_sum(sq);
-    if (lane == 0) sq_part[sg] = sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total_sq = sq_part[0] + sq_part[1] + sq_part[2] + sq_part[3]
-                   + sq_part[4] + sq_part[5] + sq_part[6] + sq_part[7];
-    float inv_rms = rsqrt(total_sq / float(p.hidden) + p.eps);
-    for (uint i = tid; i < p.hidden; i += 256) {{
-        shared_x[i] = x[i] * inv_rms * norm_w[i];
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint row = tg * 8 + sg;
-    if (row >= p.inter) return;
-    const uint blocks_per_row = p.hidden / {be};
-    float g = 0.0f;
-    float u = 0.0f;
-    for (uint s = lane; s < blocks_per_row * {subs}; s += 32) {{
-        const ulong b = s / {subs};
-        const uint sub = s % {subs};
-        const uint col = b * {be} + sub * 8;
-        float gw[8], uw[8];
-        {{ {gate_decl} {dec}(b, {gate_sub}sub, gw); }}
-        {{ {up_decl} {dec}(b, {up_sub}sub, uw); }}
-        #pragma unroll
-        for (uint i = 0; i < 8; ++i) {{
-            float xv = shared_x[col + i];
-            g += gw[i] * xv;
-            u += uw[i] * xv;
-        }}
-    }}
-    g = simd_sum(g);
-    u = simd_sum(u);
+    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
+    const uint tok = tg.y;
+    if (row0 >= p.rows || (tok + 1) * p.top_k > p.slots) return;
+    const uint blocks_per_row = p.cols / {be};
+    {out_decl}
+    for (uint j = 0; j < p.top_k; ++j) {{
+        const uint slot = tok * p.top_k + j;
+        const uint expert = ids[slot];
+        const float wt = weights[slot];
+        {acc_decl}
+        if (expert < p.experts) {{
+            const ulong bank_row = (ulong)expert * p.rows;
+            device const float* xb = x + (ulong)slot * p.cols;
+{loop_src}        }}
+{sums}    }}
     if (lane == 0) {{
-        inter_out[row] = {act_expr};
-    }}
+{store}    }}
 }}
 "#,
-        gate_decl = gate_br.decl,
-        gate_sub = gate_br.sub,
-        up_decl = up_br.decl,
-        up_sub = up_br.sub,
+        rows_per_tg = gemv_rows_per_tg(p),
+        wide_msl = wide_msl(codec, &dec, false),
+        out_decl = decl("out"),
+        acc_decl = decl("acc"),
     )
 }
 
-/// Target GPU shader language dialect for multi-hardware code generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ShaderDialect {
-    /// Apple Metal Shading Language (MSL).
-    Msl,
-    /// NVIDIA CUDA C++ (for NVRTC -> PTX).
-    Cuda,
-    /// AMD ROCm HIP C++ (for hipRTC -> HSACO).
-    Hip,
-    /// OpenCL C / Intel XPU SYCL kernel source.
-    OpenClSycl,
-}
-
-/// Translates a generated MSL kernel or device function into `dialect` (`Msl`, `Cuda`, `Hip`, `OpenClSycl`).
-pub fn translate_msl_to_dialect(msl: &str, dialect: ShaderDialect) -> String {
-    if dialect == ShaderDialect::Msl {
-        return msl.to_string();
-    }
-
-    let preamble = match dialect {
-        ShaderDialect::Msl => "",
-        ShaderDialect::Cuda => {
-            r#"// Generated by Gibbs Multi-Dialect Codegen (CUDA NVRTC)
-typedef unsigned char uchar;
-typedef unsigned short ushort;
-typedef unsigned int uint;
-typedef unsigned long long ulong;
-__device__ __forceinline__ float gibbs_simd_sum(float v) {
-    for (int mask = 16; mask > 0; mask >>= 1)
-        v += __shfl_xor_sync(0xffffffffu, v, mask);
-    return v;
-}
-__device__ __forceinline__ float gibbs_simd_shuffle_xor(float v, int m) {
-    return __shfl_xor_sync(0xffffffffu, v, m);
-}
-#define GIBBS_TG_BARRIER() __syncthreads()
-"#
-        }
-        ShaderDialect::Hip => {
-            r#"// Generated by Gibbs Multi-Dialect Codegen (ROCm hipRTC)
-typedef unsigned char uchar;
-typedef unsigned short ushort;
-typedef unsigned int uint;
-typedef unsigned long long ulong;
-__device__ __forceinline__ float gibbs_simd_sum(float v) {
-    for (int mask = 16; mask > 0; mask >>= 1)
-        v += __shfl_xor(v, mask);
-    return v;
-}
-__device__ __forceinline__ float gibbs_simd_shuffle_xor(float v, int m) {
-    return __shfl_xor(v, m);
-}
-#define GIBBS_TG_BARRIER() __syncthreads()
-"#
-        }
-        ShaderDialect::OpenClSycl => {
-            r#"// Generated by Gibbs Multi-Dialect Codegen (OpenCL / Intel XPU SYCL)
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-#pragma OPENCL EXTENSION cl_khr_subgroups : enable
-#define gibbs_simd_sum(v) sub_group_reduce_add(v)
-#define gibbs_simd_shuffle_xor(v, m) intel_sub_group_shuffle_xor(v, m)
-#define GIBBS_TG_BARRIER() barrier(CLK_LOCAL_MEM_FENCE)
-"#
-        }
-    };
-
-    let mut out = String::with_capacity(preamble.len() + msl.len() + 256);
-    out.push_str(preamble);
-
-    let mut body = msl
-        .replace(
-            "threadgroup_barrier(mem_flags::mem_threadgroup)",
-            "GIBBS_TG_BARRIER()",
-        )
-        .replace("simd_sum(", "gibbs_simd_sum(")
-        .replace("simd_shuffle_xor(", "gibbs_simd_shuffle_xor(");
-
-    match dialect {
-        ShaderDialect::Cuda | ShaderDialect::Hip => {
-            body = body
-                .replace("kernel void ", "extern \"C\" __global__ void ")
-                .replace("static inline ", "__device__ __forceinline__ ")
-                .replace("threadgroup ", "__shared__ ")
-                .replace("device const ", "const ")
-                .replace("device ", "")
-                .replace("constant ", "const ");
-        }
-        ShaderDialect::OpenClSycl => {
-            body = body
-                .replace("kernel void ", "__kernel void ")
-                .replace("threadgroup ", "__local ")
-                .replace("device const ", "__global const ")
-                .replace("device ", "__global ")
-                .replace("constant ", "__constant ");
-        }
-        ShaderDialect::Msl => {}
-    }
-
-    // Strip MSL `[[buffer(N)]]` and thread/simdgroup index attributes, binding built-in indices at the start of the kernel body.
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("[[threadgroup_position_in_grid]]")
-            || trimmed.contains("[[simdgroup_index_in_threadgroup]]")
-            || trimmed.contains("[[thread_index_in_simdgroup]]")
-            || trimmed.contains("[[thread_index_in_threadgroup]]")
-            || trimmed.contains("[[thread_position_in_grid]]")
-        {
-            continue;
-        }
-        let cleaned = strip_msl_buffer_attrs(line, dialect);
-        out.push_str(&cleaned);
-        out.push('\n');
-        if trimmed == ") {" {
-            match dialect {
-                ShaderDialect::Cuda | ShaderDialect::Hip => {
-                    out.push_str(
-                        "    const uint tid = threadIdx.x;\n    const uint sg = tid >> 5;\n    const uint lane = tid & 31u;\n    const uint tg = blockIdx.x;\n",
-                    );
-                }
-                ShaderDialect::OpenClSycl => {
-                    out.push_str(
-                        "    const uint tid = get_local_id(0);\n    const uint sg = tid >> 5;\n    const uint lane = tid & 31u;\n    const uint tg = get_group_id(0);\n",
-                    );
-                }
-                ShaderDialect::Msl => {}
-            }
-        }
-    }
-    out
-}
-
-fn strip_msl_buffer_attrs(line: &str, dialect: ShaderDialect) -> String {
-    let mut s = line.to_string();
-    while let Some(start) = s.find("[[") {
-        if let Some(end_rel) = s[start..].find("]]") {
-            let end = start + end_rel + 2;
-            s.replace_range(start..end, "");
-        } else {
-            break;
-        }
-    }
-    if matches!(dialect, ShaderDialect::Cuda | ShaderDialect::Hip) {
-        s = s.replace("& p ", " p ");
-    }
-    s
-}
-
-/// Emits a quantized GEMV kernel for `codec` in the target `dialect`.
-pub fn fn_gemv_for_dialect(codec: &Codec, p: GemvParams, dialect: ShaderDialect) -> String {
-    let msl = gemv_packed(codec, p);
-    translate_msl_to_dialect(&msl, dialect)
-}
-
-/// Emits the cooperative decode MLP megakernel for `codec` in the target `dialect`.
-pub fn mlp_megakernel_for_dialect(codec: &Codec, is_geglu: bool, dialect: ShaderDialect) -> String {
-    let msl = mlp_megakernel_msl(codec, is_geglu);
-    translate_msl_to_dialect(&msl, dialect)
-}

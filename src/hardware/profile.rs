@@ -39,7 +39,7 @@ impl HardwareProfile {
             Device::Cuda => Self {
                 device: Device::Cuda,
                 name: crate::graph::cuda::device_name(),
-                memory_bandwidth_gbps: 900.0,
+                memory_bandwidth_gbps: crate::graph::cuda::bandwidth_gbps().unwrap_or(0.0),
                 threadgroup_memory_bytes: 48 * 1024,
                 max_threads_per_threadgroup: 1024,
                 simd_width: 32,
@@ -55,7 +55,7 @@ impl HardwareProfile {
             Device::Rocm => Self {
                 device: Device::Rocm,
                 name: crate::graph::rocm::device_name(),
-                memory_bandwidth_gbps: 1600.0,
+                memory_bandwidth_gbps: crate::graph::rocm::bandwidth_gbps().unwrap_or(0.0),
                 threadgroup_memory_bytes: 64 * 1024,
                 max_threads_per_threadgroup: 1024,
                 simd_width: 64,
@@ -87,7 +87,7 @@ impl HardwareProfile {
             Device::IntelXpu => Self {
                 device: Device::IntelXpu,
                 name: crate::graph::intel_xpu::device_name(),
-                memory_bandwidth_gbps: 560.0,
+                memory_bandwidth_gbps: crate::graph::intel_xpu::bandwidth_gbps().unwrap_or(0.0),
                 threadgroup_memory_bytes: 64 * 1024,
                 max_threads_per_threadgroup: 1024,
                 simd_width: 16,
@@ -99,22 +99,6 @@ impl HardwareProfile {
                 has_unified_memory: false,
                 compute_capability: None,
                 max_systolic_tile: Some([8, 16, 16, 1]),
-            },
-            Device::Extropic => Self {
-                device: Device::Extropic,
-                name: crate::graph::extropic::device_name(),
-                memory_bandwidth_gbps: 512.0,
-                threadgroup_memory_bytes: 32 * 1024,
-                max_threads_per_threadgroup: 256,
-                simd_width: 32,
-                m_tile: 1,
-                n_tile: 32,
-                k_tile: 32,
-                vector_width_bits: 128,
-                compute_units: 16,
-                has_unified_memory: true,
-                compute_capability: None,
-                max_systolic_tile: None,
             },
         }
     }

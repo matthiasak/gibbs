@@ -72,9 +72,6 @@ pub trait Drafter: Send + Sync {
     }
 }
 
-/// Top-k the scheduler samples with (see `ExecutableModel::sample`).
-const TOP_K: usize = 50;
-
 /// One sequence's speculative state, tied to the drafter it started with.
 pub struct SpecSeq {
     drafter: Arc<dyn Drafter>,
@@ -201,13 +198,11 @@ pub(super) fn decode(
         Vec::new()
     } else {
         let (rng, picked) = (&mut spec.rng, &mut qs);
-        let drafts = spec.drafter.propose(
-            &mut spec.draft,
-            all,
-            &spec.pending,
-            k,
-            &mut |l| pick(l, temp, top_p, vocab, rng, picked),
-        )?;
+        let drafts = spec
+            .drafter
+            .propose(&mut spec.draft, all, &spec.pending, k, &mut |l| {
+                pick(l, temp, top_p, vocab, rng, picked)
+            })?;
         spec.pending.clear();
         if drafts.len() > k || (!greedy && qs.len() != drafts.len()) {
             return Err(format!(
@@ -283,9 +278,8 @@ pub(super) fn decode(
     }
     // The drafts proposed during the verify stand when it accepted every draft and its bonus
     // token is the one they assumed.
-    let kept = ahead.filter(|(d, ..)| {
-        out.len() == drafts.len() + 1 && d.len() > 1 && d.first() == out.last()
-    });
+    let kept = ahead
+        .filter(|(d, ..)| out.len() == drafts.len() + 1 && d.len() > 1 && d.first() == out.last());
     spec.prefetched = kept.map(|(d, state, qs)| Prefetch {
         len: all.len() + out.len(),
         drafts: d[1..].to_vec(),
@@ -365,9 +359,13 @@ fn pick(
     let greedy = temp <= 1e-4;
     let q = match l {
         DraftLogits::Dense(l) => {
-            let l = &l[..if vocab > 0 { l.len().min(vocab) } else { l.len() }];
+            let l = &l[..if vocab > 0 {
+                l.len().min(vocab)
+            } else {
+                l.len()
+            }];
             if greedy {
-                return sample_logits(l, &[], temp, TOP_K, top_p, 1.0);
+                return sample_logits(l, &[], temp, super::SAMPLE_TOP_K, top_p);
             }
             dist(l, temp, top_p)
         }
@@ -382,7 +380,8 @@ fn pick(
                 (true, true) => return 0,
                 (true, false) => vec![(0, 1.0)],
                 (false, true) => {
-                    return ids[sample_logits(&logits, &[], temp, TOP_K, top_p, 1.0) as usize]
+                    return ids
+                        [sample_logits(&logits, &[], temp, super::SAMPLE_TOP_K, top_p) as usize]
                 }
                 (false, false) => dist(&logits, temp, top_p)
                     .into_iter()
@@ -407,7 +406,7 @@ fn verify_draft(p: &[(u32, f32)], q: &[(u32, f32)], x: u32, rng: &mut Rng) -> (u
 
 /// The scheduler's sampling distribution over `logits` (sparse, normalized).
 fn dist(logits: &[f32], temp: f32, top_p: f32) -> Vec<(u32, f32)> {
-    let (cands, probs, n) = nucleus(logits, &[], temp, TOP_K, top_p, 1.0);
+    let (cands, probs, n) = nucleus(logits, temp, super::SAMPLE_TOP_K, top_p);
     let sum: f32 = probs[..n].iter().sum();
     cands[..n]
         .iter()
@@ -824,7 +823,8 @@ mod tests {
             pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
         ) -> Result<Vec<u32>, String> {
             if k > 0 {
-                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let end = (tokens.len() + k).min(self.script.len());
             Ok((tokens.len()..end)
@@ -849,7 +849,9 @@ mod tests {
         let m = crate::arch::testing::synthetic_lm(dir.path(), cfg, crate::hardware::Device::Cpu);
         let prompt = vec![5u32, 9, 13, 2];
         let fresh = || {
-            let (ids, mut st) = m.prepare(prompt.clone(), &[], &PrepareCtx::default()).unwrap();
+            let (ids, mut st) = m
+                .prepare(prompt.clone(), &[], &PrepareCtx::default())
+                .unwrap();
             m.prefill_logits(&ids[..ids.len() - 1], 0, &mut st).unwrap();
             st
         };

@@ -29,13 +29,14 @@ pub fn evict_pages(
     let middle = sink_pages..n - recent_pages;
     let mut score = vec![0.0f32; n];
     for name in pool.classes[c].names.iter().filter(|p| p.name.ends_with(".k")) {
-        let rows = view.host_rows(&name.name).expect("a name of this pool");
-        let mut row = vec![0.0f32; name.row_width];
+        let Some(keys) = view.gather(&name.name) else {
+            continue;
+        };
+        let w = name.row_width;
         for lp in middle.clone() {
-            for t in lp * PAGE_TOKENS..(lp + 1) * PAGE_TOKENS {
-                rows.read(t, &mut row);
-                score[lp] += row.iter().map(|x| x * x).sum::<f32>().sqrt();
-            }
+            let page = &keys[lp * PAGE_TOKENS * w..(lp + 1) * PAGE_TOKENS * w];
+            let norm = |r: &[f32]| r.iter().map(|x| x * x).sum::<f32>().sqrt();
+            score[lp] += page.chunks_exact(w).map(norm).sum::<f32>();
         }
     }
     let mut heavy: Vec<usize> = middle.collect();
