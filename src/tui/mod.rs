@@ -84,7 +84,8 @@ enum SlashCmd {
     Variant(Option<VariantPolicy>),
     Profile(ProfileArg),
     Placement,
-    Spec(SpecArg),
+    /// No arguments: print the status.
+    Spec(Vec<SpecArg>),
 }
 
 /// `/profile` arguments.
@@ -100,13 +101,18 @@ enum ProfileArg {
 /// `/spec` arguments for live speculative decoding & online noise drafter tuning.
 #[derive(Debug, PartialEq)]
 enum SpecArg {
-    Status,
     Mode(crate::runtime::noise_draft::DraftMode),
+    Objective(crate::runtime::noise_draft::DraftObjective),
     MaxK(usize),
     Accept(f32),
     Cost(f32),
     Suffix(usize),
     Lr(f32),
+    Sigma(f32),
+    Steps(usize),
+    Shortlist(usize),
+    Probes(usize),
+    Window(usize),
 }
 
 /// Parses `/reencode`, `/variant`, `/profile` and `/placement` lines; `None` for any other command.
@@ -139,37 +145,56 @@ fn parse_slash(raw: &str) -> Option<Result<SlashCmd, String>> {
     })
 }
 
-fn parse_spec(arg: &str) -> Result<SpecArg, String> {
-    let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
-    let val = rest.trim();
-    match (word, val) {
-        ("", _) => Ok(SpecArg::Status),
-        ("mode", m) => m.parse().map(SpecArg::Mode),
-        ("k" | "max-k" | "max_k", v) => v
-            .parse::<usize>()
-            .map(|k| SpecArg::MaxK(k.min(crate::runtime::noise_draft::NOISE_MAX_K)))
-            .map_err(|_| format!("invalid max_k '{v}'; expected integer 0..=15")),
-        ("accept" | "target-accept", v) => v
-            .parse::<f32>()
-            .map(SpecArg::Accept)
-            .map_err(|_| format!("invalid target acceptance '{v}'; expected float 0.10..=0.98")),
-        ("cost" | "cost-weight", v) => v
-            .parse::<f32>()
-            .map(SpecArg::Cost)
-            .map_err(|_| format!("invalid cost weight '{v}'; expected float 0.0..=1.0")),
-        ("suffix" | "suffix-min", v) => v
-            .parse::<usize>()
-            .map(SpecArg::Suffix)
-            .map_err(|_| format!("invalid suffix min match '{v}'; expected integer 1..=4")),
-        ("lr" | "noise-lr", v) => v
-            .parse::<f32>()
-            .map(SpecArg::Lr)
-            .map_err(|_| format!("invalid noise lr '{v}'; expected float 0.0..=0.10")),
-        (w, "") => w.parse().map(SpecArg::Mode),
-        (w, _) => Err(format!(
-            "unknown /spec argument '{w}'; use mode <auto|noise|suffix|model|off>, k <0..15>, accept <0.1..0.98>, cost <0..1>, suffix <1..4>, or lr <f32>"
-        )),
+/// `/spec` alone (status), `/spec <mode>`, `/spec <key> <value>` or `/spec key=value ...`.
+fn parse_spec(arg: &str) -> Result<Vec<SpecArg>, String> {
+    if arg.contains('=') {
+        return arg
+            .split_whitespace()
+            .map(|kv| {
+                let (k, v) = kv
+                    .split_once('=')
+                    .ok_or_else(|| format!("expected key=value, got '{kv}'"))?;
+                spec_arg(k, v)
+            })
+            .collect();
     }
+    let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+    match (word, rest.trim()) {
+        ("", _) => Ok(Vec::new()),
+        (w, "") => w.parse().map(|m| vec![SpecArg::Mode(m)]),
+        (w, v) => spec_arg(w, v).map(|a| vec![a]),
+    }
+}
+
+fn spec_arg(key: &str, v: &str) -> Result<SpecArg, String> {
+    fn num<T: std::str::FromStr>(v: &str, what: &str, range: &str) -> Result<T, String> {
+        v.parse()
+            .map_err(|_| format!("invalid {what} '{v}'; expected {range}"))
+    }
+    Ok(match key {
+        "mode" => SpecArg::Mode(v.parse()?),
+        "objective" => SpecArg::Objective(v.parse()?),
+        "k" | "max-k" | "max_k" => SpecArg::MaxK(
+            num::<usize>(v, "max_k", "integer 0..=15")?
+                .min(crate::runtime::noise_draft::NOISE_MAX_K),
+        ),
+        "accept" | "target-accept" => {
+            SpecArg::Accept(num(v, "target acceptance", "float 0.10..=0.98")?)
+        }
+        "cost" | "cost-weight" => SpecArg::Cost(num(v, "cost weight", "float 0.0..=1.0")?),
+        "suffix" | "suffix-min" => SpecArg::Suffix(num(v, "suffix min match", "integer 1..=4")?),
+        "lr" | "noise-lr" => SpecArg::Lr(num(v, "noise lr", "float 0.0..=0.10")?),
+        "sigma" | "noise-sigma" => SpecArg::Sigma(num(v, "noise sigma", "float 1e-5..=0.25")?),
+        "steps" | "denoise-steps" => SpecArg::Steps(num(v, "denoise steps", "integer 1..=4")?),
+        "shortlist" => SpecArg::Shortlist(num(v, "shortlist", "integer 64..=1024")?),
+        "probes" => SpecArg::Probes(num(v, "probes", "power of two 4..=32")?),
+        "window" => SpecArg::Window(num(v, "window", "integer 1..=8")?),
+        w => {
+            return Err(format!(
+                "unknown /spec argument '{w}'; use mode=<auto|noise|suffix|model|off> objective=<speed|tokens> k= accept= cost= suffix= lr= sigma= steps= shortlist= probes= window="
+            ))
+        }
+    })
 }
 
 fn parse_profile(arg: &str) -> Result<ProfileArg, String> {
@@ -846,7 +871,7 @@ impl TuiApp {
                      · /bench     : Benchmark the loaded model on Metal (128 tokens x 3 runs): tok/s, roofline % and where each token's time goes; refuses while generating\n\
                      · /placement : Where every graph node of the loaded model runs (op, device, avenue): 100% Metal, or the CPU ops\n\
                      · /roofline  : Focus ROOFLINE detail & run the calibration sweep\n\
-                     · /spec [mode|k|accept|cost|suffix|lr] : Live-tune speculative decoding & online noise drafter\n\
+                     · /spec [mode=|objective=|k=|accept=|cost=|suffix=|lr=|sigma=|steps=|shortlist=|probes=|window=] : Live-tune speculative decoding & the online drafter (no args: status)\n\
                      · /quant     : Display active weight quantization formats\n\
                      · /gibbs     : Full historical biography & ASCII portrait of J. Willard Gibbs\n\
                      · /system1 [on|off] : Turn the active LLM into a System 1 encoder & zero-shot judge (or return to chat)\n\
@@ -1024,46 +1049,75 @@ impl TuiApp {
         Ok(self.reload_for("variant", next.name()))
     }
 
-    /// Applies a `/spec` command, updating `self.draft_knobs`, `settings.json`, and the live scheduler.
-    fn apply_spec_cmd(&mut self, arg: SpecArg) -> Result<String, String> {
+    /// Applies `/spec` arguments to `self.draft_knobs`, `settings.json` and the live scheduler, and
+    /// reports the knobs and what the `k` tuner measured.
+    fn apply_spec_cmd(&mut self, args: Vec<SpecArg>) -> Result<String, String> {
         let mut k = self
             .scheduler
             .as_ref()
             .map_or(self.draft_knobs, |s| s.draft_knobs());
-        match arg {
-            SpecArg::Status => {}
-            SpecArg::Mode(m) => k.mode = m,
-            SpecArg::MaxK(mk) => k.max_k = mk,
-            SpecArg::Accept(a) => k.target_acceptance = a,
-            SpecArg::Cost(c) => k.cost_weight = c,
-            SpecArg::Suffix(sm) => k.suffix_min_match = sm,
-            SpecArg::Lr(lr) => k.noise_lr = lr,
+        let changed = !args.is_empty();
+        for arg in args {
+            match arg {
+                SpecArg::Mode(m) => k.mode = m,
+                SpecArg::Objective(o) => k.objective = o,
+                SpecArg::MaxK(mk) => k.max_k = mk,
+                SpecArg::Accept(a) => k.target_acceptance = a,
+                SpecArg::Cost(c) => k.cost_weight = c,
+                SpecArg::Suffix(sm) => k.suffix_min_match = sm,
+                SpecArg::Lr(lr) => k.noise_lr = lr,
+                SpecArg::Sigma(s) => k.noise_sigma = s,
+                SpecArg::Steps(n) => k.denoise_steps = n,
+                SpecArg::Shortlist(n) => k.shortlist = n,
+                SpecArg::Probes(n) => k.probes = n,
+                SpecArg::Window(n) => k.window = n,
+            }
         }
         let k = k.sanitized();
         self.draft_knobs = k;
-        let mut s = settings::load_settings();
-        s.draft = k;
-        let _ = settings::save_settings(&s);
-        if let Some(sched) = &self.scheduler {
-            sched.set_draft_knobs(k);
+        if changed {
+            let mut s = settings::load_settings();
+            s.draft = k;
+            let _ = settings::save_settings(&s);
+            if let Some(sched) = &self.scheduler {
+                sched.set_draft_knobs(k);
+            }
         }
-        let active = self
+        let view = self.scheduler.as_ref().and_then(|sc| sc.view().spec);
+        let best = view.as_ref().and_then(|v| v.k);
+        let rate = self
             .scheduler
             .as_ref()
-            .and_then(|sc| sc.view().spec)
-            .map_or_else(
-                || "none (plain decode)".to_string(),
-                |sv| format!("{} (best k={:?})", sv.label, sv.k),
-            );
+            .zip(best)
+            .and_then(|(sc, b)| sc.k_tuner_rates().into_iter().find(|r| r.k == b));
+        let measured = rate.map_or_else(
+            || "acceptance — · tokens/forward — · tok/s —".to_string(),
+            |r| {
+                format!(
+                    "acceptance {:.0}% · tokens/forward {:.2} · tok/s {:.1}",
+                    r.acceptance_rate * 100.0,
+                    r.tokens_per_forward,
+                    r.tok_per_sec
+                )
+            },
+        );
         Ok(format!(
-            "Speculative decoding: mode={} · active={} · max_k={} · target_accept={:.0}% · cost_weight={:.2} · suffix_min={} · noise_lr={:.4}",
+            "Speculative decoding: mode={} · objective={} · active={} · k={} · {measured} · online updates={}\nKnobs: max_k={} · accept={:.0}% · cost={:.2} · suffix={} · lr={:.4} · sigma={:.4} · steps={} · shortlist={} · probes={} · window={}",
             k.mode.name(),
-            active,
+            k.objective.name(),
+            view.as_ref().map_or("none (plain decode)", |v| v.label.as_str()),
+            best.map_or_else(|| format!("0..{} (measuring)", k.max_k), |b| b.to_string()),
+            view.as_ref().and_then(|v| v.updates).map_or_else(|| "—".to_string(), |u| u.to_string()),
             k.max_k,
             k.target_acceptance * 100.0,
             k.cost_weight,
             k.suffix_min_match,
-            k.noise_lr
+            k.noise_lr,
+            k.noise_sigma,
+            k.denoise_steps,
+            k.shortlist,
+            k.probes,
+            k.window,
         ))
     }
 
@@ -2302,7 +2356,7 @@ impl TuiApp {
                 }
                 KeyCode::Char('5') => {
                     let next = self.draft_knobs.mode.next();
-                    let _ = self.apply_spec_cmd(SpecArg::Mode(next));
+                    let _ = self.apply_spec_cmd(vec![SpecArg::Mode(next)]);
                 }
                 KeyCode::Char('6') => {
                     let next = match self.draft_knobs.max_k {
@@ -2313,7 +2367,7 @@ impl TuiApp {
                         8 => 12,
                         _ => 0,
                     };
-                    let _ = self.apply_spec_cmd(SpecArg::MaxK(next));
+                    let _ = self.apply_spec_cmd(vec![SpecArg::MaxK(next)]);
                 }
                 KeyCode::Char('7') => {
                     let cur = (self.draft_knobs.target_acceptance * 100.0).round() as u32;
@@ -2323,11 +2377,19 @@ impl TuiApp {
                         71..=80 => 0.85,
                         _ => 0.50,
                     };
-                    let _ = self.apply_spec_cmd(SpecArg::Accept(next));
+                    let _ = self.apply_spec_cmd(vec![SpecArg::Accept(next)]);
                 }
                 KeyCode::Char('8') => {
                     let next = self.compact_config.mode.next();
                     let _ = self.run_compact_cmd(next.name());
+                }
+                KeyCode::Char('9') => {
+                    let next = self.draft_knobs.objective.next();
+                    let _ = self.apply_spec_cmd(vec![SpecArg::Objective(next)]);
+                }
+                KeyCode::Char('0') => {
+                    let next = self.draft_knobs.denoise_steps % 4 + 1;
+                    let _ = self.apply_spec_cmd(vec![SpecArg::Steps(next)]);
                 }
                 KeyCode::Enter => self.show_settings_modal = false,
                 _ => {}
@@ -3320,6 +3382,24 @@ mod tests {
         assert_eq!(app.ctx_limit, 4096);
         app.handle_key(key(KeyCode::Char('4')));
         assert_eq!(app.ctx_limit, 8192);
+        // '9' cycles the draft objective and '0' the denoise steps 1 -> 2 -> 3 -> 4 -> 1; both
+        // persist.
+        use crate::runtime::noise_draft::DraftObjective;
+        assert_eq!(app.draft_knobs.objective, DraftObjective::Speed);
+        app.handle_key(key(KeyCode::Char('9')));
+        assert_eq!(app.draft_knobs.objective, DraftObjective::TokensPerForward);
+        assert_eq!(
+            settings::load_settings().draft.objective,
+            DraftObjective::TokensPerForward
+        );
+        app.handle_key(key(KeyCode::Char('9')));
+        assert_eq!(app.draft_knobs.objective, DraftObjective::Speed);
+        assert_eq!(app.draft_knobs.denoise_steps, 2);
+        for want in [3, 4, 1, 2] {
+            app.handle_key(key(KeyCode::Char('0')));
+            assert_eq!(app.draft_knobs.denoise_steps, want);
+            assert_eq!(settings::load_settings().draft.denoise_steps, want);
+        }
 
         // 7. Rendered F4 modal shows [FASTEST] defaults and bottom keybar shows F4 options & ↑↓ history
         let _g = truecolor();
@@ -3333,10 +3413,32 @@ mod tests {
             "{modal_text}"
         );
         assert!(!modal_text.contains("⟦^R⟧"), "{modal_text}");
+        assert!(
+            modal_text.contains("[9] Spec Objective") && modal_text.contains("[0] Draft Denoise"),
+            "{modal_text}"
+        );
 
         // 8. Esc closes modal
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.show_settings_modal);
+
+        // `/spec key=value ...` applies and persists every knob; `/spec` prints the status.
+        type_and_run(&mut app, "/spec objective=tokens steps=3 sigma=0.02");
+        assert_eq!(app.draft_knobs.objective, DraftObjective::TokensPerForward);
+        assert_eq!(settings::load_settings().draft.denoise_steps, 3);
+        type_and_run(&mut app, "/spec");
+        let out = &app.history.last().unwrap().output;
+        for want in [
+            "mode=auto",
+            "objective=tokens",
+            "tokens/forward",
+            "tok/s",
+            "online updates=",
+            "steps=3",
+            "sigma=0.0200",
+        ] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
 
         // 9. Up / Down arrow keys cycle prior prompt entries for retry/editing, mouse wheel scrolls
         type_and_run(&mut app, "/quant");
@@ -3740,6 +3842,28 @@ mod tests {
         assert!(err("/variant best").contains("valid: fastest"));
         assert!(err("/profile sort size").contains("'size'"));
         assert!(err("/profile xyz").contains("'xyz'"));
+        assert_eq!(ok("/spec"), SlashCmd::Spec(vec![]));
+        assert_eq!(
+            ok("/spec noise"),
+            SlashCmd::Spec(vec![SpecArg::Mode(
+                crate::runtime::noise_draft::DraftMode::Noise
+            )])
+        );
+        assert_eq!(ok("/spec k 6"), SlashCmd::Spec(vec![SpecArg::MaxK(6)]));
+        assert_eq!(
+            ok("/spec objective=tokens steps=3 shortlist=512 probes=16 window=6 sigma=0.02"),
+            SlashCmd::Spec(vec![
+                SpecArg::Objective(crate::runtime::noise_draft::DraftObjective::TokensPerForward),
+                SpecArg::Steps(3),
+                SpecArg::Shortlist(512),
+                SpecArg::Probes(16),
+                SpecArg::Window(6),
+                SpecArg::Sigma(0.02),
+            ])
+        );
+        assert!(err("/spec objective=fast").contains("valid: speed, tokens"));
+        assert!(err("/spec steps=two").contains("denoise steps"));
+        assert!(err("/spec turbo=1").contains("unknown /spec argument 'turbo'"));
         assert_eq!(parse_slash("/help"), None);
     }
 
