@@ -160,7 +160,10 @@ impl TuiApp {
             roof_tok_s,
             bytes_per_tok,
             ceiling,
-            kv_pct: self.kv_pool.utilization() * 100.0,
+            kv_pct: {
+                let (used, cap) = self.kv_pages();
+                used as f32 * 100.0 / cap.max(1) as f32
+            },
             itl: self.telemetry.recent_itl_ms(512),
             s,
         }
@@ -595,7 +598,7 @@ impl TuiApp {
                 th.fg(Token::Gold),
             )));
         }
-        let (kv_hits, kv_misses) = self.kv_pool.radix_cache.metrics();
+        let (kv_hits, kv_misses) = self.scheduler.as_ref().map_or((0, 0), |s| s.radix.metrics());
         let turns = self.chat_history.len() / 2;
         if turns > 0 || kv_hits > 0 {
             lines.push(Line::from(Span::styled(
@@ -897,8 +900,7 @@ impl TuiApp {
             return;
         }
         let iw = inner.width as usize;
-        let total = self.kv_pool.total_blocks;
-        let used = (self.kv_pool.utilization() * total as f32).round() as usize;
+        let (used, total) = self.kv_pages();
         let rss = crate::hardware::current_resident_memory_bytes() as f64 / 1e9;
         let lines = vec![
             Line::from(vec![
@@ -910,11 +912,20 @@ impl TuiApp {
                 Span::styled(format!(" {:>3.0}%", v.kv_pct), th.fg(Token::Parchment)),
             ]),
             Line::from(Span::styled(
-                trunc(&format!("RSS {rss:.1} GB · blocks {used}/{total}"), iw),
+                trunc(&format!("RSS {rss:.1} GB · pages {used}/{total}"), iw),
                 th.fg(Token::Dim),
             )),
         ];
         f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// `(used, capacity)` KV pages of the active model's pool.
+    fn kv_pages(&self) -> (usize, usize) {
+        self.scheduler
+            .as_ref()
+            .and_then(|s| s.model())
+            .and_then(|m| m.kv_pool())
+            .map_or((0, 0), |p| (p.used_pages(), p.capacity_pages()))
     }
 
     // ---- DEVICE ---------------------------------------------------------------------------

@@ -136,11 +136,18 @@ pub struct SpecLm {
     /// Modalities whose tower failed to build at load, with why (said when a prompt attaches one).
     off: HashMap<String, String>,
     tok: Arc<Tokenizer>,
+    /// Rows a sequence stores (`--ctx`, else the spec's `ctx`).
     ctx: usize,
+    /// Positions a sequence reaches: the spec's own `ctx` (its trained context), or `--ctx` when
+    /// larger. Past `ctx` rows, Tier-4 page eviction keeps a sequence going up to here.
+    max_positions: usize,
     shapes: ShapeCache,
     /// Compiled from the decode instance; every other instance runs reshaped on it.
     program: Mutex<GraphProgram>,
     recurrent: Vec<String>,
+    /// States the KV pool does not page: a prefix-cache boundary snapshots them.
+    contiguous: Vec<String>,
+    kv_pool: Option<Arc<crate::kv::KvPool>>,
     /// The decode instance takes exactly `[token_ids, positions]`, outputs `logits` first and
     /// holds no recurrent state: greedy decode may stream on the device.
     streams: bool,
@@ -336,12 +343,7 @@ pub fn load_with_ctx(
         || {
             Some(
                 crate::arch::load::load(artifacts, reg, family)
-                    .and_then(|m| {
-                        if let Some(c) = ctx {
-                            m.env.set_ctx(c.into());
-                        }
-                        SpecLm::new(m, mode)
-                    })
+                    .and_then(|m| SpecLm::with_ctx(m, mode, ctx))
                     .map(|m| Arc::new(m) as Arc<dyn NativeLm>),
             )
         },
@@ -353,8 +355,26 @@ pub fn load_with_ctx(
 impl SpecLm {
     /// Compiles `model`'s decode instance on `mode`.
     pub fn new(model: Model, mode: PlacementMode) -> Result<Self, String> {
-        crate::arch::load::check(&model)?;
+        Self::with_ctx(model, mode, None)
+    }
+
+    /// [`Self::new`] storing at most `ctx` rows per sequence (`--ctx`, `runtime.ctx`).
+    pub fn with_ctx(model: Model, mode: PlacementMode, ctx: Option<usize>) -> Result<Self, String> {
         let fam = model.spec.family.clone();
+        let ctx_var = |model: &Model| {
+            ["ctx", "max_position_embeddings"]
+                .iter()
+                .find_map(|v| model.env.var(v).ok().filter(|v| !v.is_null()))
+                .ok_or_else(|| {
+                    format!("{fam}: config sets neither `ctx` nor `max_position_embeddings`")
+                })?
+                .usize()
+        };
+        let trained = ctx_var(&model)?;
+        if let Some(c) = ctx {
+            model.env.set_ctx(c.into());
+        }
+        crate::arch::load::check(&model)?;
         let rt: Runtime = model.spec.runtime_as()?;
         if rt.thinking_delimiters.len() % 2 != 0 {
             return Err(format!(
@@ -367,13 +387,7 @@ impl SpecLm {
             (None, true) => Arc::new(Tokenizer::default_bpe()),
             (None, false) => return Err(format!("{fam}: the checkpoint has no tokenizer")),
         };
-        let ctx = ["ctx", "max_position_embeddings"]
-            .iter()
-            .find_map(|v| model.env.var(v).ok().filter(|v| !v.is_null()))
-            .ok_or_else(|| {
-                format!("{fam}: config sets neither `ctx` nor `max_position_embeddings`")
-            })?
-            .usize()?;
+        let ctx = ctx_var(&model)?;
         let shapes = ShapeCache::new(TEXT);
         let v = vars(1, "last", &[], 0);
         let decode = shapes.get(&v, || {
@@ -439,6 +453,8 @@ impl SpecLm {
         let embed = EmbedTable::find(&decode.graph, &weights).map(Arc::new);
         let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
         let recurrent = program.recurrent_states();
+        let contiguous = program.contiguous_states();
+        let kv_pool = program.kv_pool.clone();
         let streams = decode.output_index("logits") == Some(0)
             && decode
                 .inputs
@@ -452,9 +468,12 @@ impl SpecLm {
             off,
             tok,
             ctx,
+            max_positions: trained.max(ctx),
             shapes,
             program: Mutex::new(program),
             recurrent,
+            contiguous,
+            kv_pool,
             streams,
             weights: decode.weights.len(),
             mode,
@@ -468,6 +487,16 @@ impl SpecLm {
         state
             .downcast_mut::<Seq>()
             .ok_or_else(|| "sequence state was not built by this model".into())
+    }
+
+    /// Whether a cached prefix resumes only at an exported boundary: ring pages or contiguous
+    /// states hold the sequence's state at one exact length.
+    fn needs_boundary(&self) -> bool {
+        !self.contiguous.is_empty()
+            || self
+                .kv_pool
+                .as_ref()
+                .is_some_and(|p| p.classes.iter().any(|c| c.window.is_some()))
     }
 
     fn instance(
@@ -607,12 +636,16 @@ impl SpecLm {
             ));
         }
         let end = start + tokens.len();
-        if end > self.ctx {
+        if end > self.max_positions {
             return Err(format!(
                 "position {} is past the context length {}",
                 end - 1,
-                self.ctx
+                self.max_positions
             ));
+        }
+        let stored = end - seq.state.kv.as_ref().map_or(0, |kv| kv.evicted);
+        if stored > self.ctx {
+            return Err(format!("{stored} KV rows exceed the context of {} rows", self.ctx));
         }
         if end <= seq.len {
             // A block ran ahead: its end's logits answer every position inside it.
@@ -866,6 +899,10 @@ impl NativeLm for SpecLm {
         self.ctx
     }
 
+    fn max_positions(&self) -> usize {
+        self.max_positions
+    }
+
     fn prompt_len(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<usize, String> {
         if media.is_empty() && self.media.is_empty() {
             return Ok(ids.len());
@@ -1070,64 +1107,113 @@ impl NativeLm for SpecLm {
         self.media.contains_key("image") && !self.off.contains_key("image")
     }
 
-    fn export_kv_snapshot(
-        &self,
-        state: &SeqState,
-        token_len: usize,
-    ) -> Option<crate::kv::CachedKvSnapshot> {
+    fn kv_export(&self, state: &SeqState, len: usize) -> Option<crate::kv::KvExport> {
         let seq = state.downcast_ref::<Seq>()?;
-        if token_len == 0
-            || seq.len < token_len
-            || seq.recurrent_ahead
-            || !seq.blocks.is_empty()
-            || !seq.media.media_index.is_empty()
-            || !seq.taps.is_empty()
-        {
+        if len == 0 || seq.len < len || seq.recurrent_ahead || !seq.taps.is_empty() {
             return None;
         }
-        if !self.recurrent.is_empty() && seq.len != token_len {
+        let boundary = self.needs_boundary();
+        if boundary && seq.len != len {
             return None;
         }
-        Some(crate::kv::CachedKvSnapshot {
-            state: seq.state.fork(token_len).ok()?,
-            token_len,
-            has_recurrent: !self.recurrent.is_empty(),
-        })
+        let recurrent = boundary.then(|| {
+            let names: Vec<&str> = self.contiguous.iter().map(String::as_str).collect();
+            seq.state.snapshot(&names)
+        });
+        match &seq.state.kv {
+            Some(v) if v.evicted == 0 => v.export(len, recurrent).ok(),
+            Some(_) => None,
+            None if self.kv_pool.is_none() => Some(crate::kv::KvExport {
+                pool: None,
+                pages: Vec::new(),
+                boundary: recurrent.map(|recurrent| crate::kv::Boundary {
+                    len,
+                    rings: Vec::new(),
+                    recurrent,
+                    pool: None,
+                }),
+            }),
+            None => None,
+        }
     }
 
-    fn restore_kv_prefix(
-        &self,
-        state: &mut SeqState,
-        snap: &crate::kv::CachedKvSnapshot,
-        prefix_len: usize,
-    ) -> bool {
-        let Ok(seq) = Self::seq(state) else {
-            return false;
-        };
-        if prefix_len == 0
-            || prefix_len > snap.token_len
-            || prefix_len > seq.prompt.len()
-            || !seq.blocks.is_empty()
-            || !seq.media.media_index.is_empty()
-            || !seq.taps.is_empty()
-        {
-            return false;
+    fn kv_restore(&self, state: &mut SeqState, m: &crate::kv::Match) -> Option<usize> {
+        let seq = Self::seq(state).ok()?;
+        if seq.len != 0 || !seq.taps.is_empty() {
+            return None;
         }
-        if (snap.has_recurrent || !self.recurrent.is_empty()) && prefix_len != snap.token_len {
-            return false;
-        }
-        let Ok(forked) = snap.state.fork(prefix_len) else {
-            return false;
+        let same_pool = match (&self.kv_pool, &m.pool) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
         };
-        seq.state = forked;
-        seq.len = prefix_len;
-        seq.asked = prefix_len;
-        seq.ids = seq.prompt[..prefix_len].to_vec();
+        let b = m.boundary.as_deref();
+        let mut len = if self.needs_boundary() { b?.len } else { m.len };
+        // Never resume inside a bidirectional block: its rows saw the whole block.
+        if let Some(blk) = seq.blocks.iter().find(|r| r.start < len && len < r.end) {
+            if self.needs_boundary() {
+                return None;
+            }
+            len = blk.start;
+        }
+        if !same_pool || len == 0 || len > m.len || len > seq.prompt.len() {
+            return None;
+        }
+        let rings = b.filter(|b| b.len == len).map_or(&[][..], |b| &b.rings[..]);
+        seq.state = StateStore::new();
+        if let Some(p) = &self.kv_pool {
+            seq.state.kv = Some(crate::kv::KvView::resume(p.clone(), len, &m.pages, rings).ok()?);
+        }
+        if self.needs_boundary() {
+            seq.state.restore(b?.recurrent.clone());
+        }
+        seq.len = len;
+        seq.asked = len;
+        seq.ids = seq.prompt[..len].to_vec();
         seq.ahead.clear();
         seq.ckpt.clear();
         seq.ckpt_from = 0;
         seq.recurrent_ahead = false;
-        true
+        Some(len)
+    }
+
+    fn kv_pool(&self) -> Option<Arc<crate::kv::KvPool>> {
+        self.kv_pool.clone()
+    }
+
+    fn kv_evict(&self, state: &mut SeqState, target_rows: usize) -> Result<usize, String> {
+        let seq = Self::seq(state)?;
+        self.drain_stream(seq)?;
+        // Every unpaged state must be position-free (recurrent): only paged rows can be dropped.
+        if seq.recurrent_ahead || self.contiguous.iter().any(|n| !self.recurrent.contains(n)) {
+            return Err("this model's state cannot drop KV pages".into());
+        }
+        let kv = seq.state.kv.as_mut().ok_or("this model's KV is not paged")?;
+        kv.release_from(seq.len);
+        // ponytail: half of the non-sink page budget recent, half heaviest keys; tune with evals.
+        let recent = (target_rows / crate::kv::PAGE_TOKENS).saturating_sub(1).div_ceil(2);
+        Ok(crate::compact::snapkv::evict_pages(kv, target_rows, 1, recent))
+    }
+
+    fn radix_key(&self, state: &SeqState, ids: &[u32]) -> Vec<u32> {
+        let mut key = ids.to_vec();
+        let Some(seq) = state.downcast_ref::<Seq>() else {
+            return key;
+        };
+        // A media placeholder's key: the FNV-1a hash of its tower row (the media content as the
+        // model sees it) plus its row index, with the top bit set (above every token id).
+        if let Some((_, w, rows)) = seq.rows.first() {
+            for (i, &q) in seq.media.media_index.iter().enumerate() {
+                let h = rows.get(i * w..(i + 1) * w).map_or(0x811c_9dc5u32, |r| {
+                    r.iter().flat_map(|x| x.to_bits().to_le_bytes()).fold(0x811c_9dc5u32, |h, b| {
+                        (h ^ b as u32).wrapping_mul(0x0100_0193)
+                    })
+                });
+                if let Some(k) = key.get_mut(q as usize) {
+                    *k = 0x8000_0000 | (h.wrapping_add(i as u32) & 0x7fff_ffff);
+                }
+            }
+        }
+        key
     }
 }
 

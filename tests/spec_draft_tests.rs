@@ -4,12 +4,10 @@
 //! spec-run Llama-3.2-1B-Instruct one; mismatched pairs are refused at attach.
 
 use gibbs_engine::hardware::{Device, PlacementMode};
-use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::hub::{HuggingFaceHub, ModelArtifacts};
 use gibbs_engine::runtime::draft::load_drafter;
 use gibbs_engine::scheduler::{ContinuousBatchScheduler, ExecutableModel, SamplingParams};
 use gibbs_engine::telemetry::EngineTelemetry;
-use std::sync::Arc;
 
 /// The Qwen3.5-2B target: the HF original, else the cached GGUF.
 const TARGET: [&str; 2] = ["Qwen/Qwen3.5-2B", "unsloth/Qwen3.5-2B-GGUF"];
@@ -36,12 +34,7 @@ fn generate(
     let model =
         ExecutableModel::new(gibbs_engine::runtime::lm::load(target, reg, None, cpu).unwrap());
     let telemetry = EngineTelemetry::new();
-    let sched = ContinuousBatchScheduler::with_telemetry(
-        target.model_id.clone(),
-        Arc::new(PagedKVPool::new(1024)),
-        Some(model),
-        telemetry.clone(),
-    );
+    let sched = ContinuousBatchScheduler::with_telemetry(target.model_id.clone(), Some(model), telemetry.clone());
     // The checkpoint's own MTP head stays off: the baseline is plain decoding.
     sched.set_drafter(draft.map(|d| load_drafter(d, target, cpu).unwrap()));
     let params = SamplingParams {

@@ -1,5 +1,4 @@
 use gibbs_engine::hardware::HardwareCapability;
-use gibbs_engine::kv::{BlockId, RadixPrefixCache};
 
 #[test]
 fn test_hardware_probe_reports_detected_facts() {
@@ -13,23 +12,6 @@ fn test_hardware_probe_reports_detected_facts() {
         );
     }
 }
-
-#[test]
-fn test_radix_prefix_cache_matching() {
-    let cache = RadixPrefixCache::new();
-    let prefix_tokens = vec![101, 2054, 2003, 1037];
-    let blocks = vec![BlockId(1), BlockId(2)];
-
-    cache.insert_prefix(&prefix_tokens, &blocks);
-
-    let (matched, count) = cache.match_prefix(&[101, 2054, 2003, 1037, 9999]);
-    assert_eq!(count, 4);
-    assert_eq!(matched, blocks);
-
-    let (_, count_miss) = cache.match_prefix(&[9999, 101]);
-    assert_eq!(count_miss, 0);
-}
-
 
 #[test]
 fn test_codec_benchmark_efficiency() {

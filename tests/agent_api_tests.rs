@@ -4,7 +4,6 @@
 
 use axum::body::Body;
 use axum::http::Request;
-use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::hub::ModelArtifacts;
 use gibbs_engine::scheduler::{ContinuousBatchScheduler, ExecutableModel};
 use gibbs_engine::server::{create_router, AppState};
@@ -35,20 +34,16 @@ async fn media_for_a_text_only_model_is_a_400() {
     // A synthetic llama (no chat template: the built-in fallback renders the text and leaves
     // media to the model).
     let app = create_router(AppState {
-        scheduler: Arc::new(ContinuousBatchScheduler::new(
-            "tiny",
-            Arc::new(PagedKVPool::new(64)),
-            Some({
-            // A fresh hub dir: a synthetic repo left in the user's cache would be reused as is.
-            let hub_dir = tempfile::tempdir().unwrap();
-            let a = gibbs_engine::model::hub::HuggingFaceHub::with_cache_dir(hub_dir.path().to_path_buf())
-                .resolve_or_synthesize_tiny("gibbs/tiny-5m")
-                .unwrap();
-            let reg = gibbs_engine::arch::registry().unwrap();
-            let cpu = gibbs_engine::hardware::Device::Cpu.into();
-            ExecutableModel::new(gibbs_engine::runtime::lm::load(&a, reg, None, cpu).unwrap())
-        }),
-        )),
+        scheduler: Arc::new(ContinuousBatchScheduler::new("tiny", Some({
+        // A fresh hub dir: a synthetic repo left in the user's cache would be reused as is.
+        let hub_dir = tempfile::tempdir().unwrap();
+        let a = gibbs_engine::model::hub::HuggingFaceHub::with_cache_dir(hub_dir.path().to_path_buf())
+            .resolve_or_synthesize_tiny("gibbs/tiny-5m")
+            .unwrap();
+        let reg = gibbs_engine::arch::registry().unwrap();
+        let cpu = gibbs_engine::hardware::Device::Cpu.into();
+        ExecutableModel::new(gibbs_engine::runtime::lm::load(&a, reg, None, cpu).unwrap())
+                }))),
         telemetry: EngineTelemetry::new(),
         jev_model: Default::default(),
         image_model: Default::default(),
@@ -104,11 +99,7 @@ async fn qwen_tool_calls_in_every_schema() {
     let reg = gibbs_engine::arch::registry().unwrap();
     let cpu = gibbs_engine::hardware::Device::Cpu.into();
     let model = ExecutableModel::new(gibbs_engine::runtime::lm::load(&artifacts, reg, None, cpu).unwrap());
-    let sched = Arc::new(ContinuousBatchScheduler::new(
-        "Qwen/Qwen2.5-0.5B-Instruct",
-        Arc::new(PagedKVPool::new(1024)),
-        Some(model),
-    ));
+    let sched = Arc::new(ContinuousBatchScheduler::new("Qwen/Qwen2.5-0.5B-Instruct", Some(model)));
     let stop = Arc::new(AtomicBool::new(false));
     let engine = {
         let (sched, stop) = (sched.clone(), stop.clone());
