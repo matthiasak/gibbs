@@ -84,6 +84,31 @@ struct Cli {
     #[arg(long)]
     draft_noise_lr: Option<f32>,
 
+    /// What the speculative `k` tuner maximizes: speed (tok/s) | tokens (tokens per verify
+    /// forward).
+    #[arg(long)]
+    draft_objective: Option<String>,
+
+    /// Online drafter refinement passes (1..=4).
+    #[arg(long)]
+    draft_denoise_steps: Option<usize>,
+
+    /// Online drafter shortlist size (64..=1024).
+    #[arg(long)]
+    draft_shortlist: Option<usize>,
+
+    /// Online drafter Hadamard probe directions per update (4..=32, a power of two).
+    #[arg(long)]
+    draft_probes: Option<usize>,
+
+    /// Online drafter context window in tokens (1..=8).
+    #[arg(long)]
+    draft_window: Option<usize>,
+
+    /// Online drafter node-perturbation scale sigma (1e-5..=0.25).
+    #[arg(long)]
+    draft_noise_sigma: Option<f32>,
+
     /// Session compaction mode: auto | light | aggressive | off.
     #[arg(long)]
     compact_mode: Option<String>,
@@ -686,40 +711,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if drafter.is_some() {
         scheduler.set_drafter(drafter);
     }
-    if cli.draft_mode.is_some()
-        || online_draft.is_some()
-        || cli.draft_max_k.is_some()
-        || cli.draft_target_accept.is_some()
-        || cli.draft_cost_weight.is_some()
-        || cli.draft_suffix_min.is_some()
-        || cli.draft_noise_lr.is_some()
-    {
-        let mut knobs = scheduler.draft_knobs();
-        if let Some(d) = online_draft {
-            knobs.mode = if d == "suffix" {
-                gibbs_engine::runtime::noise_draft::DraftMode::Suffix
-            } else {
-                gibbs_engine::runtime::noise_draft::DraftMode::Noise
-            };
-        }
-        if let Some(m) = &cli.draft_mode {
-            knobs.mode = m.parse()?;
-        }
-        if let Some(k) = cli.draft_max_k {
-            knobs.max_k = k;
-        }
-        if let Some(a) = cli.draft_target_accept {
-            knobs.target_acceptance = a;
-        }
-        if let Some(c) = cli.draft_cost_weight {
-            knobs.cost_weight = c;
-        }
-        if let Some(s) = cli.draft_suffix_min {
-            knobs.suffix_min_match = s;
-        }
-        if let Some(lr) = cli.draft_noise_lr {
-            knobs.noise_lr = lr;
-        }
+    let before = scheduler.draft_knobs();
+    let mut knobs = before;
+    if let Some(d) = online_draft {
+        knobs.mode = if d == "suffix" {
+            gibbs_engine::runtime::noise_draft::DraftMode::Suffix
+        } else {
+            gibbs_engine::runtime::noise_draft::DraftMode::Noise
+        };
+    }
+    if let Some(m) = &cli.draft_mode {
+        knobs.mode = m.parse()?;
+    }
+    if let Some(o) = &cli.draft_objective {
+        knobs.objective = o.parse()?;
+    }
+    knobs.max_k = cli.draft_max_k.unwrap_or(knobs.max_k);
+    knobs.target_acceptance = cli.draft_target_accept.unwrap_or(knobs.target_acceptance);
+    knobs.cost_weight = cli.draft_cost_weight.unwrap_or(knobs.cost_weight);
+    knobs.suffix_min_match = cli.draft_suffix_min.unwrap_or(knobs.suffix_min_match);
+    knobs.noise_lr = cli.draft_noise_lr.unwrap_or(knobs.noise_lr);
+    knobs.noise_sigma = cli.draft_noise_sigma.unwrap_or(knobs.noise_sigma);
+    knobs.denoise_steps = cli.draft_denoise_steps.unwrap_or(knobs.denoise_steps);
+    knobs.shortlist = cli.draft_shortlist.unwrap_or(knobs.shortlist);
+    knobs.probes = cli.draft_probes.unwrap_or(knobs.probes);
+    knobs.window = cli.draft_window.unwrap_or(knobs.window);
+    if knobs != before {
         scheduler.set_draft_knobs(knobs);
     }
     if online_draft.is_some() && scheduler.view().spec.is_none() {

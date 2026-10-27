@@ -77,11 +77,55 @@ impl FromStr for DraftMode {
     }
 }
 
+/// What [`KTuner`](crate::scheduler::spec::KTuner) maximizes when it picks `k`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DraftObjective {
+    /// Output tokens per second.
+    #[default]
+    #[serde(rename = "speed")]
+    Speed,
+    /// Output tokens per verify forward.
+    #[serde(rename = "tokens", alias = "tokens-per-forward")]
+    TokensPerForward,
+}
+
+impl DraftObjective {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Speed => "speed",
+            Self::TokensPerForward => "tokens",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Speed => Self::TokensPerForward,
+            Self::TokensPerForward => Self::Speed,
+        }
+    }
+}
+
+impl FromStr for DraftObjective {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "speed" | "tok/s" => Ok(Self::Speed),
+            "tokens" | "tokens-per-forward" | "tpf" => Ok(Self::TokensPerForward),
+            other => Err(format!(
+                "unknown draft objective '{other}'; valid: speed, tokens"
+            )),
+        }
+    }
+}
+
 /// User-facing tuning knobs for speculative decoding and [`OnlineNoiseDrafter`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DraftKnobs {
     pub mode: DraftMode,
+    /// What the `k` tuner maximizes (default `speed`).
+    pub objective: DraftObjective,
     /// Maximum draft tokens per step (`0..=15`, default `4`).
     pub max_k: usize,
     /// Minimum acceptance rate (`0.30..=0.95`, default `0.65`) before [`KTuner`] penalizes deeper `k`.
@@ -109,6 +153,7 @@ impl Default for DraftKnobs {
     fn default() -> Self {
         Self {
             mode: DraftMode::Auto,
+            objective: DraftObjective::Speed,
             max_k: 4,
             target_acceptance: 0.65,
             cost_weight: 0.25,
@@ -912,10 +957,6 @@ impl OnlineNoiseDrafter {
         &self.knobs
     }
 
-    pub fn online_updates(&self) -> u64 {
-        self.inner.lock().head.updates
-    }
-
     /// The shared head, rebuilt when the shortlist or window knob changed.
     fn inner(&self, knobs: &DraftKnobs) -> parking_lot::MutexGuard<'_, Inner> {
         let mut inner = self.inner.lock();
@@ -960,6 +1001,10 @@ impl Drafter for OnlineNoiseDrafter {
 
     fn overlaps(&self) -> bool {
         true
+    }
+
+    fn online_updates(&self) -> Option<u64> {
+        Some(self.inner.lock().head.updates)
     }
 
     fn fork_state(&self, st: &DraftState) -> Option<DraftState> {

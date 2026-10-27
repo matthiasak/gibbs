@@ -677,40 +677,18 @@ async fn handle_image_edits(
     .await
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct DraftConfigUpdate {
-    pub mode: Option<crate::runtime::noise_draft::DraftMode>,
-    pub max_k: Option<usize>,
-    pub target_acceptance: Option<f32>,
-    pub cost_weight: Option<f32>,
-    pub suffix_min_match: Option<usize>,
-    pub noise_lr: Option<f32>,
-    pub noise_sigma: Option<f32>,
-}
-
 fn draft_status_json(state: &AppState) -> serde_json::Value {
     let knobs = state.scheduler.draft_knobs();
     let view = state.scheduler.view();
     let sum = state.telemetry.get_summary();
-    let rates: Vec<serde_json::Value> = state
-        .scheduler
-        .k_tuner_rates()
-        .into_iter()
-        .map(|(k, tok_s, acc)| {
-            serde_json::json!({
-                "k": k,
-                "tok_per_sec": tok_s,
-                "acceptance_rate": acc,
-            })
-        })
-        .collect();
     serde_json::json!({
         "knobs": knobs,
         "active_drafter": view.spec.as_ref().map(|s| s.label.clone()),
         "best_k": view.spec.as_ref().and_then(|s| s.k),
+        "online_updates": view.spec.as_ref().and_then(|s| s.updates),
         "spec_accept_rate": sum.spec_accept_rate,
         "spec_tokens_per_forward": sum.spec_tokens_per_forward,
-        "k_tuner": rates,
+        "k_tuner": state.scheduler.k_tuner_rates(),
     })
 }
 
@@ -718,38 +696,31 @@ async fn handle_get_draft_config(State(state): State<AppState>) -> Json<serde_js
     Json(draft_status_json(&state))
 }
 
+/// Applies any subset of the [`crate::runtime::noise_draft::DraftKnobs`] fields (clamped), saves
+/// them and returns the status with every knob.
 async fn handle_set_draft_config(
     State(state): State<AppState>,
-    Json(update): Json<DraftConfigUpdate>,
-) -> Json<serde_json::Value> {
-    let mut knobs = state.scheduler.draft_knobs();
-    if let Some(m) = update.mode {
-        knobs.mode = m;
+    Json(update): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+    let mut knobs = serde_json::to_value(state.scheduler.draft_knobs()).map_err(|e| bad(e.to_string()))?;
+    let (Some(cur), Some(update)) = (knobs.as_object_mut(), update.as_object()) else {
+        return Err(bad("expected a JSON object of draft knobs".into()));
+    };
+    for (k, v) in update {
+        if !cur.contains_key(k) {
+            return Err(bad(format!("unknown draft knob `{k}`")));
+        }
+        cur.insert(k.clone(), v.clone());
     }
-    if let Some(k) = update.max_k {
-        knobs.max_k = k;
-    }
-    if let Some(a) = update.target_acceptance {
-        knobs.target_acceptance = a;
-    }
-    if let Some(c) = update.cost_weight {
-        knobs.cost_weight = c;
-    }
-    if let Some(s) = update.suffix_min_match {
-        knobs.suffix_min_match = s;
-    }
-    if let Some(lr) = update.noise_lr {
-        knobs.noise_lr = lr;
-    }
-    if let Some(sig) = update.noise_sigma {
-        knobs.noise_sigma = sig;
-    }
-    let knobs = knobs.sanitized();
+    let knobs = serde_json::from_value::<crate::runtime::noise_draft::DraftKnobs>(knobs)
+        .map_err(|e| bad(format!("invalid draft knobs: {e}")))?
+        .sanitized();
     state.scheduler.set_draft_knobs(knobs);
     let mut s = crate::tui::settings::load_settings();
     s.draft = knobs;
     let _ = crate::tui::settings::save_settings(&s);
-    Json(draft_status_json(&state))
+    Ok(Json(draft_status_json(&state)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -956,13 +927,25 @@ mod tests {
             "target_acceptance": 0.72,
             "cost_weight": 0.4,
             "suffix_min_match": 3,
-            "noise_lr": 0.008
+            "noise_lr": 0.008,
+            "objective": "tokens",
+            "denoise_steps": 3,
+            "probes": 12
         });
         let body = post_body("/v1/draft/config", payload).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["knobs"]["mode"], "noise");
         assert_eq!(v["knobs"]["max_k"], 6);
         assert_eq!(v["knobs"]["suffix_min_match"], 3);
+        assert_eq!(v["knobs"]["objective"], "tokens");
+        assert_eq!(v["knobs"]["denoise_steps"], 3);
+        // Clamped to a power of two; untouched knobs keep their values.
+        assert_eq!(v["knobs"]["probes"], 16);
+        assert_eq!(v["knobs"]["shortlist"], 256);
+        assert_eq!(
+            post_status("/v1/draft/config", serde_json::json!({"bogus": 1})).await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

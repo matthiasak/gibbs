@@ -14,7 +14,7 @@
 use super::{recent, ExecutableModel, NO_STATE};
 use crate::model::native::SeqState;
 use crate::runtime::lm::{nucleus, sample_logits};
-use crate::runtime::noise_draft::{DraftKnobs, DraftMode};
+use crate::runtime::noise_draft::{DraftKnobs, DraftMode, DraftObjective};
 use crate::runtime::sched::Rng;
 use std::any::Any;
 use std::sync::Arc;
@@ -65,6 +65,10 @@ pub trait Drafter: Send + Sync {
     /// the target verifies this step's.
     fn overlaps(&self) -> bool {
         false
+    }
+    /// Online learning updates so far (online drafters).
+    fn online_updates(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -718,7 +722,10 @@ impl KTuner {
         if s <= 0.0 {
             return 0.0;
         }
-        let raw = t / s;
+        let raw = match knobs.objective {
+            DraftObjective::Speed => t / s,
+            DraftObjective::TokensPerForward => t,
+        };
         if k == 0 || knobs.cost_weight <= 1e-5 {
             return raw;
         }
@@ -757,12 +764,27 @@ impl KTuner {
         self.cur
     }
 
-    /// Summary `(k, tok_per_sec, accept_rate)` for each measured `k`.
-    pub fn rates_summary(&self) -> Vec<(usize, f64, f64)> {
+    /// What [`KTuner`] measured for each `k`.
+    pub fn rates_summary(&self) -> Vec<KRate> {
         (0..self.avg.len())
-            .map(|k| (k, self.rate(k), self.acceptance_rate(k)))
+            .map(|k| KRate {
+                k,
+                tok_per_sec: self.rate(k),
+                acceptance_rate: self.acceptance_rate(k),
+                tokens_per_forward: self.avg[k].0,
+            })
             .collect()
     }
+}
+
+/// [`KTuner`]'s EWMAs for one `k`: output tokens per second, accepted / drafted, and output tokens
+/// per verify forward (one forward per step).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct KRate {
+    pub k: usize,
+    pub tok_per_sec: f64,
+    pub acceptance_rate: f64,
+    pub tokens_per_forward: f64,
 }
 
 #[cfg(test)]
