@@ -173,6 +173,9 @@ struct Cli {
     #[arg(long)]
     max_tokens: Option<usize>,
 
+    /// KV rows one sequence stores (default: the model's context). Below the model's context,
+    /// `--compact-mode auto|aggressive` evicts KV pages (sinks, recent, heaviest keys) there so
+    /// decoding continues up to the model's context; `light|off` stop with `length`.
     #[arg(long)]
     ctx: Option<usize>,
 
@@ -784,6 +787,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             s.compact.summarizer = gibbs_engine::compact::summarizer_id(id);
         }
         s.compact = s.compact.clone().sanitized();
+        scheduler.set_compaction(&s.compact);
         let _ = gibbs_engine::tui::settings::save_settings(&s);
     }
 

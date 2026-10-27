@@ -10,8 +10,9 @@
 //! - **Tier 3 (`Summarizer`)**: Folds the oldest turns into a greedy, cached model summary; on
 //!   vision models in Aggressive mode the folded transcript also rides along as `SnapCompact`
 //!   glyph pages (HD44780 5x7 font, `render_snapcompact_pages`).
-//! - **Tier 4 ([`snapkv::evict_kv_state`])**: Physical `SnapKV` / `H2O` heavy-hitter + attention-sink
-//!   KV row compaction inside [`StateStore`].
+//! - **Tier 4 ([`snapkv::evict_pages`])**: KV page eviction (attention-sink, recent and
+//!   heaviest-key pages kept) when a decoding sequence outgrows `--ctx` below the model's trained
+//!   positions (Auto and Aggressive; run by the scheduler).
 
 pub mod snapkv;
 

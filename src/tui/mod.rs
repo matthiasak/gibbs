@@ -1155,6 +1155,9 @@ impl TuiApp {
             let mut s = settings::load_settings();
             s.compact = cfg.clone();
             settings::save_settings(&s)?;
+            if let Some(sch) = &self.scheduler {
+                sch.set_compaction(&cfg);
+            }
             self.compact_config = cfg;
         }
         if run_now {

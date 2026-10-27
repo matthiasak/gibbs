@@ -828,6 +828,32 @@ impl KvView {
         }
     }
 
+    /// Tier-4 page eviction ([`crate::compact::snapkv::evict_pages`]): keeps the full-class
+    /// logical pages `keep` (ascending, ending with the last page, so every dropped page is full),
+    /// releases the rest and counts their positions in [`Self::evicted`]. Rings are untouched.
+    pub fn keep_pages(&mut self, keep: &[usize]) {
+        let Some(c) = self.pool.full else {
+            return;
+        };
+        let old = std::mem::take(&mut self.tables[c]);
+        assert_eq!(keep.last(), old.len().checked_sub(1).as_ref(), "the last page stays");
+        let (mut kept, mut dropped) = (Vec::with_capacity(keep.len()), Vec::new());
+        let mut want = keep.iter().peekable();
+        for (lp, pg) in old.into_iter().enumerate() {
+            if want.next_if(|&&k| k == lp).is_some() {
+                kept.push(pg);
+            } else {
+                dropped.push(pg);
+            }
+        }
+        self.pool.release(c, &dropped);
+        let rows = dropped.len() * PAGE_TOKENS;
+        self.evicted += rows;
+        self.lens[c] -= rows;
+        self.tables[c] = kept;
+        self.gen[c] += 1;
+    }
+
     /// Host addresses of `name`'s rows.
     pub fn host_rows(&self, name: &str) -> Option<HostRows<'_>> {
         let (c, i) = self.pool.locate(name)?;

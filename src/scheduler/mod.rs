@@ -222,9 +222,19 @@ impl ExecutableModel {
         self.0.tokenizer().clone()
     }
 
-    /// Maximum positions the model's state holds.
+    /// Rows one sequence may store ([`NativeLm::context_len`]).
     pub fn context_len(&self) -> Option<usize> {
         Some(self.0.context_len().max(1))
+    }
+
+    /// Positions one sequence may reach ([`NativeLm::max_positions`]).
+    pub fn max_positions(&self) -> usize {
+        self.0.max_positions()
+    }
+
+    /// [`NativeLm::kv_evict`].
+    pub fn kv_evict(&self, state: &mut Option<SeqState>, target_rows: usize) -> Result<usize, String> {
+        self.0.kv_evict(state.as_mut().ok_or(NO_STATE)?, target_rows)
     }
 
     /// Expands `ids` for the model ([`NativeLm::prepare_ctx`], media allowed) and builds the
@@ -510,6 +520,9 @@ pub struct Sequence {
     pub finish: FinishSignal,
     /// Speculative decoding state; set when the sequence starts prefill with a drafter.
     pub spec: Option<SpecSeq>,
+    /// Positions Tier-4 page eviction dropped (stored rows = positions - evicted); an evicted
+    /// sequence is never exported to the radix cache.
+    pub evicted: usize,
 }
 
 impl Sequence {
@@ -529,6 +542,7 @@ impl Sequence {
             prefilled_tokens: 0,
             finish: FinishSignal::default(),
             spec: None,
+            evicted: 0,
         }
     }
 
@@ -626,6 +640,8 @@ pub struct ContinuousBatchScheduler {
     drafter: RwLock<Option<Arc<dyn Drafter>>>,
     k_tuner: Mutex<KTuner>,
     draft_knobs: Arc<LiveDraftKnobs>,
+    /// Tier-4 KV page eviction settings: compaction mode and target fraction of the context.
+    tier4: Mutex<(crate::compact::CompactionMode, f32)>,
     pub logprob_tx: Arc<RwLock<Option<UnboundedSender<TokenLogprobInfo>>>>,
     work_signal: (Mutex<bool>, Condvar),
 }
@@ -680,7 +696,8 @@ impl ContinuousBatchScheduler {
                 .unwrap_or_else(Tokenizer::default_bpe),
         );
         let has_model = model.is_some();
-        let mut init_knobs = crate::tui::settings::load_settings().draft;
+        let settings = crate::tui::settings::load_settings();
+        let mut init_knobs = settings.draft;
         if let Ok(env_spec) = std::env::var("GIBBS_SPEC") {
             if let Ok(mode) = env_spec.parse::<DraftMode>() {
                 init_knobs.mode = mode;
@@ -702,6 +719,7 @@ impl ContinuousBatchScheduler {
             view: Mutex::new(SchedulerView::default()),
             k_tuner: Mutex::new(KTuner::default()),
             draft_knobs,
+            tier4: Mutex::new((settings.compact.mode, settings.compact.target_ratio)),
             logprob_tx: Arc::new(RwLock::new(None)),
             work_signal: (Mutex::new(false), Condvar::new()),
         };
@@ -857,6 +875,11 @@ impl ContinuousBatchScheduler {
         self.draft_knobs.clone()
     }
 
+    /// Applies compaction settings to Tier-4 KV page eviction (mode and target ratio).
+    pub fn set_compaction(&self, cfg: &crate::compact::CompactionConfig) {
+        *self.tier4.lock() = (cfg.mode, cfg.target_ratio);
+    }
+
     /// Updates [`DraftKnobs`] live and reconfigures the active drafter when the mode changes.
     pub fn set_draft_knobs(&self, knobs: DraftKnobs) {
         let prev = self.draft_knobs.snapshot();
@@ -977,8 +1000,9 @@ impl ContinuousBatchScheduler {
         };
         let (tokenizer, model, ids, kv_cache) = self.prepare_prompt(media, &ctx, encode)?;
         let n = ids.len();
-        if let Some(ctx) = model.as_ref().and_then(ExecutableModel::context_len) {
-            params.max_new_tokens = params.max_new_tokens.min(ctx.saturating_sub(n));
+        // Positions, not stored rows: past `--ctx` rows Tier 4 may evict, else the step ends it.
+        if let Some(m) = &model {
+            params.max_new_tokens = params.max_new_tokens.min(m.max_positions().saturating_sub(n));
         }
         if let Some((t, p)) = tokenizer.sampling_defaults {
             params.temperature.get_or_insert(t);
@@ -1160,11 +1184,21 @@ impl ContinuousBatchScheduler {
         let model = self.model.read().clone();
         let tokenizer = self.tokenizer();
         let drafter = self.drafter.read().clone();
-        // Sequences end at the model's context length: its KV cache holds no more positions.
+        // Sequences store at most the model's context length of KV rows. Tier 4 (Auto and
+        // Aggressive compaction, `--ctx` below the trained positions) evicts KV pages down to the
+        // target fraction there, so sequences end at the trained positions instead.
         let context_len = model
             .as_ref()
             .and_then(ExecutableModel::context_len)
             .unwrap_or(usize::MAX);
+        let max_positions = model.as_ref().map_or(context_len, ExecutableModel::max_positions);
+        let tier4 = {
+            use crate::compact::CompactionMode::{Aggressive, Auto};
+            let (mode, target) = *self.tier4.lock();
+            (matches!(mode, Auto | Aggressive) && max_positions > context_len)
+                .then(|| (context_len as f32 * target) as usize)
+        };
+        let pos_limit = if tier4.is_some() { max_positions } else { context_len };
         self.step_counter.fetch_add(1, Ordering::Relaxed);
         let decoding = active.iter().any(|s| s.state == SequenceState::Decoding);
         let prefill_budget = self.prefill_tuner.lock().budget(decoding);
@@ -1335,7 +1369,7 @@ impl ContinuousBatchScheduler {
                             } else {
                                 seq.emit(&[next_tok], &self.telemetry);
                                 tokens_gen += 1;
-                                if seq.total_tokens() >= context_len
+                                if seq.total_tokens() >= pos_limit
                                     || seq.output_tokens.len() >= seq.params.max_new_tokens
                                 {
                                     let _ = seq.finish.set(FinishReason::Length);
@@ -1350,6 +1384,31 @@ impl ContinuousBatchScheduler {
                 let top_p = seq.params.top_p.unwrap_or(DEFAULT_TOP_P);
                 let mut all = seq.prompt_tokens.clone();
                 all.extend_from_slice(&seq.output_tokens);
+                // Tier 4: the stored rows reached the context; evict pages to keep decoding.
+                let full = all.len() >= context_len.saturating_add(seq.evicted);
+                if let Some(target) = tier4.filter(|_| full) {
+                    match m.kv_evict(&mut seq.kv_cache, target) {
+                        Ok(n) if n > 0 => {
+                            seq.evicted += n;
+                            self.telemetry.log_info(&format!(
+                                "sequence {}: evicted {n} KV positions at position {} ({} in total)",
+                                seq.id,
+                                all.len(),
+                                seq.evicted
+                            ));
+                        }
+                        r => {
+                            if let Err(e) = r {
+                                self.telemetry.log_info(&format!("sequence {}: {e}", seq.id));
+                            }
+                            let _ = seq.finish.set(FinishReason::Length);
+                            seq.state = SequenceState::Finished;
+                            continue;
+                        }
+                    }
+                }
+                // Positions this sequence may still reach: stored rows within the context.
+                let limit = pos_limit.min(context_len.saturating_add(seq.evicted));
                 // Draft no more than the sequence may still emit (the target adds one) or hold.
                 let knobs_snap = self.draft_knobs.snapshot();
                 let spec_k = seq.spec.as_ref().map(|sp| {
@@ -1361,7 +1420,7 @@ impl ContinuousBatchScheduler {
                                 .max_new_tokens
                                 .saturating_sub(seq.output_tokens.len() + 1),
                         )
-                        .min(context_len.saturating_sub(all.len()))
+                        .min(limit.saturating_sub(all.len()))
                 });
                 // Pages for the positions this step may add (cached prefixes evicted first).
                 if let Some(Err(e)) = pool.as_ref().map(|p| p.ensure_free(1 + spec_k.unwrap_or(0), false)) {
@@ -1423,7 +1482,7 @@ impl ContinuousBatchScheduler {
                                 seq.params
                                     .max_new_tokens
                                     .saturating_sub(seq.output_tokens.len())
-                                    .min(context_len.saturating_sub(all.len())),
+                                    .min(limit.saturating_sub(all.len())),
                                 temp,
                                 top_p,
                                 &all,
@@ -1471,12 +1530,13 @@ impl ContinuousBatchScheduler {
                 decode_time += started.elapsed();
                 decoded += 1;
 
-                // Emit up to EOS, max_new_tokens or the context end, whichever comes first.
+                // Emit up to EOS, max_new_tokens or the last position, whichever comes first (a
+                // sequence at its stored-row cap evicts before its next step).
                 let room = seq
                     .params
                     .max_new_tokens
                     .saturating_sub(seq.output_tokens.len())
-                    .min(context_len.saturating_sub(seq.total_tokens()));
+                    .min(pos_limit.saturating_sub(seq.total_tokens()));
                 let eos = tokens.iter().position(|&t| tokenizer.ends_generation(t));
                 let n = eos.unwrap_or(tokens.len()).min(room);
                 if n > 0 {
@@ -1488,7 +1548,7 @@ impl ContinuousBatchScheduler {
                         self.record_gap(itl);
                     }
                 }
-                if seq.total_tokens() >= context_len
+                if seq.total_tokens() >= pos_limit
                     || seq.output_tokens.len() >= seq.params.max_new_tokens
                 {
                     let _ = seq.finish.set(FinishReason::Length);
@@ -1822,7 +1882,9 @@ mod tests {
         }
     }
 
-    /// Generation ends at the model's context length (its KV cache capacity), not past it.
+    /// Generation ends at the model's context length (its KV cache capacity), not past it. With
+    /// `--ctx` below the trained positions, Auto compaction evicts KV pages at the stored-row cap
+    /// and decoding runs on to the trained positions (`length` there); Off stops at the cap.
     #[test]
     fn test_generation_stops_at_model_context_length() {
         let model = cpu_exec(SHORT);
@@ -1833,6 +1895,35 @@ mod tests {
         // Unclamped submit path: only the step's context check can stop this sequence.
         let (_, rx) = scheduler.submit_request_stream(vec![7u32; ctx - 12]);
         assert_eq!(run_to_completion(&scheduler, rx).len(), 12);
+
+        use crate::compact::{CompactionConfig, CompactionMode};
+        let (stored, prompt) = (3 * crate::kv::PAGE_TOKENS, 150);
+        for (mode, want) in [(CompactionMode::Auto, SHORT), (CompactionMode::Off, stored)] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = serde_json::json!({"max_position_embeddings": SHORT});
+            let a = crate::arch::testing::synthetic_llama(dir.path(), cfg);
+            let exact = crate::model::weight_format::ReencodeConfig {
+                policy: crate::model::weight_format::ReencodePolicy::BitExact,
+                ..Default::default()
+            };
+            let reg = crate::arch::registry().unwrap();
+            let m = crate::arch::load::load_with(&a, reg, Some("llama"), exact).unwrap();
+            let cpu = crate::hardware::PlacementMode::Pin(Device::Cpu);
+            let lm = crate::runtime::lm::SpecLm::with_ctx(m, cpu, Some(stored)).unwrap();
+            let s = ContinuousBatchScheduler::new("", Some(ExecutableModel::new(Arc::new(lm))));
+            s.set_compaction(&CompactionConfig { mode, ..Default::default() });
+            let params = SamplingParams {
+                temperature: Some(0.0),
+                top_p: None,
+                max_new_tokens: usize::MAX,
+                top_logprobs: None,
+            };
+            let (_, rx, ..) = s.submit_with_params(params, |_| vec![7u32; prompt]);
+            assert_eq!(run_to_completion(&s, rx).len(), want - prompt, "{mode:?}");
+            let logs = s.telemetry.get_recent_logs(500);
+            let evictions = logs.iter().filter(|l| l.message.contains("evicted")).count();
+            assert_eq!(evictions > 0, mode == CompactionMode::Auto, "{mode:?}");
+        }
     }
 
     #[test]

@@ -50,8 +50,13 @@ pub trait NativeLm: Send + Sync {
         None
     }
     fn tokenizer(&self) -> &Tokenizer;
-    /// Positions one sequence may hold (prompt + output).
+    /// Rows one sequence may store (`--ctx`): prompt + output unless Tier-4 KV page eviction
+    /// ([`Self::kv_evict`]) drops older rows.
     fn context_len(&self) -> usize;
+    /// Positions one sequence may reach (the model's trained context; RoPE never extrapolates).
+    fn max_positions(&self) -> usize {
+        self.context_len()
+    }
     /// Output cap when the caller sets none (seq2seq: generation_config `max_length`).
     fn default_max_new_tokens(&self) -> Option<usize> {
         None
@@ -185,6 +190,12 @@ pub trait NativeLm: Send + Sync {
     /// The model's KV page pool.
     fn kv_pool(&self) -> Option<Arc<crate::kv::KvPool>> {
         None
+    }
+
+    /// Tier-4 KV page eviction ([`crate::compact::snapkv::evict_pages`]): drops older pages of
+    /// `state` down to about `target_rows` stored rows; the positions evicted (0: nothing to drop).
+    fn kv_evict(&self, _state: &mut SeqState, _target_rows: usize) -> Result<usize, String> {
+        Err("this model cannot evict KV pages".into())
     }
 
     /// The radix prefix-cache key of prepared prompt `ids`: equal to `ids` except at media

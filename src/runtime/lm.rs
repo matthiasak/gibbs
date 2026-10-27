@@ -136,7 +136,11 @@ pub struct SpecLm {
     /// Modalities whose tower failed to build at load, with why (said when a prompt attaches one).
     off: HashMap<String, String>,
     tok: Arc<Tokenizer>,
+    /// Rows a sequence stores (`--ctx`, else the spec's `ctx`).
     ctx: usize,
+    /// Positions a sequence reaches: the spec's own `ctx` (its trained context), or `--ctx` when
+    /// larger. Past `ctx` rows, Tier-4 page eviction keeps a sequence going up to here.
+    max_positions: usize,
     shapes: ShapeCache,
     /// Compiled from the decode instance; every other instance runs reshaped on it.
     program: Mutex<GraphProgram>,
@@ -339,12 +343,7 @@ pub fn load_with_ctx(
         || {
             Some(
                 crate::arch::load::load(artifacts, reg, family)
-                    .and_then(|m| {
-                        if let Some(c) = ctx {
-                            m.env.set_ctx(c.into());
-                        }
-                        SpecLm::new(m, mode)
-                    })
+                    .and_then(|m| SpecLm::with_ctx(m, mode, ctx))
                     .map(|m| Arc::new(m) as Arc<dyn NativeLm>),
             )
         },
@@ -356,8 +355,26 @@ pub fn load_with_ctx(
 impl SpecLm {
     /// Compiles `model`'s decode instance on `mode`.
     pub fn new(model: Model, mode: PlacementMode) -> Result<Self, String> {
-        crate::arch::load::check(&model)?;
+        Self::with_ctx(model, mode, None)
+    }
+
+    /// [`Self::new`] storing at most `ctx` rows per sequence (`--ctx`, `runtime.ctx`).
+    pub fn with_ctx(model: Model, mode: PlacementMode, ctx: Option<usize>) -> Result<Self, String> {
         let fam = model.spec.family.clone();
+        let ctx_var = |model: &Model| {
+            ["ctx", "max_position_embeddings"]
+                .iter()
+                .find_map(|v| model.env.var(v).ok().filter(|v| !v.is_null()))
+                .ok_or_else(|| {
+                    format!("{fam}: config sets neither `ctx` nor `max_position_embeddings`")
+                })?
+                .usize()
+        };
+        let trained = ctx_var(&model)?;
+        if let Some(c) = ctx {
+            model.env.set_ctx(c.into());
+        }
+        crate::arch::load::check(&model)?;
         let rt: Runtime = model.spec.runtime_as()?;
         if rt.thinking_delimiters.len() % 2 != 0 {
             return Err(format!(
@@ -370,13 +387,7 @@ impl SpecLm {
             (None, true) => Arc::new(Tokenizer::default_bpe()),
             (None, false) => return Err(format!("{fam}: the checkpoint has no tokenizer")),
         };
-        let ctx = ["ctx", "max_position_embeddings"]
-            .iter()
-            .find_map(|v| model.env.var(v).ok().filter(|v| !v.is_null()))
-            .ok_or_else(|| {
-                format!("{fam}: config sets neither `ctx` nor `max_position_embeddings`")
-            })?
-            .usize()?;
+        let ctx = ctx_var(&model)?;
         let shapes = ShapeCache::new(TEXT);
         let v = vars(1, "last", &[], 0);
         let decode = shapes.get(&v, || {
@@ -457,6 +468,7 @@ impl SpecLm {
             off,
             tok,
             ctx,
+            max_positions: trained.max(ctx),
             shapes,
             program: Mutex::new(program),
             recurrent,
@@ -624,12 +636,16 @@ impl SpecLm {
             ));
         }
         let end = start + tokens.len();
-        if end > self.ctx {
+        if end > self.max_positions {
             return Err(format!(
                 "position {} is past the context length {}",
                 end - 1,
-                self.ctx
+                self.max_positions
             ));
+        }
+        let stored = end - seq.state.kv.as_ref().map_or(0, |kv| kv.evicted);
+        if stored > self.ctx {
+            return Err(format!("{stored} KV rows exceed the context of {} rows", self.ctx));
         }
         if end <= seq.len {
             // A block ran ahead: its end's logits answer every position inside it.
@@ -881,6 +897,10 @@ impl NativeLm for SpecLm {
 
     fn context_len(&self) -> usize {
         self.ctx
+    }
+
+    fn max_positions(&self) -> usize {
+        self.max_positions
     }
 
     fn prompt_len(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<usize, String> {
@@ -1161,6 +1181,20 @@ impl NativeLm for SpecLm {
 
     fn kv_pool(&self) -> Option<Arc<crate::kv::KvPool>> {
         self.kv_pool.clone()
+    }
+
+    fn kv_evict(&self, state: &mut SeqState, target_rows: usize) -> Result<usize, String> {
+        let seq = Self::seq(state)?;
+        self.drain_stream(seq)?;
+        // Every unpaged state must be position-free (recurrent): only paged rows can be dropped.
+        if seq.recurrent_ahead || self.contiguous.iter().any(|n| !self.recurrent.contains(n)) {
+            return Err("this model's state cannot drop KV pages".into());
+        }
+        let kv = seq.state.kv.as_mut().ok_or("this model's KV is not paged")?;
+        kv.release_from(seq.len);
+        // ponytail: half of the non-sink page budget recent, half heaviest keys; tune with evals.
+        let recent = (target_rows / crate::kv::PAGE_TOKENS).saturating_sub(1).div_ceil(2);
+        Ok(crate::compact::snapkv::evict_pages(kv, target_rows, 1, recent))
     }
 
     fn radix_key(&self, state: &SeqState, ids: &[u32]) -> Vec<u32> {
