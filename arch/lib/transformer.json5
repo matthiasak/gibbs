@@ -165,6 +165,17 @@
       {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "y", name: "add_attn"},
       {op: "Binary", args: {kind: "Add"}, in: ["y", "m"], out: "out", name: "add_mlp"},
     ]},
+    // Post-LN encoder layer (BERT): x = ln1(x + attn(x)), out = ln2(x + mlp(x)). args: wq, wk,
+    // wv, wo (bidirectional `attn_full`); ln1, ln2 (`layer_norm` stems); up, down (`mlp_plain`,
+    // act default 'GeluErf').
+    post_ln_encoder_layer: {params: ["x"], body: [
+      {use: "attn_full", args: {causal: false}, in: ["x"], out: "y", name: "attn"},
+      {use: "residual", in: ["y", "x"], out: "x", name: "res1"},
+      {use: "layer_norm", args: {w: "ln1"}, in: ["x"], out: "x", name: "ln1"},
+      {use: "mlp_plain", args: {act: "first(act, 'GeluErf')"}, in: ["x"], out: "m", name: "mlp"},
+      {use: "residual", in: ["m", "x"], out: "x", name: "res2"},
+      {use: "layer_norm", args: {w: "ln2"}, in: ["x"], out: "out", name: "ln2"},
+    ]},
 
     // Logits: Linear over `{w}` (`{embed}` when tied), divided by logit_scale, then soft-capped.
     lm_head: {params: ["x"], body: [
