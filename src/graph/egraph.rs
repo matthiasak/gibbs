@@ -34,7 +34,8 @@
 //! and only lowered by the planner. The allocation-dependent GEMV pairing
 //! (`pair_small_hand_gemvs`, which needs arena offsets and tuned variants) stays a planner post-pass.
 
-use crate::graph::passes::{fusion, megakernel};
+use crate::graph::passes::fusion::{self, FuseWeights};
+use crate::graph::passes::megakernel;
 use crate::graph::pattern::MatchContext;
 use crate::graph::{DType, Graph, NodeId, Op, Tensor, ValueId, ValueKind, Weights};
 use egglog::scheduler::{Matches, Scheduler};
@@ -583,20 +584,20 @@ pub struct Fusion {
 }
 
 /// Runs the e-graph fusion on `graph` (after canonical/dtype_adapt), applying the
-/// extracted fusions in place and updating `weights` like the passes do.
+/// extracted fusions in place and treating `weights` like the passes do.
 pub fn fuse(
     graph: &mut Graph,
-    weights: Option<&mut Weights>,
+    weights: FuseWeights<'_>,
     rules: &[Rule],
     cost: &CostModel,
     budget: Budget,
 ) -> Result<Report, String> {
-    Fusion::new(graph, weights.as_deref(), rules, cost, budget)?.apply(graph, weights, &[])
+    Fusion::new(graph, weights.tensors(), rules, cost, budget)?.apply(graph, weights, &[])
 }
 
 /// `rule` alone with constant costs (tests of one fusion): how many it applied.
 #[cfg(test)]
-pub(crate) fn fuse_rule(graph: &mut Graph, weights: Option<&mut Weights>, rule: Rule) -> usize {
+pub(crate) fn fuse_rule(graph: &mut Graph, weights: FuseWeights<'_>, rule: Rule) -> usize {
     let r = fuse(
         graph,
         weights,
@@ -946,14 +947,16 @@ impl Fusion {
     }
 
     /// Applies the cost model's choices with `flip` toggled to `graph` (the graph [`Fusion::new`]
-    /// saw, unchanged), concatenating `weights` like the passes do. A choice flipped on wins: the
+    /// saw, unchanged), treating `weights` like the passes do. A choice flipped on wins: the
     /// cost model's choices it overlaps are switched off and the gate/up fusions it reads are
     /// switched on; choices left reading a gate/up fusion that is off are switched off. Two
-    /// flipped-on choices that overlap are an error.
+    /// flipped-on choices that overlap are an error. Under [`FuseWeights::ReuseOnly`] a choice
+    /// whose fused weight the program does not bind stays unfused, and so does a QKV choice
+    /// reading a gate/up fusion that stayed unfused.
     pub fn apply(
         &self,
         graph: &mut Graph,
-        mut weights: Option<&mut Weights>,
+        mut weights: FuseWeights<'_>,
         flip: &[usize],
     ) -> Result<Report, String> {
         let mut report = self.report.clone();
@@ -1006,16 +1009,19 @@ impl Fusion {
             chosen(Kind::Qkv).map(|p| &p.members[..]).collect();
 
         let node_of = |g: &Graph, v: ValueId| match g.value(v).kind {
-            ValueKind::Node(n) => n,
-            _ => unreachable!("fusion member is a node output"),
+            ValueKind::Node(n) => Some(n),
+            _ => None,
         };
-        let resolve = |g: &Graph, m: &Result<ValueId, ValueId>| -> NodeId {
+        let resolve = |g: &Graph, m: &Result<ValueId, ValueId>| -> Option<NodeId> {
             match m {
                 Ok(v) => node_of(g, *v),
-                // GLU input 0 is the gate slice of the fused gate/up Linear.
+                // GLU input 0 is the gate slice of the fused gate/up Linear (when it was fused).
                 Err(glu) => {
-                    let slice = g.nodes[node_of(g, *glu).0 as usize].inputs[0];
-                    node_of(g, g.nodes[node_of(g, slice).0 as usize].inputs[0])
+                    let slice = g.nodes[node_of(g, *glu)?.0 as usize].inputs[0];
+                    let s = &g.nodes[node_of(g, slice)?.0 as usize];
+                    matches!(s.op, Op::Slice { .. })
+                        .then(|| node_of(g, s.inputs[0]))
+                        .flatten()
                 }
             }
         };
@@ -1025,10 +1031,11 @@ impl Fusion {
          -> Vec<MatchContext> {
             let mut ms: Vec<Vec<NodeId>> = sets
                 .iter()
-                .map(|s| {
-                    let mut ns: Vec<NodeId> = s.iter().map(|m| resolve(g, m)).collect();
+                .filter_map(|s| {
+                    let mut ns: Vec<NodeId> =
+                        s.iter().map(|m| resolve(g, m)).collect::<Option<_>>()?;
                     ns.sort_by_key(|n| n.0);
-                    ns
+                    Some(ns)
                 })
                 .collect();
             ms.sort_by_key(|ns| ns.iter().map(|n| n.0).collect::<Vec<_>>());
@@ -1043,7 +1050,7 @@ impl Fusion {
                 .collect()
         };
         let only = |g: &Graph, vs: &[ValueId]| -> HashSet<NodeId> {
-            vs.iter().map(|v| node_of(g, *v)).collect()
+            vs.iter().filter_map(|v| node_of(g, *v)).collect()
         };
         let want = [mlp_adds.len(), gate_up.len(), qkv.len()];
         report.applied = [0; 3];
@@ -1052,11 +1059,11 @@ impl Fusion {
             report.applied[0] = megakernel::fuse_mlp_blocks(graph, &s);
         }
         let ms = contexts(graph, &gate_up, &["gate", "up"]);
-        report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.as_deref_mut());
+        report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.reborrow());
         let ms = contexts(graph, &qkv, &["q", "k", "v"]);
-        report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.as_deref_mut());
+        report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.reborrow());
         report.decode_ms = t.elapsed().as_secs_f64() * 1e3;
-        if report.applied != want {
+        if report.applied != want && !matches!(weights, FuseWeights::ReuseOnly(_)) {
             return Err(format!(
                 "egraph: extracted fusions {want:?} but the rewriters applied {:?}",
                 report.applied
@@ -1076,18 +1083,13 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::passes::{canonical, dtype_adapt};
 
     type Gw = (Graph, Weights);
 
-    fn prep(g: &mut Graph, w: &Weights) {
-        canonical::run(g, w);
-        dtype_adapt::run(g);
-    }
-
     fn by_egraph((mut g, mut w): Gw, rules: &[Rule], cost: &CostModel) -> (Gw, Report) {
-        prep(&mut g, &w);
-        let r = fuse(&mut g, Some(&mut w), rules, cost, Budget::default()).expect("egraph fusion");
+        crate::graph::passes::prefuse(&mut g);
+        let r = fuse(&mut g, FuseWeights::Materialize(&mut w), rules, cost, Budget::default())
+            .expect("egraph fusion");
         crate::graph::pattern::validate_ssa(&g).expect("SSA after egraph fusion");
         ((g, w), r)
     }

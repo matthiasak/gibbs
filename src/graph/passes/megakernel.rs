@@ -289,6 +289,7 @@ pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: &HashSet<NodeId>) -> usiz
 mod tests {
     use super::*;
     use crate::graph::egraph::Rule;
+    use crate::graph::passes::fusion::FuseWeights;
     use crate::graph::{DType, Op, Tensor, Weights};
 
     #[test]
@@ -358,7 +359,7 @@ mod tests {
         let ref_logits = ref_res[0].as_f32().expect("f32 output");
 
         // 2. Run fusion pass
-        let rewrites = crate::graph::egraph::fuse_rule(&mut g, None, Rule::MegakernelMlp);
+        let rewrites = crate::graph::egraph::fuse_rule(&mut g, FuseWeights::None, Rule::MegakernelMlp);
         assert_eq!(rewrites, 1, "MLP block must be fused into megakernel");
 
         // 3. Validate SSA and check node structure
@@ -483,7 +484,7 @@ mod tests {
         let ref_logits = ref_res[0].as_f32().expect("f32 output");
 
         // 2. Run fusion pass
-        let rewrites = crate::graph::egraph::fuse_rule(&mut g, None, Rule::MegakernelMlp);
+        let rewrites = crate::graph::egraph::fuse_rule(&mut g, FuseWeights::None, Rule::MegakernelMlp);
         assert_eq!(
             rewrites, 1,
             "MLP block with post-norm must be fused into megakernel"

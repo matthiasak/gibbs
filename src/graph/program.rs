@@ -3,6 +3,7 @@
 use crate::graph::placement::{
     device_supports_op, place_graph, placement_rows, PlacementPlan, PlacementRow,
 };
+use crate::graph::passes::fusion::FuseWeights;
 use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, ValueId, Weights};
 use crate::hardware::{available_devices, Device, PlacementMode};
 
@@ -68,6 +69,17 @@ impl CompiledSegment {
     }
 }
 
+/// One [`GraphProgram::run_reshaped`] instance shape: the caller's graph canonicalized and fused
+/// onto the fused weights the program already binds.
+struct ReshapedInstance {
+    /// The caller graph's node and output counts (a tapped instance adds outputs, not nodes).
+    key: (usize, usize),
+    shapes: Vec<Vec<usize>>,
+    graph: Graph,
+    #[cfg(target_os = "macos")]
+    plan: Option<crate::graph::metal::PreparedPlan>,
+}
+
 /// An executable graph program with state persistence.
 pub struct GraphProgram {
     pub segment: CompiledSegment,
@@ -79,13 +91,11 @@ pub struct GraphProgram {
     /// [`Self::stream_next`]'s argmax graph and plan, with the `valid` they were built for.
     #[cfg(target_os = "macos")]
     argmax: Option<(usize, Graph, crate::graph::metal::PreparedPlan)>,
-    /// [`Self::run_reshaped`]'s plans, keyed by the graph's node count and input shapes.
-    #[cfg(target_os = "macos")]
-    reshaped: Vec<(
-        (usize, usize),
-        Vec<Vec<usize>>,
-        crate::graph::metal::PreparedPlan,
-    )>,
+    /// [`Self::run_reshaped`]'s instances (Metal: with their plans), least recently used first.
+    reshaped_graphs: Vec<ReshapedInstance>,
+    /// The one-element f32 weights: the constants the canonical reductions of a reshaped
+    /// instance test.
+    scalars: Weights,
 }
 
 /// `graph` with output 0 (one f32 row) replaced by the `[.., 1]` u32 index of the first largest of
@@ -164,9 +174,10 @@ impl GraphProgram {
 
     /// [`Self::compile`] for a network that also runs other instance shapes through
     /// [`Self::run_reshaped`]: weights the fusion passes fold into fused tensors (q/k/v, gate/up
-    /// concatenations) stay bound beside them, so unfused instances still find them.
+    /// concatenations) stay bound beside them, so instances whose fusions are rejected still find
+    /// them.
     // ponytail: folded originals stay resident next to their fused copy (only unpacked f32/f16
-    // tensors fold); fuse reshaped instances the same way if that memory matters.
+    // tensors fold) for instances that fuse differently; drop them if every instance fuses alike.
     pub fn compile_reshapable(
         graph: Graph,
         weights: Weights,
@@ -184,9 +195,16 @@ impl GraphProgram {
         let _compiling = CompileGuard::enter();
         #[cfg(test)]
         crate::graph::shape::note(&graph);
-        crate::graph::passes::prefuse(&mut graph, &weights);
+        crate::graph::passes::prefuse(&mut graph);
+        let mut scalars = Weights::new();
+        for (name, t) in weights.iter() {
+            if matches!(t, Tensor::F32(v) if v.len() == 1) {
+                scalars.insert(name, t.clone());
+            }
+        }
         let unfused = keep_folded.then(|| weights.clone());
-        crate::graph::passes::fuse(&mut graph, Some(&mut weights))?;
+        crate::graph::passes::fuse(&mut graph, FuseWeights::Materialize(&mut weights))?;
+        crate::graph::passes::canonical::run(&mut graph, &scalars);
         let dump: Option<usize> = std::env::var("GIBBS_PLAN_DUMP_CPU")
             .ok()
             .map(|v| v.parse().unwrap_or(1));
@@ -263,8 +281,8 @@ impl GraphProgram {
             graph_outputs,
             #[cfg(target_os = "macos")]
             argmax: None,
-            #[cfg(target_os = "macos")]
-            reshaped: Vec::new(),
+            reshaped_graphs: Vec::new(),
+            scalars,
         };
         if mode != PlacementMode::Pin(Device::Cpu) {
             COMPILED_CPU_NODES
@@ -360,9 +378,10 @@ impl GraphProgram {
     }
 
     /// Runs `graph` with the program's weights inside the program's state: another instance shape of
-    /// the compiled network (same weight and state names), e.g. a batched prefill pass. On Metal, plans
-    /// are cached by the graph's node count and input shapes, which identify such a graph (prefill
-    /// chunks repeat); on the CPU the graph runs directly.
+    /// the compiled network (same weight and state names), e.g. a batched prefill pass. Instances
+    /// are cached by the graph's node and output counts and input shapes, which identify such a
+    /// graph (prefill chunks repeat): on a miss the graph is canonicalized and fused onto the fused
+    /// weights the program binds ([`FuseWeights::ReuseOnly`]), and Metal plans it.
     pub fn run_reshaped(
         &mut self,
         graph: &Graph,
@@ -370,6 +389,45 @@ impl GraphProgram {
     ) -> Result<Vec<Tensor>, String> {
         #[cfg(test)]
         crate::graph::shape::note(graph);
+        let shapes: Vec<Vec<usize>> = graph
+            .inputs
+            .iter()
+            .map(|&v| graph.value(v).shape.clone())
+            .collect();
+        let key = (graph.nodes.len(), graph.outputs.len());
+        let hit = self
+            .reshaped_graphs
+            .iter()
+            .position(|r| r.key == key && r.shapes == shapes);
+        // Least recently used first: a varying tail chunk must not evict the full chunk's instance.
+        let entry = match hit {
+            Some(i) => self.reshaped_graphs.remove(i),
+            None => {
+                // ponytail: 4 shapes (full chunk, tails, image blocks); more if callers vary
+                // their row counts more.
+                if self.reshaped_graphs.len() == 4 {
+                    self.reshaped_graphs.remove(0);
+                }
+                let mut g = graph.clone();
+                let program = self.segment.graph();
+                crate::graph::passes::prefuse(&mut g);
+                crate::graph::passes::fuse(&mut g, FuseWeights::ReuseOnly(program))?;
+                crate::graph::passes::canonical::run(&mut g, &self.scalars);
+                ReshapedInstance {
+                    key,
+                    shapes,
+                    #[cfg(target_os = "macos")]
+                    plan: match &self.segment {
+                        CompiledSegment::Metal { session, .. } => Some(session.prepare_plan(&g)?),
+                        _ => None,
+                    },
+                    graph: g,
+                }
+            }
+        };
+        self.reshaped_graphs.push(entry);
+        let r = &self.reshaped_graphs[self.reshaped_graphs.len() - 1];
+        let graph = &r.graph;
         match &self.segment {
             CompiledSegment::Cpu { weights, .. } => {
                 cpu::run(graph, weights, &mut self.state, inputs)
@@ -385,31 +443,7 @@ impl GraphProgram {
             }
             #[cfg(target_os = "macos")]
             CompiledSegment::Metal { session, .. } => {
-                let shapes: Vec<Vec<usize>> = graph
-                    .inputs
-                    .iter()
-                    .map(|&v| graph.value(v).shape.clone())
-                    .collect();
-                // Node and output counts: a tapped instance adds outputs, not nodes.
-                let n = (graph.nodes.len(), graph.outputs.len());
-                let hit = self
-                    .reshaped
-                    .iter()
-                    .position(|(c, s, _)| *c == n && *s == shapes);
-                // Least recently used first: a varying tail chunk must not evict the full chunk's plan.
-                let entry = match hit {
-                    Some(i) => self.reshaped.remove(i),
-                    None => {
-                        // ponytail: 4 shapes (full chunk, tails, image blocks); more if callers vary
-                        // their row counts more.
-                        if self.reshaped.len() == 4 {
-                            self.reshaped.remove(0);
-                        }
-                        (n, shapes, session.prepare_plan(graph)?)
-                    }
-                };
-                self.reshaped.push(entry);
-                let plan = &self.reshaped[self.reshaped.len() - 1].2;
+                let plan = r.plan.as_ref().expect("a Metal program plans its instances");
                 session.run_prepared(graph, plan, Some(&mut self.state), inputs)
             }
         }
@@ -763,7 +797,7 @@ mod tests {
         // Callers rebuild the graph per chunk: the second call's graph is a fresh, equal one.
         let a = prog.run_reshaped(&rows(2), x(2)).unwrap();
         let b = prog.run_reshaped(&rows(2), x(2)).unwrap();
-        assert_eq!(prog.reshaped.len(), 1);
+        assert_eq!(prog.reshaped_graphs.len(), 1);
         assert_eq!(a[0].as_f32().unwrap(), b[0].as_f32().unwrap());
         // 0.25 * i through two all-0.1 4x4 layers: every output of row r is 0.04 * (sum of its x).
         let want: Vec<f32> = (0..2)
@@ -773,7 +807,7 @@ mod tests {
             assert!((got - want).abs() < 1e-4, "{got} vs {want}");
         }
         prog.run_reshaped(&rows(3), x(3)).unwrap();
-        assert_eq!(prog.reshaped.len(), 2);
+        assert_eq!(prog.reshaped_graphs.len(), 2);
     }
 
     /// One CPU program runs its graph at two instance shapes (1 row, then 3 rows), sharing its weights
