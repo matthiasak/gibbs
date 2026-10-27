@@ -6,6 +6,13 @@
 //! argument is a device pointer plus an element offset. Shapes and strides a kernel needs beyond
 //! scalars live in one per-plan `meta` buffer, and positions are read from device buffers, so a
 //! plan's launches are identical from run to run (CUDA/HIP replay them from a captured graph).
+//!
+//! Paged KV ([`crate::kv`]): a program's [`KvPool`](crate::kv::KvPool) keeps page ids, refcounts
+//! and the budget; [`DevPages`] holds each paged state's pages in one device buffer (page `pg`
+//! at rows `pg * 64..`), grown by copy when the pool adds a slab, on every dialect (OpenCL 1.2
+//! has no pointers in buffers, and this executor never has work in flight across runs). Each run
+//! reserves its rows through the state's `KvView` from the host-known positions and uploads the
+//! page tables; a grown buffer changes the replay signature, so CUDA/HIP re-capture.
 
 use super::api::{Arg, Buf, GpuApi, Kernel, Module, Replay};
 use super::Encoding;
@@ -166,8 +173,9 @@ enum Loc {
 }
 
 /// A kernel parameter: a value (device pointer + element offset), a weight buffer, a slice of
-/// the plan's meta buffer or arena scratch (pointer + offset), a scalar, or the row capacity of a
-/// state at the run's allocation (`StateRows(slot, row width)`, a u32).
+/// the plan's meta buffer or arena scratch (pointer + offset), a scalar, the row capacity of a
+/// state at the run's allocation (`StateRows(slot, row width)`, a u32), or a KV state's page
+/// table (`Kv(slot)`: pointer + offset + paged flag; a contiguous or absent state is flag 0).
 #[derive(Clone, Copy, Debug)]
 enum P {
     Val(ValueId),
@@ -178,6 +186,7 @@ enum P {
     F32(f32),
     U64(u64),
     StateRows(usize, u32),
+    Kv(Option<usize>),
 }
 
 struct Step {
@@ -196,11 +205,13 @@ struct StateSlot {
 }
 
 /// Rows `pos + m` a KV state must hold, `pos` being element 0 of graph input `pos_input`
-/// (unknown when the positions are computed on the device: the state is then allocated in full).
+/// (unknown when the positions are computed on the device: the state is then allocated in full),
+/// and whether the run writes them.
 struct Need {
     state: usize,
     pos_input: Option<usize>,
     m: usize,
+    write: bool,
 }
 
 struct Plan {
@@ -227,6 +238,83 @@ pub struct PortableSession {
     arena: Option<DevBuf>,
     main: Option<Plan>,
     reshaped: Vec<((usize, usize), Vec<Vec<usize>>, Plan)>,
+    /// Page tables of the running state's paged KV states ([`Self::reserve_pages`]).
+    kv_tab: Option<DevBuf>,
+}
+
+/// A paged KV state of one run: its pages' buffer and row capacity (as elements), and its page
+/// table's offset in the session's table buffer.
+#[derive(Clone, Copy)]
+struct PagedSlot {
+    buf: (Buf, usize),
+    tab: u32,
+}
+
+/// The pages of a device [`KvPool`](crate::kv::KvPool): `[class][name]` one buffer holding every
+/// page of the class (page `pg` at rows `pg * PAGE_TOKENS..`).
+struct DevPages {
+    api: Arc<dyn GpuApi>,
+    bufs: Mutex<Vec<Vec<DevState>>>,
+}
+
+impl crate::kv::DevicePages for DevPages {
+    fn grow(&self, class: usize, cls: &crate::kv::PageClass, pages: usize) -> Result<(), String> {
+        let mut bufs = self.bufs.lock().map_err(|_| "KV page lock poisoned")?;
+        if bufs.len() <= class {
+            bufs.resize_with(class + 1, Vec::new);
+        }
+        let names = &mut bufs[class];
+        for (i, n) in cls.names.iter().enumerate() {
+            let elems = pages * crate::kv::PAGE_TOKENS * n.row_width;
+            // ponytail: growth copies through the host; once per 256 pages.
+            let grown = match names.get(i) {
+                Some(d) => d.copy_grown(elems)?,
+                None => DevState::zeroed(&self.api, elems)?,
+            };
+            match names.get_mut(i) {
+                Some(d) => *d = grown,
+                None => names.push(grown),
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_page(
+        &self,
+        class: usize,
+        cls: &crate::kv::PageClass,
+        src: u32,
+        dst: u32,
+    ) -> Result<(), String> {
+        let bufs = self.bufs.lock().map_err(|_| "KV page lock poisoned")?;
+        for (d, n) in bufs[class].iter().zip(&cls.names) {
+            let page = crate::kv::PAGE_TOKENS * n.row_width * 4;
+            let mut tmp = vec![0u8; page];
+            self.api
+                .download(d.mem.buf, src as usize * page, &mut tmp)?;
+            self.api.upload(d.mem.buf, dst as usize * page, &tmp)?;
+        }
+        Ok(())
+    }
+
+    fn read_row(
+        &self,
+        class: usize,
+        name: usize,
+        pg: u32,
+        row: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        let bufs = self.bufs.lock().map_err(|_| "KV page lock poisoned")?;
+        let off = (pg as usize * crate::kv::PAGE_TOKENS + row) * out.len() * 4;
+        self.api
+            .download(bufs[class][name].mem.buf, off, as_bytes_mut(out))
+    }
+
+    fn buffer(&self, class: usize, name: usize) -> Option<u64> {
+        let bufs = self.bufs.lock().ok()?;
+        bufs.get(class)?.get(name).map(|d| d.mem.buf.0)
+    }
 }
 
 fn numel(s: &[usize]) -> usize {
@@ -273,9 +361,91 @@ impl PortableSession {
             arena: None,
             main: None,
             reshaped: Vec::new(),
+            kv_tab: None,
         };
         s.main = Some(s.plan(graph)?);
         Ok(s)
+    }
+
+    /// A KV pool whose pages live on this session's device.
+    pub fn new_kv_pool(&self, paged: &[crate::graph::PagedState]) -> Arc<crate::kv::KvPool> {
+        let pages = DevPages {
+            api: self.api.clone(),
+            bufs: Mutex::new(Vec::new()),
+        };
+        crate::kv::KvPool::device(paged, Arc::new(pages))
+    }
+
+    /// Reserves the rows this run writes in `st`'s paged KV states and uploads their page
+    /// tables (per class `[ring pages, evicted rows, page ids...]`, ring classes first so the
+    /// full class's growing table never moves the others).
+    fn reserve_pages(
+        &mut self,
+        plan: &Plan,
+        st: &mut StateStore,
+        first_u32: &[Option<u32>],
+    ) -> Result<Vec<Option<PagedSlot>>, String> {
+        let mut slots = vec![None; plan.states.len()];
+        let Some(kv) = st.kv.as_mut() else {
+            return Ok(slots);
+        };
+        let pool = kv.pool().clone();
+        let located: Vec<_> = plan.states.iter().map(|s| pool.locate(&s.name)).collect();
+        if located.iter().all(Option::is_none) {
+            return Ok(slots);
+        }
+        let (mut need, mut lo, mut hi) = (0, usize::MAX, 0);
+        for n in plan.needs.iter().filter(|n| located[n.state].is_some()) {
+            let p = n.pos_input.and_then(|i| first_u32[i]).ok_or_else(|| {
+                let name = &plan.states[n.state].name;
+                format!("paged KV state '{name}' needs host-known positions")
+            })? as usize;
+            need = need.max(p + n.m);
+            lo = lo.min(p);
+            hi = hi.max(if n.write { p + n.m } else { p });
+        }
+        kv.reserve(need, lo.min(hi)..hi)?;
+        let mut classes: Vec<usize> = located.iter().flatten().map(|&(c, _)| c).collect();
+        classes.sort_by_key(|&c| (pool.classes[c].window.is_none(), c));
+        classes.dedup();
+        let (mut words, mut offs) = (Vec::new(), vec![0u32; pool.classes.len()]);
+        for &c in &classes {
+            offs[c] = words.len() as u32;
+            let full = pool.classes[c].window.is_none();
+            words.push(kv.ring(c) as u32);
+            words.push(if full { kv.evicted as u32 } else { 0 });
+            words.extend_from_slice(&kv.tables[c]);
+        }
+        let bytes = words.len() * 4;
+        if self.kv_tab.as_ref().is_none_or(|t| t.bytes < bytes) {
+            self.kv_tab = None;
+            self.kv_tab = Some(DevBuf::new(&self.api, bytes.next_power_of_two().max(4096))?);
+        }
+        self.api.upload(
+            self.kv_tab.as_ref().expect("table buffer").buf,
+            0,
+            as_bytes(&words),
+        )?;
+        for (i, l) in located.iter().enumerate() {
+            let Some((c, ni)) = *l else { continue };
+            let w = pool.classes[c].names[ni].row_width;
+            let buf = pool.device_buffer(c, ni).ok_or_else(|| {
+                format!(
+                    "KV pages of state '{}' are not on this device",
+                    plan.states[i].name
+                )
+            })?;
+            // Ring rows wrap, so a ring has no row cap.
+            let rows = match kv.ring(c) {
+                0 => kv.tables[c].len() * crate::kv::PAGE_TOKENS,
+                _ => u32::MAX as usize,
+            };
+            slots[i] = Some(PagedSlot {
+                buf: (Buf(buf), rows * w),
+                tab: offs[c],
+            });
+        }
+        Ok(slots)
     }
 
     /// Runs the compiled graph.
@@ -617,11 +787,17 @@ impl PortableSession {
                 _ => None,
             };
         }
+        let paged = self.reserve_pages(plan, st, &first_u32)?;
         let mut sbufs = Vec::with_capacity(plan.states.len());
-        for (slot, r) in plan.states.iter().zip(&rows) {
+        for (i, (slot, r)) in plan.states.iter().zip(&rows).enumerate() {
+            if let Some(p) = paged[i] {
+                sbufs.push(p.buf);
+                continue;
+            }
             let r = if slot.row.is_some() { *r } else { None };
             sbufs.push(self.state_buf(st, slot, r)?);
         }
+        let tab = self.kv_tab.as_ref().map_or(plan.meta.buf, |t| t.buf);
         let resolve = |v: ValueId| -> (Buf, u32) {
             match plan.loc[v.0 as usize] {
                 Loc::Arena(o) => (arena, o),
@@ -630,8 +806,9 @@ impl PortableSession {
                 Loc::None => unreachable!("every read value is bound"),
             }
         };
-        let mut sig: Vec<u64> = vec![arena.0, plan.meta.buf.0];
+        let mut sig: Vec<u64> = vec![arena.0, plan.meta.buf.0, tab.0];
         sig.extend(sbufs.iter().map(|b| b.0 .0));
+        sig.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| p.tab as u64)));
         let replayed = match &plan.replay {
             Some((s, r)) if *s == sig => {
                 self.api.replay(*r)?;
@@ -665,6 +842,18 @@ impl PortableSession {
                         P::StateRows(i, w) => {
                             args.push(Arg::U32((sbufs[i].1 / w.max(1) as usize) as u32))
                         }
+                        P::Kv(s) => match s.and_then(|s| paged[s]) {
+                            Some(p) => {
+                                args.push(Arg::Buf(tab));
+                                args.push(Arg::U32(p.tab));
+                                args.push(Arg::U32(1));
+                            }
+                            None => {
+                                args.push(Arg::Buf(plan.meta.buf));
+                                args.push(Arg::U32(0));
+                                args.push(Arg::U32(0));
+                            }
+                        },
                     }
                 }
                 self.api.launch(step.kernel, step.grid, step.block, &args)?;
@@ -1010,9 +1199,11 @@ impl Builder<'_> {
                     match (pa[d], pb[d]) {
                         (x, y) if x == y || y == 1 => ob.push(x),
                         (1, y) => ob.push(y),
-                        _ => return Err(format!(
+                        _ => {
+                            return Err(format!(
                             "node '{name}': MatMul batch dims {sa:?} and {sb:?} do not broadcast"
-                        )),
+                        ))
+                        }
                     }
                 }
                 let off = |p: &[usize], mut flat: usize, sz: usize| {
@@ -1528,7 +1719,7 @@ impl Builder<'_> {
                     Some(slot) => P::StateRows(slot, w),
                     None => P::U32((n_of(k) / w.max(1) as usize) as u32),
                 };
-                let (ks, vs, pos, kcap, vcap) = if cached {
+                let (ks, vs, pos, kcap, vcap, sk, sv) = if cached {
                     let (ks, vs) = (self.bind(ins[3])?, self.bind(ins[4])?);
                     let pos = self.bind(ins[5])?;
                     let (sk, sv) = (self.state_slot_opt(ins[3])?, self.state_slot_opt(ins[4])?);
@@ -1538,12 +1729,14 @@ impl Builder<'_> {
                             state: s,
                             pos_input,
                             m: nq,
+                            write: *write,
                         });
                     }
-                    (ks, vs, pos, rows_of(sk, 3, kw), rows_of(sv, 4, vw))
+                    (ks, vs, pos, rows_of(sk, 3, kw), rows_of(sv, 4, vw), sk, sv)
                 } else {
                     // Plain k/v rows starting at position 0.
-                    (kn, vn, kn, rows_of(None, 1, kw), rows_of(None, 2, vw))
+                    let (kc, vc) = (rows_of(None, 1, kw), rows_of(None, 2, vw));
+                    (kn, vn, kn, kc, vc, None, None)
                 };
                 if cached && *write {
                     let (nk_new, nv_new) = (n_of(1), n_of(2));
@@ -1551,13 +1744,29 @@ impl Builder<'_> {
                         "kv_append",
                         [groups(nk_new, 256), 1, 1],
                         W,
-                        vec![kn, ks, pos, P::U32(nk_new as u32), P::U32(kw), kcap],
+                        vec![
+                            kn,
+                            ks,
+                            pos,
+                            P::Kv(sk),
+                            P::U32(nk_new as u32),
+                            P::U32(kw),
+                            kcap,
+                        ],
                     )?;
                     self.launch(
                         "kv_append",
                         [groups(nv_new, 256), 1, 1],
                         W,
-                        vec![vn, vs, pos, P::U32(nv_new as u32), P::U32(vw), vcap],
+                        vec![
+                            vn,
+                            vs,
+                            pos,
+                            P::Kv(sv),
+                            P::U32(nv_new as u32),
+                            P::U32(vw),
+                            vcap,
+                        ],
                     )?;
                 }
                 let vis = match ins.get(6) {
@@ -1582,6 +1791,7 @@ impl Builder<'_> {
                     vs,
                     pos,
                     vis.0,
+                    P::Kv(sk),
                     y,
                     meta,
                     P::F32(*scale),
@@ -2118,6 +2328,7 @@ impl Builder<'_> {
             state: slot,
             pos_input: None,
             m: 0,
+            write: true,
         });
     }
 

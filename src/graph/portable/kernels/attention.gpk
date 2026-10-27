@@ -28,13 +28,23 @@ DEVFN float att_max(LPTR float* red, float v) {
     return red[0];
 }
 
+// Element offset of stored KV row t of width `stride`: contiguous (`paged` 0) or through the page
+// table at tab (crate::kv's kv_row): tab = [ring pages (0: full attention), evicted rows, page
+// ids...], page `pg` holding rows of all pages of one paged state in one buffer.
+DEVFN u64 kv_off(GLOBAL const u32* tab, u32 paged, u32 t, u32 stride) {
+    if (!paged) return (u64)t * stride;
+    u32 lp = t >> 6, ring = tab[0];
+    if (ring) lp %= ring;
+    return ((u64)tab[2u + lp] * 64u + (t & 63u)) * stride;
+}
+
 // Online-softmax attention of query vector qs over keys [lo, hi): row `key` of K is at
-// k + key * kstride, of V at v + key * vstride. score(key) = cap(q.k * scale) + bias(key) where
-// `bias_row` (or NULL-equivalent bias_mode 0) adds bias_row[key]. Writes y[0..vd).
+// k + kv_off(key, kstride), of V at v + kv_off(key, vstride). score(key) = cap(q.k * scale) +
+// bias(key) where `bias_row` (or NULL-equivalent bias_mode 0) adds bias_row[key]. Writes y[0..vd).
 DEVFN void att_core(LPTR float* qs, LPTR float* ps, LPTR float* red, GLOBAL const float* k,
-                    u32 kstride, GLOBAL const float* v, u32 vstride, u32 d, u32 vd, u32 lo,
-                    u32 hi, float scale, float cap, GLOBAL const float* bias_row, u32 has_bias,
-                    GLOBAL float* y) {
+                    u32 kstride, GLOBAL const float* v, u32 vstride, GLOBAL const u32* tab,
+                    u32 paged, u32 d, u32 vd, u32 lo, u32 hi, float scale, float cap,
+                    GLOBAL const float* bias_row, u32 has_bias, GLOBAL float* y) {
     u32 t = LID(0);
     float m = GPK_NEG_INF, l = 0.0f;
     float acc[4];
@@ -43,7 +53,7 @@ DEVFN void att_core(LPTR float* qs, LPTR float* ps, LPTR float* red, GLOBAL cons
         u32 key = c0 + t;
         float s = GPK_NEG_INF;
         if (key < hi) {
-            GLOBAL const float* kr = k + (u64)key * kstride;
+            GLOBAL const float* kr = k + kv_off(tab, paged, key, kstride);
             float dot = 0.0f;
             for (u32 i = 0; i < d; i++) dot += qs[i] * kr[i];
             s = dot * scale;
@@ -62,7 +72,7 @@ DEVFN void att_core(LPTR float* qs, LPTR float* ps, LPTR float* red, GLOBAL cons
             u32 j = t + i * ATT_T;
             if (j < vd) {
                 float a = acc[i] * alpha;
-                for (u32 q = 0; q < n; q++) a += ps[q] * v[(u64)(c0 + q) * vstride + j];
+                for (u32 q = 0; q < n; q++) a += ps[q] * v[kv_off(tab, paged, c0 + q, vstride) + j];
                 acc[i] = a;
             }
         }
@@ -102,42 +112,47 @@ KERNEL attention(GLOBAL const float* q, u32 qo, GLOBAL const float* k, u32 ko, G
     GLOBAL const float* brow = bias + bo;
     if (bias_mode == 2u) brow += qi * nk;
     if (bias_mode == 3u) brow += (h * nq + qi) * nk;
-    att_core(qs, ps, red, k + ko + kv * d, kvh * d, v + vo + kv * d, kvh * d, d, d, lo, hi, scale,
-             cap, brow, bias_mode != 0u, y + yo + qi * heads * d + h * d);
+    att_core(qs, ps, red, k + ko + kv * d, kvh * d, v + vo + kv * d, kvh * d, meta, 0u, d, d, lo,
+             hi, scale, cap, brow, bias_mode != 0u, y + yo + qi * heads * d + h * d);
 }
 
-// Appends m rows of `width` (n = m * width values) at row pos[0] of a KV state of `cap` rows.
+// Appends m rows of `width` (n = m * width values) at stored row pos[0] - evicted of a KV state
+// of `cap` rows (contiguous, or paged through tab, see kv_off).
 KERNEL kv_append(GLOBAL const float* x, u32 xo, GLOBAL float* st, u32 so, GLOBAL const u32* pos,
-                 u32 po, u32 n, u32 width, u32 cap) {
+                 u32 po, GLOBAL const u32* tab, u32 to, u32 paged, u32 n, u32 width, u32 cap) {
     u32 i = GID(0);
     if (i >= n) return;
-    u32 p = pos[po];
-    if (p + i / width < cap) st[so + p * width + i] = x[xo + i];
+    GLOBAL const u32* tb = tab + to;
+    u32 r = pos[po] - (paged ? tb[1] : 0u) + i / width;
+    if (r < cap) st[so + kv_off(tb, paged, r, width) + i % width] = x[xo + i];
 }
 
-// Op::CachedAttention over KV rows of `kcap` / `vcap` capacity. meta = [nq, heads, kv_heads,
-// head_dim, v_head_dim, causal, has_window, window, has_visible_end, cached]. Row i of the
-// queries is at position pos[0] + i (0 when not cached); it sees keys < visible_end[i] (or
-// position + 1) when causal, every stored key otherwise, and with a window only keys after
-// position - window.
+// Op::CachedAttention over KV rows of `kcap` / `vcap` capacity (contiguous, or paged through tab,
+// see kv_off). meta = [nq, heads, kv_heads, head_dim, v_head_dim, causal, has_window, window,
+// has_visible_end, cached]. Keys are stored rows: row i of the queries is stored row
+// base + i, base = pos[0] - evicted (0 when not cached); it sees keys < visible_end[i] - evicted
+// (or base + i + 1) when causal, every stored key otherwise, and with a window only keys after
+// base + i - window.
 KERNEL cached_attention(GLOBAL const float* q, u32 qo, GLOBAL const float* k, u32 ko,
                         GLOBAL const float* v, u32 vo, GLOBAL const u32* pos, u32 po,
-                        GLOBAL const u32* vis, u32 vio, GLOBAL float* y, u32 yo,
-                        GLOBAL const u32* meta, u32 mo, float scale, float cap, u32 kcap,
-                        u32 vcap) {
+                        GLOBAL const u32* vis, u32 vio, GLOBAL const u32* tab, u32 to, u32 paged,
+                        GLOBAL float* y, u32 yo, GLOBAL const u32* meta, u32 mo, float scale,
+                        float cap, u32 kcap, u32 vcap) {
     LOCAL float qs[512];
     LOCAL float ps[ATT_T];
     LOCAL float red[ATT_T];
     GLOBAL const u32* m = meta + mo;
+    GLOBAL const u32* tb = tab + to;
     u32 nq = m[0], heads = m[1], kvh = m[2], hd = m[3], vhd = m[4];
     u32 causal = m[5], has_w = m[6], w = m[7], has_vis = m[8], cached = m[9];
     u32 h = GRP(0), qi = GRP(1), t = LID(0);
     u32 kv = h / (heads / kvh);
-    u32 p0 = cached ? pos[po] : 0u;
+    u32 shift = paged ? tb[1] : 0u;
+    u32 p0 = cached ? pos[po] - shift : 0u;
     u32 rows = kcap < vcap ? kcap : vcap;
     u32 nk = p0 + nq;
     if (has_vis)
-        for (u32 i = 0; i < nq; i++) nk = vis[vio + i] > nk ? vis[vio + i] : nk;
+        for (u32 i = 0; i < nq; i++) nk = vis[vio + i] - shift > nk ? vis[vio + i] - shift : nk;
     nk = nk < rows ? nk : rows;
     GLOBAL const float* qr = q + qo + qi * heads * hd + h * hd;
     for (u32 i = t; i < hd; i += ATT_T) qs[i] = qr[i];
@@ -145,10 +160,10 @@ KERNEL cached_attention(GLOBAL const float* q, u32 qo, GLOBAL const float* k, u3
     u32 cur = p0 + qi;
     u32 hi = nk;
     if (causal) {
-        u32 e = has_vis ? vis[vio + qi] : cur + 1u;
+        u32 e = has_vis ? vis[vio + qi] - shift : cur + 1u;
         hi = e < nk ? e : nk;
     }
     u32 lo = (has_w && cur + 1u > w) ? cur + 1u - w : 0u;
-    att_core(qs, ps, red, k + ko + kv * hd, kvh * hd, v + vo + kv * vhd, kvh * vhd, hd, vhd, lo,
-             hi, scale, cap, k, 0u, y + yo + qi * heads * vhd + h * vhd);
+    att_core(qs, ps, red, k + ko + kv * hd, kvh * hd, v + vo + kv * vhd, kvh * vhd, tb, paged, hd,
+             vhd, lo, hi, scale, cap, k, 0u, y + yo + qi * heads * vhd + h * vhd);
 }

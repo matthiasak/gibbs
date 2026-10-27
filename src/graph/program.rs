@@ -212,7 +212,6 @@ impl GraphProgram {
         let graph_inputs = graph.inputs.clone();
         let graph_outputs = graph.outputs.clone();
         let paged = crate::graph::paged_states(&graph);
-        #[allow(unused_mut)]
         let mut kv_pool = None;
         let segment = match primary_device {
             #[cfg(target_os = "macos")]
@@ -236,6 +235,9 @@ impl GraphProgram {
                     .ok_or_else(|| format!("--backend {d}: not available on this host"))?;
                 let session =
                     crate::graph::portable::PortableSession::compile(api, &graph, weights)?;
+                if !paged.is_empty() {
+                    kv_pool = Some(session.new_kv_pool(&paged));
+                }
                 CompiledSegment::Portable {
                     device: d,
                     graph,
@@ -1116,13 +1118,14 @@ mod tests {
         out
     }
 
-    /// A CachedAttention layer instance of `m` query rows: q/k/v inputs, a 64-row KV state pair,
-    /// positions `start..start + m`, optional per-row `visible_end`.
+    /// A CachedAttention layer instance of `m` query rows: q/k/v inputs, a `rows`-row KV state
+    /// pair, positions `start..start + m`, optional per-row `visible_end`.
     fn cached_attn(
         op: &Op,
         m: usize,
         start: u32,
         vis: Option<u32>,
+        rows: usize,
         seed: u64,
     ) -> (Graph, Vec<Tensor>) {
         let Op::CachedAttention {
@@ -1140,9 +1143,9 @@ mod tests {
         let k = f.x("k", &[m, kv_heads * head_dim]);
         let v = f.x("v", &[m, kv_heads * v_head_dim]);
         let ks =
-            f.g.state("kc", vec![64, kv_heads * head_dim], DType::F32, false);
+            f.g.state("kc", vec![rows, kv_heads * head_dim], DType::F32, false);
         let vs =
-            f.g.state("vc", vec![64, kv_heads * v_head_dim], DType::F32, false);
+            f.g.state("vc", vec![rows, kv_heads * v_head_dim], DType::F32, false);
         let pos: Vec<u32> = (start..start + m as u32).collect();
         let p = f.u("pos", &pos);
         let mut ins = vec![q, k, v, ks, vs, p];
@@ -1430,11 +1433,14 @@ mod tests {
         );
         outs.push(o);
         cases.push(f.case("Binary", &outs));
-        // CachedAttention prefill then decode on one state, several configurations.
-        for (label, h, kvh, window, cap, vis) in [
-            ("gqa", 4, 2, None, None, None),
-            ("window cap", 2, 1, Some(3), Some(20.0), None),
-            ("visible end", 2, 2, None, None, Some(1)),
+        // CachedAttention prefill then decode on one state, several configurations; the last
+        // two span several KV pages (a windowed ring among them).
+        for (label, h, kvh, window, cap, vis, m, rows) in [
+            ("gqa", 4, 2, None, None, None, 5, 64),
+            ("window cap", 2, 1, Some(3), Some(20.0), None, 5, 64),
+            ("visible end", 2, 2, None, None, Some(1), 5, 64),
+            ("pages", 4, 2, None, None, None, 130, 4096),
+            ("pages window", 4, 2, Some(100), None, None, 130, 4096),
         ] {
             let op = Op::CachedAttention {
                 heads: h,
@@ -1447,10 +1453,10 @@ mod tests {
                 soft_cap: cap,
                 write: true,
             };
-            let (g, ins) = cached_attn(&op, 5, 0, vis, 40);
+            let (g, ins) = cached_attn(&op, m, 0, vis, rows, 40);
             let mut runs = vec![(None, ins)];
-            for (i, pos) in [5u32, 6].into_iter().enumerate() {
-                let (gd, ins) = cached_attn(&op, 1, pos, vis.map(|_| 0), 41 + i as u64);
+            for (i, pos) in [m as u32, m as u32 + 1].into_iter().enumerate() {
+                let (gd, ins) = cached_attn(&op, 1, pos, vis.map(|_| 0), rows, 41 + i as u64);
                 runs.push((Some(gd), ins));
             }
             cases.push(Case {
@@ -1897,6 +1903,12 @@ mod tests {
                 )
                 .unwrap_or_else(|e| panic!("{dev} {}: {e}", case.name));
                 assert_eq!(gpu.cpu_node_count(), 0);
+                // Pages released in order are reused last-first: a view allocating after this
+                // spacer released its pages gets descending page ids.
+                if let Some(pool) = &gpu.kv_pool {
+                    let mut spacer = crate::kv::KvView::new(pool.clone());
+                    spacer.reserve(512, 0..512).unwrap();
+                }
                 let mut err = 0f64;
                 for (step, ((g, ins), want)) in case.runs.iter().zip(&wants).enumerate() {
                     let got = match g {
@@ -1915,6 +1927,10 @@ mod tests {
                         }
                         err = err.max(e);
                     }
+                }
+                if gpu.kv_pool.is_some() {
+                    let kv = gpu.state.kv.as_ref().expect("paged state attached");
+                    assert!(kv.tables.iter().any(|t| !t.is_empty()), "{}: no KV pages", case.name);
                 }
                 for n in &case.graph.nodes {
                     let e = worst.entry(n.op.name().to_string()).or_default();
