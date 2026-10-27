@@ -1,7 +1,7 @@
 pub mod spec;
 
 use crate::hardware::Device;
-use crate::kv::{BlockId, PagedKVPool, TOKENS_PER_BLOCK};
+use crate::kv::{Match, RadixPrefixCache};
 use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::tokenizer::Tokenizer;
 use crate::runtime::lm::sample_logits;
@@ -10,7 +10,7 @@ use crate::telemetry::{EngineTelemetry, GapSample};
 use parking_lot::{Condvar, Mutex, RwLock};
 use spec::{Drafter, KTuner, SpecSeq};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -212,26 +212,28 @@ impl ExecutableModel {
         Ok((g.text, g.decode.1, g.decode.0))
     }
 
-    /// A private scheduler for one-shot generation: its KV pool holds the model's whole context
-    /// (at least [`ONE_SHOT_POOL_BLOCKS`]).
+    /// A private scheduler for one-shot generation.
     pub(crate) fn one_shot_scheduler(&self) -> ContinuousBatchScheduler {
-        // ponytail: block ids are bookkeeping only; the 4M-token cap bounds that list.
-        let blocks = self
-            .context_len()
-            .unwrap_or(0)
-            .min(1 << 22)
-            .div_ceil(TOKENS_PER_BLOCK)
-            .max(ONE_SHOT_POOL_BLOCKS);
-        ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(blocks)), Some(self.clone()))
+        ContinuousBatchScheduler::new("", Some(self.clone()))
     }
 
     pub fn tokenizer(&self) -> Tokenizer {
         self.0.tokenizer().clone()
     }
 
-    /// Maximum positions the model's state holds.
+    /// Rows one sequence may store ([`NativeLm::context_len`]).
     pub fn context_len(&self) -> Option<usize> {
         Some(self.0.context_len().max(1))
+    }
+
+    /// Positions one sequence may reach ([`NativeLm::max_positions`]).
+    pub fn max_positions(&self) -> usize {
+        self.0.max_positions()
+    }
+
+    /// [`NativeLm::kv_evict`].
+    pub fn kv_evict(&self, state: &mut Option<SeqState>, target_rows: usize) -> Result<usize, String> {
+        self.0.kv_evict(state.as_mut().ok_or(NO_STATE)?, target_rows)
     }
 
     /// Expands `ids` for the model ([`NativeLm::prepare_ctx`], media allowed) and builds the
@@ -251,24 +253,27 @@ impl ExecutableModel {
         self.0.prompt_len(ids, media)
     }
 
-    pub fn export_kv_snapshot(
-        &self,
-        state: &Option<SeqState>,
-        token_len: usize,
-    ) -> Option<crate::kv::CachedKvSnapshot> {
-        self.0.export_kv_snapshot(state.as_ref()?, token_len)
+    /// [`NativeLm::kv_export`].
+    pub fn kv_export(&self, state: &Option<SeqState>, len: usize) -> Option<crate::kv::KvExport> {
+        self.0.kv_export(state.as_ref()?, len)
     }
 
-    pub fn restore_kv_prefix(
-        &self,
-        state: &mut Option<SeqState>,
-        snap: &crate::kv::CachedKvSnapshot,
-        prefix_len: usize,
-    ) -> bool {
-        let Some(st) = state.as_mut() else {
-            return false;
-        };
-        self.0.restore_kv_prefix(st, snap, prefix_len)
+    /// [`NativeLm::kv_restore`].
+    pub fn kv_restore(&self, state: &mut Option<SeqState>, m: &crate::kv::Match) -> Option<usize> {
+        self.0.kv_restore(state.as_mut()?, m)
+    }
+
+    /// [`NativeLm::kv_pool`].
+    pub fn kv_pool(&self) -> Option<Arc<crate::kv::KvPool>> {
+        self.0.kv_pool()
+    }
+
+    /// [`NativeLm::radix_key`].
+    pub fn radix_key(&self, state: &Option<SeqState>, ids: &[u32]) -> Vec<u32> {
+        match state {
+            Some(st) => self.0.radix_key(st, ids),
+            None => ids.to_vec(),
+        }
     }
 
     /// [`NativeLm::thinking_delimiters`].
@@ -352,8 +357,6 @@ pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 pub const DEFAULT_TOP_P: f32 = 0.9;
 /// Most prompt tokens one scheduler step prefills, across all sequences.
 pub const MAX_PREFILL_CHUNK: usize = 2048;
-/// KV blocks of the server's pool, and the least a one-shot generation's private pool gets.
-pub const ONE_SHOT_POOL_BLOCKS: usize = 16384;
 /// Prefill budget before the first prefill has been timed.
 const INITIAL_PREFILL_CHUNK: usize = 64;
 /// With nothing decoding, a step's prefill is sized to take about this long, so a request that
@@ -470,7 +473,23 @@ pub enum FinishReason {
 }
 
 /// Set once by the scheduler before the token stream closes; unset means `Stop`.
-pub type FinishSignal = Arc<std::sync::OnceLock<FinishReason>>;
+pub type FinishSignal = Arc<Finish>;
+
+/// How a sequence ended ([`FinishSignal`]), plus the prompt positions it resumed from the radix
+/// prefix cache.
+#[derive(Debug, Default)]
+pub struct Finish {
+    reason: std::sync::OnceLock<FinishReason>,
+    /// Prompt positions resumed from the radix prefix cache (set at admission).
+    pub cached_tokens: AtomicUsize,
+}
+
+impl std::ops::Deref for Finish {
+    type Target = std::sync::OnceLock<FinishReason>;
+    fn deref(&self) -> &Self::Target {
+        &self.reason
+    }
+}
 
 /// OpenAI `finish_reason` for a closed stream, or the engine error that aborted it.
 pub fn finish_outcome(signal: &FinishSignal) -> Result<&'static str, String> {
@@ -485,7 +504,10 @@ pub struct Sequence {
     pub id: u64,
     pub prompt_tokens: Vec<u32>,
     pub output_tokens: Vec<u32>,
-    pub allocated_blocks: Vec<BlockId>,
+    /// The radix prefix this sequence resumed from: its path stays locked until it finishes.
+    pub prefix: Option<Match>,
+    /// The prompt's radix key ([`ExecutableModel::radix_key`]), set at admission.
+    pub key: Vec<u32>,
     pub params: SamplingParams,
     pub state: SequenceState,
     pub submitted: Instant,
@@ -497,6 +519,9 @@ pub struct Sequence {
     pub finish: FinishSignal,
     /// Speculative decoding state; set when the sequence starts prefill with a drafter.
     pub spec: Option<SpecSeq>,
+    /// Positions Tier-4 page eviction dropped (stored rows = positions - evicted); an evicted
+    /// sequence is never exported to the radix cache.
+    pub evicted: usize,
 }
 
 impl Sequence {
@@ -505,7 +530,8 @@ impl Sequence {
             id,
             prompt_tokens,
             output_tokens: Vec::new(),
-            allocated_blocks: Vec::new(),
+            prefix: None,
+            key: Vec::new(),
             params: SamplingParams::default(),
             state: SequenceState::Waiting,
             submitted: Instant::now(),
@@ -515,6 +541,7 @@ impl Sequence {
             prefilled_tokens: 0,
             finish: FinishSignal::default(),
             spec: None,
+            evicted: 0,
         }
     }
 
@@ -597,7 +624,8 @@ pub struct SpecView {
 
 pub struct ContinuousBatchScheduler {
     model_id: RwLock<String>,
-    pub kv_pool: Arc<PagedKVPool>,
+    /// Cached prompt prefixes of the loaded model, sharing its KV pages.
+    pub radix: Arc<RadixPrefixCache>,
     model: RwLock<Option<ExecutableModel>>,
     tokenizer: RwLock<Arc<Tokenizer>>,
     pub telemetry: Arc<EngineTelemetry>,
@@ -611,6 +639,8 @@ pub struct ContinuousBatchScheduler {
     drafter: RwLock<Option<Arc<dyn Drafter>>>,
     k_tuner: Mutex<KTuner>,
     draft_knobs: Arc<LiveDraftKnobs>,
+    /// Tier-4 KV page eviction settings: compaction mode and target fraction of the context.
+    tier4: Mutex<(crate::compact::CompactionMode, f32)>,
     pub logprob_tx: Arc<RwLock<Option<UnboundedSender<TokenLogprobInfo>>>>,
     work_signal: (Mutex<bool>, Condvar),
 }
@@ -649,17 +679,12 @@ fn spec_enabled() -> bool {
 }
 
 impl ContinuousBatchScheduler {
-    pub fn new(
-        model_id: impl Into<String>,
-        kv_pool: Arc<PagedKVPool>,
-        model: Option<ExecutableModel>,
-    ) -> Self {
-        Self::with_telemetry(model_id, kv_pool, model, EngineTelemetry::new())
+    pub fn new(model_id: impl Into<String>, model: Option<ExecutableModel>) -> Self {
+        Self::with_telemetry(model_id, model, EngineTelemetry::new())
     }
 
     pub fn with_telemetry(
         model_id: impl Into<String>,
-        kv_pool: Arc<PagedKVPool>,
         model: Option<ExecutableModel>,
         telemetry: Arc<EngineTelemetry>,
     ) -> Self {
@@ -670,7 +695,8 @@ impl ContinuousBatchScheduler {
                 .unwrap_or_else(Tokenizer::default_bpe),
         );
         let has_model = model.is_some();
-        let mut init_knobs = crate::tui::settings::load_settings().draft;
+        let settings = crate::tui::settings::load_settings();
+        let mut init_knobs = settings.draft;
         if let Ok(env_spec) = std::env::var("GIBBS_SPEC") {
             if let Ok(mode) = env_spec.parse::<DraftMode>() {
                 init_knobs.mode = mode;
@@ -679,7 +705,7 @@ impl ContinuousBatchScheduler {
         let draft_knobs = Arc::new(LiveDraftKnobs::new(init_knobs));
         let s = Self {
             model_id: RwLock::new(model_id.into()),
-            kv_pool,
+            radix: Arc::new(RadixPrefixCache::new()),
             drafter: RwLock::new(resolve_drafter(model.as_ref(), &draft_knobs)),
             model: RwLock::new(model),
             tokenizer: RwLock::new(tokenizer),
@@ -692,6 +718,7 @@ impl ContinuousBatchScheduler {
             view: Mutex::new(SchedulerView::default()),
             k_tuner: Mutex::new(KTuner::default()),
             draft_knobs,
+            tier4: Mutex::new((settings.compact.mode, settings.compact.target_ratio)),
             logprob_tx: Arc::new(RwLock::new(None)),
             work_signal: (Mutex::new(false), Condvar::new()),
         };
@@ -823,7 +850,7 @@ impl ContinuousBatchScheduler {
         // Prefill and decode costs were measured on the old model.
         *self.prefill_tuner.lock() = PrefillTuner::default();
         *self.k_tuner.lock() = KTuner::default();
-        self.kv_pool.radix_cache.clear();
+        self.radix.clear();
         self.sync_spec_view();
         self.log_drafter();
     }
@@ -845,6 +872,11 @@ impl ContinuousBatchScheduler {
     /// Shared atomic handle to the live draft knobs.
     pub fn live_draft_knobs(&self) -> Arc<LiveDraftKnobs> {
         self.draft_knobs.clone()
+    }
+
+    /// Applies compaction settings to Tier-4 KV page eviction (mode and target ratio).
+    pub fn set_compaction(&self, cfg: &crate::compact::CompactionConfig) {
+        *self.tier4.lock() = (cfg.mode, cfg.target_ratio);
     }
 
     /// Updates [`DraftKnobs`] live and reconfigures the active drafter when the mode changes.
@@ -880,9 +912,6 @@ impl ContinuousBatchScheduler {
         let n = active.len() + waiting.len();
         for seq in active.drain(..).chain(waiting.drain(..)) {
             let _ = seq.finish.set(FinishReason::Error(reason.to_string()));
-            for &b in &seq.allocated_blocks {
-                self.kv_pool.release_block(b);
-            }
         }
         if n > 0 {
             self.telemetry
@@ -970,8 +999,9 @@ impl ContinuousBatchScheduler {
         };
         let (tokenizer, model, ids, kv_cache) = self.prepare_prompt(media, &ctx, encode)?;
         let n = ids.len();
-        if let Some(ctx) = model.as_ref().and_then(ExecutableModel::context_len) {
-            params.max_new_tokens = params.max_new_tokens.min(ctx.saturating_sub(n));
+        // Positions, not stored rows: past `--ctx` rows Tier 4 may evict, else the step ends it.
+        if let Some(m) = &model {
+            params.max_new_tokens = params.max_new_tokens.min(m.max_positions().saturating_sub(n));
         }
         if let Some((t, p)) = tokenizer.sampling_defaults {
             params.temperature.get_or_insert(t);
@@ -1153,91 +1183,67 @@ impl ContinuousBatchScheduler {
         let model = self.model.read().clone();
         let tokenizer = self.tokenizer();
         let drafter = self.drafter.read().clone();
-        // Sequences end at the model's context length: its KV cache holds no more positions.
+        // Sequences store at most the model's context length of KV rows. Tier 4 (Auto and
+        // Aggressive compaction, `--ctx` below the trained positions) evicts KV pages down to the
+        // target fraction there, so sequences end at the trained positions instead.
         let context_len = model
             .as_ref()
             .and_then(ExecutableModel::context_len)
             .unwrap_or(usize::MAX);
-        let current_step = self.step_counter.fetch_add(1, Ordering::Relaxed) as usize;
+        let max_positions = model.as_ref().map_or(context_len, ExecutableModel::max_positions);
+        let tier4 = {
+            use crate::compact::CompactionMode::{Aggressive, Auto};
+            let (mode, target) = *self.tier4.lock();
+            (matches!(mode, Auto | Aggressive) && max_positions > context_len)
+                .then(|| (context_len as f32 * target) as usize)
+        };
+        let pos_limit = if tier4.is_some() { max_positions } else { context_len };
+        self.step_counter.fetch_add(1, Ordering::Relaxed);
         let decoding = active.iter().any(|s| s.state == SequenceState::Decoding);
         let prefill_budget = self.prefill_tuner.lock().budget(decoding);
 
-        // 1. Cache-aware promotion of waiting sequences if KV blocks are available:
-        // When multiple sequences wait and some share cached prefix tokens, promote cache hits first.
+        // 1. Cache-aware promotion: with several sequences waiting, cache hits go first.
         if waiting.len() > 1 {
             let mut vec: Vec<Sequence> = waiting.drain(..).collect();
             vec.sort_by_key(|s| {
-                let hit = self.kv_pool.radix_cache.peek_match_len(&s.prompt_tokens);
+                let hit = self.radix.peek_match_len(&s.prompt_tokens);
                 (usize::MAX - hit, s.submitted)
             });
             waiting.extend(vec);
         }
+        let pool = model.as_ref().and_then(ExecutableModel::kv_pool);
+        // A restored prefix has no tap rows.
+        let reuse = drafter.as_ref().is_none_or(|d| d.tap_layers().is_empty());
         while let Some(mut seq) = waiting.pop_front() {
-            let (mut matched_blocks, mut matched_tokens, snapshot) = self
-                .kv_pool
-                .radix_cache
-                .match_prefix_with_snapshot(&seq.prompt_tokens);
             let max_reusable = seq.prompt_tokens.len().saturating_sub(1);
-            let mut restored_tokens = 0usize;
-            if drafter.as_ref().is_none_or(|d| d.tap_layers().is_empty()) && max_reusable > 0 {
-                if let (Some(m), Some(snap)) = (model.as_ref(), snapshot.as_ref()) {
-                    let usable = if snap.has_recurrent {
-                        if snap.token_len <= max_reusable {
-                            snap.token_len
-                        } else {
-                            0
+            if let (Some(m), true) = (&model, seq.key.is_empty()) {
+                seq.key = m.radix_key(&seq.kv_cache, &seq.prompt_tokens);
+            }
+            if let (Some(m), true, 0, None) = (&model, reuse, seq.prefilled_tokens, &seq.prefix) {
+                if max_reusable > 0 {
+                    let hit = self.radix.match_prefix(&seq.key[..max_reusable]);
+                    if hit.len > 0 {
+                        if let Some(n) = m.kv_restore(&mut seq.kv_cache, &hit) {
+                            seq.prefilled_tokens = n;
+                            seq.finish.cached_tokens.store(n, Ordering::Relaxed);
+                            seq.prefix = Some(hit);
                         }
-                    } else {
-                        matched_tokens.min(snap.token_len).min(max_reusable)
-                    };
-                    if usable > 0 && m.restore_kv_prefix(&mut seq.kv_cache, snap, usable) {
-                        restored_tokens = usable;
                     }
                 }
             }
-            if restored_tokens == 0 {
-                matched_blocks.clear();
-                matched_tokens = 0;
-            } else {
-                matched_tokens = restored_tokens;
-                let keep_blocks = (matched_tokens + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
-                matched_blocks.truncate(keep_blocks);
-                for &b in &matched_blocks {
-                    let _ = self.kv_pool.retain_block(b, current_step);
-                }
-            }
-
-            seq.allocated_blocks = matched_blocks;
-            let needed_tokens = seq
-                .prompt_tokens
-                .len()
-                .saturating_sub(matched_tokens)
-                .min(prefill_budget);
-            let total_initial = matched_tokens + needed_tokens;
-            let total_blocks = (total_initial + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
-            let needed_blocks = total_blocks.saturating_sub(seq.allocated_blocks.len());
-
-            let mut all_allocated = true;
-            for _ in 0..needed_blocks {
-                if let Some(block_id) = self.kv_pool.allocate_block(current_step) {
-                    seq.allocated_blocks.push(block_id);
-                } else {
-                    all_allocated = false;
-                    break;
-                }
-            }
-
-            if all_allocated {
-                seq.prefilled_tokens = matched_tokens;
-                seq.state = SequenceState::Prefilling;
-                active.push(seq);
-            } else {
-                for &b in &seq.allocated_blocks {
-                    self.kv_pool.release_block(b);
+            // Pages for the prompt's unmatched part; with none to be had, wait for running
+            // sequences to free theirs (or fail when nothing runs).
+            let rest = seq.prompt_tokens.len() - seq.prefilled_tokens;
+            if let Some(Err(e)) = pool.as_ref().map(|p| p.ensure_free(rest, true)) {
+                if active.is_empty() {
+                    let _ = seq.finish.set(FinishReason::Error(e));
+                    continue;
                 }
                 waiting.push_front(seq);
                 break;
             }
+            seq.state = SequenceState::Prefilling;
+            active.push(seq);
         }
 
         // Release waiting queue lock cleanly so concurrent ingestion is not blocked during forward compute
@@ -1304,22 +1310,6 @@ impl ContinuousBatchScheduler {
                 if chunk_len == 0 {
                     seq.state = SequenceState::Decoding;
                 } else {
-                    // Ensure sufficient KV blocks are allocated for this chunk
-                    let needed_capacity = seq.prefilled_tokens + chunk_len;
-                    let current_capacity = seq.allocated_blocks.len() * TOKENS_PER_BLOCK;
-                    if needed_capacity > current_capacity {
-                        let blocks_needed = (needed_capacity - current_capacity + TOKENS_PER_BLOCK
-                            - 1)
-                            / TOKENS_PER_BLOCK;
-                        for _ in 0..blocks_needed {
-                            if let Some(b) = self.kv_pool.allocate_block(current_step) {
-                                seq.allocated_blocks.push(b);
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
                     if seq.spec.is_none() {
                         if let Some(d) = &drafter {
                             let nanos = std::time::SystemTime::now()
@@ -1366,14 +1356,9 @@ impl ContinuousBatchScheduler {
 
                     if is_last {
                         seq.state = SequenceState::Decoding;
-                        let snap = m
-                            .export_kv_snapshot(&seq.kv_cache, seq.prompt_tokens.len())
-                            .map(Arc::new);
-                        self.kv_pool.radix_cache.insert_prefix_with_snapshot(
-                            &seq.prompt_tokens,
-                            &seq.allocated_blocks,
-                            snap,
-                        );
+                        if let Some(e) = m.kv_export(&seq.kv_cache, seq.prompt_tokens.len()) {
+                            self.radix.insert(&seq.key, e);
+                        }
                         if seq.params.max_new_tokens == 0 {
                             let _ = seq.finish.set(FinishReason::Length);
                             seq.state = SequenceState::Finished;
@@ -1383,7 +1368,7 @@ impl ContinuousBatchScheduler {
                             } else {
                                 seq.emit(&[next_tok], &self.telemetry);
                                 tokens_gen += 1;
-                                if seq.total_tokens() >= context_len
+                                if seq.total_tokens() >= pos_limit
                                     || seq.output_tokens.len() >= seq.params.max_new_tokens
                                 {
                                     let _ = seq.finish.set(FinishReason::Length);
@@ -1398,6 +1383,31 @@ impl ContinuousBatchScheduler {
                 let top_p = seq.params.top_p.unwrap_or(DEFAULT_TOP_P);
                 let mut all = seq.prompt_tokens.clone();
                 all.extend_from_slice(&seq.output_tokens);
+                // Tier 4: the stored rows reached the context; evict pages to keep decoding.
+                let full = all.len() >= context_len.saturating_add(seq.evicted);
+                if let Some(target) = tier4.filter(|_| full) {
+                    match m.kv_evict(&mut seq.kv_cache, target) {
+                        Ok(n) if n > 0 => {
+                            seq.evicted += n;
+                            self.telemetry.log_info(&format!(
+                                "sequence {}: evicted {n} KV positions at position {} ({} in total)",
+                                seq.id,
+                                all.len(),
+                                seq.evicted
+                            ));
+                        }
+                        r => {
+                            if let Err(e) = r {
+                                self.telemetry.log_info(&format!("sequence {}: {e}", seq.id));
+                            }
+                            let _ = seq.finish.set(FinishReason::Length);
+                            seq.state = SequenceState::Finished;
+                            continue;
+                        }
+                    }
+                }
+                // Positions this sequence may still reach: stored rows within the context.
+                let limit = pos_limit.min(context_len.saturating_add(seq.evicted));
                 // Draft no more than the sequence may still emit (the target adds one) or hold.
                 let knobs_snap = self.draft_knobs.snapshot();
                 let spec_k = seq.spec.as_ref().map(|sp| {
@@ -1409,15 +1419,13 @@ impl ContinuousBatchScheduler {
                                 .max_new_tokens
                                 .saturating_sub(seq.output_tokens.len() + 1),
                         )
-                        .min(context_len.saturating_sub(all.len()))
+                        .min(limit.saturating_sub(all.len()))
                 });
-                // Ensure sufficient KV blocks are allocated for the positions this step may add.
-                let needed_capacity = seq.total_tokens() + 1 + spec_k.unwrap_or(0);
-                while needed_capacity > seq.allocated_blocks.len() * TOKENS_PER_BLOCK {
-                    match self.kv_pool.allocate_block(current_step) {
-                        Some(b) => seq.allocated_blocks.push(b),
-                        None => break,
-                    }
+                // Pages for the positions this step may add (cached prefixes evicted first).
+                if let Some(Err(e)) = pool.as_ref().map(|p| p.ensure_free(1 + spec_k.unwrap_or(0), false)) {
+                    let _ = seq.finish.set(FinishReason::Error(e));
+                    seq.state = SequenceState::Finished;
+                    continue;
                 }
 
                 let started = Instant::now();
@@ -1473,7 +1481,7 @@ impl ContinuousBatchScheduler {
                                 seq.params
                                     .max_new_tokens
                                     .saturating_sub(seq.output_tokens.len())
-                                    .min(context_len.saturating_sub(all.len())),
+                                    .min(limit.saturating_sub(all.len())),
                                 temp,
                                 top_p,
                                 &mut seq.kv_cache,
@@ -1520,12 +1528,13 @@ impl ContinuousBatchScheduler {
                 decode_time += started.elapsed();
                 decoded += 1;
 
-                // Emit up to EOS, max_new_tokens or the context end, whichever comes first.
+                // Emit up to EOS, max_new_tokens or the last position, whichever comes first (a
+                // sequence at its stored-row cap evicts before its next step).
                 let room = seq
                     .params
                     .max_new_tokens
                     .saturating_sub(seq.output_tokens.len())
-                    .min(context_len.saturating_sub(seq.total_tokens()));
+                    .min(pos_limit.saturating_sub(seq.total_tokens()));
                 let eos = tokens.iter().position(|&t| tokenizer.ends_generation(t));
                 let n = eos.unwrap_or(tokens.len()).min(room);
                 if n > 0 {
@@ -1537,7 +1546,7 @@ impl ContinuousBatchScheduler {
                         self.record_gap(itl);
                     }
                 }
-                if seq.total_tokens() >= context_len
+                if seq.total_tokens() >= pos_limit
                     || seq.output_tokens.len() >= seq.params.max_new_tokens
                 {
                     let _ = seq.finish.set(FinishReason::Length);
@@ -1562,24 +1571,15 @@ impl ContinuousBatchScheduler {
                     if seq.output_tokens.len() > 1 {
                         let committed_out = seq.output_tokens.len() - 1;
                         let total_committed = seq.prompt_tokens.len() + committed_out;
-                        if let Some(snap) = m.export_kv_snapshot(&seq.kv_cache, total_committed) {
+                        if let Some(e) = m.kv_export(&seq.kv_cache, total_committed) {
                             let mut full = Vec::with_capacity(total_committed);
-                            full.extend_from_slice(&seq.prompt_tokens);
+                            full.extend_from_slice(&seq.key);
                             full.extend_from_slice(&seq.output_tokens[..committed_out]);
-                            let n_blocks = ((total_committed + TOKENS_PER_BLOCK - 1)
-                                / TOKENS_PER_BLOCK)
-                                .min(seq.allocated_blocks.len());
-                            self.kv_pool.radix_cache.insert_prefix_with_snapshot(
-                                &full,
-                                &seq.allocated_blocks[..n_blocks],
-                                Some(Arc::new(snap)),
-                            );
+                            self.radix.insert(&full, e);
                         }
                     }
                 }
-                for &b in &seq.allocated_blocks {
-                    self.kv_pool.release_block(b);
-                }
+                seq.prefix = None;
                 self.telemetry.record_request_completed();
                 false
             } else {
@@ -1649,11 +1649,7 @@ mod tests {
     /// sequence still gets a token every step); once it finishes, the budget grows back.
     #[test]
     fn test_prefill_budget_tracks_decoding_load() {
-        let s = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(LONG)),
-        );
+        let s = ContinuousBatchScheduler::new("", Some(cpu_exec(LONG)));
         let greedy = |n| SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -1694,11 +1690,7 @@ mod tests {
     /// A short prompt queued behind a long one is prefilled first and answers in the same step.
     #[test]
     fn test_short_prompt_not_stuck_behind_long_prefill() {
-        let s = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(LONG)),
-        );
+        let s = ContinuousBatchScheduler::new("", Some(cpu_exec(LONG)));
         let greedy = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -1717,11 +1709,7 @@ mod tests {
     /// The oldest prompt keeps prefilling while newer, shorter prompts keep arriving.
     #[test]
     fn test_long_prompt_not_starved_by_short_prompts() {
-        let s = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(LONG)),
-        );
+        let s = ContinuousBatchScheduler::new("", Some(cpu_exec(LONG)));
         let greedy = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -1755,11 +1743,7 @@ mod tests {
     /// Dropping the token receiver (client gone, TUI cancel) ends the sequence on the next step.
     #[test]
     fn test_dropped_receiver_frees_slot() {
-        let s = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(SHORT)),
-        );
+        let s = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
         let params = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -1777,11 +1761,7 @@ mod tests {
     /// Counting a prompt (Anthropic count_tokens) neither queues a sequence nor takes an id.
     #[test]
     fn test_prompt_len_queues_nothing() {
-        let s = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(SHORT)),
-        );
+        let s = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
         assert_eq!(s.prompt_len(&[], |_| vec![1, 2, 3]).unwrap(), 3);
         assert!(s.waiting_queue.read().is_empty());
         let (id, ..) = s.submit_with_params(SamplingParams::default(), |_| vec![1, 2, 3]);
@@ -1792,11 +1772,7 @@ mod tests {
     /// A model swap fails in-flight requests instead of closing them like finished ones.
     #[test]
     fn test_swap_model_fails_in_flight_requests() {
-        let s = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(SHORT)),
-        );
+        let s = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
         let params = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -1812,8 +1788,7 @@ mod tests {
 
     #[test]
     fn test_prompt_ingestion_lock_cleanliness_and_state() {
-        let kv_pool = Arc::new(PagedKVPool::new(64));
-        let scheduler = ContinuousBatchScheduler::new("", kv_pool, None);
+        let scheduler = ContinuousBatchScheduler::new("", None);
 
         // submit_request_stream must drop waiting lock cleanly
         let (_, _rx) = scheduler.submit_request_stream(vec![10, 20, 30]);
@@ -1834,11 +1809,7 @@ mod tests {
     /// the next `step` admits it active.
     #[test]
     fn test_idle_wait_wakes_immediately_on_submission() {
-        let s = Arc::new(ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(SHORT)),
-        ));
+        let s = Arc::new(ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT))));
         assert_eq!(s.step().active_sequences_count, 0);
         let s2 = s.clone();
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -1888,11 +1859,7 @@ mod tests {
     #[test]
     fn test_max_new_tokens_stops_exactly() {
         for n in [1usize, 7, 100] {
-            let scheduler = ContinuousBatchScheduler::new(
-                "",
-                Arc::new(PagedKVPool::new(512)),
-                Some(cpu_exec(SHORT)),
-            );
+            let scheduler = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
             let params = SamplingParams {
                 temperature: Some(0.0),
                 top_p: None,
@@ -1913,17 +1880,48 @@ mod tests {
         }
     }
 
-    /// Generation ends at the model's context length (its KV cache capacity), not past it.
+    /// Generation ends at the model's context length (its KV cache capacity), not past it. With
+    /// `--ctx` below the trained positions, Auto compaction evicts KV pages at the stored-row cap
+    /// and decoding runs on to the trained positions (`length` there); Off stops at the cap.
     #[test]
     fn test_generation_stops_at_model_context_length() {
         let model = cpu_exec(SHORT);
         let ctx = model.context_len().unwrap();
         assert_eq!(ctx, SHORT);
         let scheduler =
-            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(model));
+            ContinuousBatchScheduler::new("", Some(model));
         // Unclamped submit path: only the step's context check can stop this sequence.
         let (_, rx) = scheduler.submit_request_stream(vec![7u32; ctx - 12]);
         assert_eq!(run_to_completion(&scheduler, rx).len(), 12);
+
+        use crate::compact::{CompactionConfig, CompactionMode};
+        let (stored, prompt) = (3 * crate::kv::PAGE_TOKENS, 150);
+        for (mode, want) in [(CompactionMode::Auto, SHORT), (CompactionMode::Off, stored)] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = serde_json::json!({"max_position_embeddings": SHORT});
+            let a = crate::arch::testing::synthetic_llama(dir.path(), cfg);
+            let exact = crate::model::weight_format::ReencodeConfig {
+                policy: crate::model::weight_format::ReencodePolicy::BitExact,
+                ..Default::default()
+            };
+            let reg = crate::arch::registry().unwrap();
+            let m = crate::arch::load::load_with(&a, reg, Some("llama"), exact).unwrap();
+            let cpu = crate::hardware::PlacementMode::Pin(Device::Cpu);
+            let lm = crate::runtime::lm::SpecLm::with_ctx(m, cpu, Some(stored)).unwrap();
+            let s = ContinuousBatchScheduler::new("", Some(ExecutableModel::new(Arc::new(lm))));
+            s.set_compaction(&CompactionConfig { mode, ..Default::default() });
+            let params = SamplingParams {
+                temperature: Some(0.0),
+                top_p: None,
+                max_new_tokens: usize::MAX,
+                top_logprobs: None,
+            };
+            let (_, rx, ..) = s.submit_with_params(params, |_| vec![7u32; prompt]);
+            assert_eq!(run_to_completion(&s, rx).len(), want - prompt, "{mode:?}");
+            let logs = s.telemetry.get_recent_logs(500);
+            let evictions = logs.iter().filter(|l| l.message.contains("evicted")).count();
+            assert_eq!(evictions > 0, mode == CompactionMode::Auto, "{mode:?}");
+        }
     }
 
     #[test]
@@ -1931,11 +1929,7 @@ mod tests {
         let prompt = [5u32, 9, 13];
         // Every load of the synthetic id has the same weights: the reference is a second one.
         let want = argmax(&cpu_exec(SHORT).prompt_logits(prompt.to_vec()).unwrap()[..256]);
-        let scheduler = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(SHORT)),
-        );
+        let scheduler = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
         let params = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -1955,7 +1949,7 @@ mod tests {
         let model = spec_model(SHORT, Device::Metal);
         assert_eq!(model.llm_backend(), Device::Metal);
         let scheduler =
-            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(model));
+            ContinuousBatchScheduler::new("", Some(model));
         let params = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -2063,11 +2057,7 @@ mod tests {
             max_new_tokens: 16,
             top_logprobs: None,
         };
-        let plain_sched = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(SHORT)),
-        );
+        let plain_sched = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
         plain_sched.set_draft_knobs(DraftKnobs {
             mode: DraftMode::Off,
             ..DraftKnobs::default()
@@ -2077,11 +2067,7 @@ mod tests {
         assert_eq!(want.len(), 16);
 
         for mode in [DraftMode::Auto, DraftMode::Noise, DraftMode::Suffix] {
-            let spec_sched = ContinuousBatchScheduler::new(
-                "",
-                Arc::new(PagedKVPool::new(512)),
-                Some(cpu_exec(SHORT)),
-            );
+            let spec_sched = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
             assert!(
                 spec_sched.view().spec.is_some(),
                 "DraftMode::Auto should automatically prepare OnlineNoiseDrafter on load"
@@ -2103,52 +2089,38 @@ mod tests {
         }
     }
 
-    /// Physical PagedRadixKv prefix reuse skips prefilling the cached prefix and produces
-    /// bit-identical tokens to a fresh full-prompt prefill.
+    /// A second chat turn (turn one's prompt and reply, then new tokens) resumes the radix-cached
+    /// pages of turn one, prefills only the rest, reports the reuse as `cached_tokens`, and
+    /// decodes the same tokens as a fresh full prefill.
     #[test]
-    fn test_physical_prefix_cache_skips_prefill_and_matches_fresh_decode() {
-        let prefix: Vec<u32> = (0..24).map(|i| 5 + (i % 40) as u32).collect();
-        let mut ext = prefix.clone();
-        ext.extend_from_slice(&[91, 92, 93, 94, 95, 96]);
+    fn second_turn_prefills_only_the_new_suffix() {
         let params = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: 8,
             top_logprobs: None,
         };
+        let turn1: Vec<u32> = (0..100).map(|i| 5 + (i % 40) as u32).collect();
+        let cached = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
+        let (_, rx1, ..) = cached.submit_with_params(params, |_| turn1.clone());
+        let reply = run_to_completion(&cached, rx1);
+        assert_eq!(reply.len(), 8);
+        let mut turn2 = turn1.clone();
+        turn2.extend(&reply);
+        turn2.extend([91, 92, 93, 94, 95, 96]);
 
-        // Reference: fresh scheduler prefills all 30 tokens of `ext` from scratch.
-        let fresh = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(SHORT)),
-        );
-        let (_, rx_fresh, ..) = fresh.submit_with_params(params, |_| ext.clone());
+        let fresh = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
+        let (_, rx_fresh, ..) = fresh.submit_with_params(params, |_| turn2.clone());
         let want = run_to_completion(&fresh, rx_fresh);
-        assert_eq!(want.len(), 8);
 
-        // Cached scheduler: first runs `prefix` (24 tokens), then runs `ext` (30 tokens).
-        let cached = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(SHORT)),
-        );
-        let (_, rx1, ..) = cached.submit_with_params(params, |_| prefix.clone());
-        let _ = run_to_completion(&cached, rx1);
-
-        let (_, mut rx2, ..) = cached.submit_with_params(params, |_| ext.clone());
+        let (_, mut rx2, _, _, finish) = cached.submit_with_params(params, |_| turn2.clone());
         let step1 = cached.step();
-        // Only the 6 uncached suffix tokens should be prefilled in step1!
-        assert_eq!(
-            step1.prefill.1, 6,
-            "expected physical prefix cache to skip 24 cached tokens and prefill only 6, got {}",
-            step1.prefill.1
-        );
+        // Turn one's sequence-end export holds its prompt and every reply token but the last.
+        let reused = turn1.len() + reply.len() - 1;
+        assert_eq!(finish.cached_tokens.load(Ordering::Relaxed), reused);
+        assert_eq!(step1.prefill.1, turn2.len() - reused, "only the new suffix is prefilled");
         let mut got: Vec<u32> = std::iter::from_fn(|| rx2.try_recv().ok()).collect();
         got.extend(run_to_completion(&cached, rx2));
-        assert_eq!(
-            got, want,
-            "physical prefix reuse output diverged from fresh prefill"
-        );
+        assert_eq!(got, want, "prefix reuse diverged from a fresh prefill");
     }
 }

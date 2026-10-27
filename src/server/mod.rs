@@ -797,18 +797,13 @@ async fn handle_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv::PagedKVPool;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
     fn create_test_state() -> AppState {
         AppState {
-            scheduler: Arc::new(ContinuousBatchScheduler::new(
-                "",
-                Arc::new(PagedKVPool::new(64)),
-                None,
-            )),
+            scheduler: Arc::new(ContinuousBatchScheduler::new("", None)),
             telemetry: EngineTelemetry::new(),
             jev_model: Default::default(),
             image_model: Default::default(),
@@ -974,11 +969,7 @@ mod tests {
     fn model_state(dir: &std::path::Path) -> AppState {
         let cfg = serde_json::json!({"max_position_embeddings": 16384});
         let model = crate::arch::testing::synthetic_lm(dir, cfg, crate::hardware::Device::Cpu);
-        let scheduler = Arc::new(ContinuousBatchScheduler::new(
-            "gibbs/test-llama",
-            Arc::new(PagedKVPool::new(1024)),
-            Some(model),
-        ));
+        let scheduler = Arc::new(ContinuousBatchScheduler::new("gibbs/test-llama", Some(model)));
         let weak = Arc::downgrade(&scheduler);
         std::thread::spawn(move || {
             while let Some(s) = weak.upgrade() {

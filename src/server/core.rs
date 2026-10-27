@@ -98,6 +98,9 @@ pub struct Generation {
     pub events: UnboundedReceiver<Event>,
     /// Set when the chat history was compacted before it was queued.
     pub compaction: Option<Compaction>,
+    /// The scheduler's finish signal: `cached_tokens` is the prompt prefix reused from the radix
+    /// cache (final once the first event arrives).
+    pub finish: crate::scheduler::FinishSignal,
 }
 
 /// A compaction applied to a request: its report and the history the model saw.
@@ -569,6 +572,7 @@ pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, 
     }
     let (tx, events) = unbounded_channel();
     let telemetry = state.telemetry.clone();
+    let finished = finish.clone();
     let mut sink = Sink {
         tx,
         stops: Stops::new(req.stop),
@@ -619,6 +623,7 @@ pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, 
         prompt_tokens,
         events,
         compaction,
+        finish: finished,
     })
 }
 
@@ -893,6 +898,7 @@ mod tests {
             prompt_tokens: 0,
             events: rx,
             compaction: None,
+            finish: Default::default(),
         };
         let Err(err) = futures::executor::block_on(collect(gen)) else {
             panic!("a swap abort is an error");

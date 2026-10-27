@@ -338,7 +338,6 @@ fn gemma3_ncii_guard_matches_card() {
 async fn http_classify_rerank_and_chat_refusal() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use gibbs_engine::kv::PagedKVPool;
     use gibbs_engine::scheduler::{ContinuousBatchScheduler, ExecutableModel};
     use gibbs_engine::server::{create_router, AppState};
     use gibbs_engine::telemetry::EngineTelemetry;
@@ -349,20 +348,16 @@ async fn http_classify_rerank_and_chat_refusal() {
         return;
     };
     let state = AppState {
-        scheduler: Arc::new(ContinuousBatchScheduler::new(
-            "gibbs/smollm-1m",
-            Arc::new(PagedKVPool::new(64)),
-            Some({
-                // A fresh hub dir: a synthetic repo left in the user's cache would be reused as is.
-                let hub_dir = tempfile::tempdir().unwrap();
-                let a = gibbs_engine::model::hub::HuggingFaceHub::with_cache_dir(hub_dir.path().to_path_buf())
-                    .resolve_or_synthesize_tiny("gibbs/tiny-5m")
-                    .unwrap();
-                let reg = gibbs_engine::arch::registry().unwrap();
-                let cpu = gibbs_engine::hardware::Device::Cpu.into();
-                ExecutableModel::new(gibbs_engine::runtime::lm::load(&a, reg, None, cpu).unwrap())
-            }),
-        )),
+        scheduler: Arc::new(ContinuousBatchScheduler::new("gibbs/smollm-1m", Some({
+            // A fresh hub dir: a synthetic repo left in the user's cache would be reused as is.
+            let hub_dir = tempfile::tempdir().unwrap();
+            let a = gibbs_engine::model::hub::HuggingFaceHub::with_cache_dir(hub_dir.path().to_path_buf())
+                .resolve_or_synthesize_tiny("gibbs/tiny-5m")
+                .unwrap();
+            let reg = gibbs_engine::arch::registry().unwrap();
+            let cpu = gibbs_engine::hardware::Device::Cpu.into();
+            ExecutableModel::new(gibbs_engine::runtime::lm::load(&a, reg, None, cpu).unwrap())
+        }))),
         telemetry: EngineTelemetry::new(),
         jev_model: Default::default(),
         image_model: Default::default(),

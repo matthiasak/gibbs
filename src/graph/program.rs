@@ -85,6 +85,36 @@ pub struct GraphProgram {
     scalars: Weights,
 }
 
+/// The positions a fed stream from `pos` may write without regrowing contiguous state buffers:
+/// up to the next 4096-row boundary (their lazy growth step), within their declared rows. Paged
+/// states (`kv`) cap nothing: a stream reserves its pages up front.
+#[cfg(target_os = "macos")]
+fn stream_cap(
+    g: &Graph,
+    plan: &crate::graph::metal::PreparedPlan,
+    kv: Option<&crate::kv::KvPool>,
+    pos: u32,
+) -> usize {
+    let declared = plan
+        .state_vars
+        .iter()
+        .filter(|(_, name)| kv.is_none_or(|p| p.locate(name).is_none()))
+        .filter_map(|&(v, _)| {
+            let val = g.value(v);
+            let rec = matches!(
+                val.kind,
+                crate::graph::ValueKind::State {
+                    recurrent: true,
+                    ..
+                }
+            );
+            (!rec && val.shape.len() == 2).then_some(val.shape[0])
+        })
+        .max();
+    let next = (pos as usize + 1).next_multiple_of(4096);
+    declared.map_or(next, |d| d.min(next))
+}
+
 /// `graph` with output 0 (one f32 row) replaced by the `[.., 1]` u32 index of the first largest of
 /// its first `valid` entries (0 = all), NaN ranking lowest: a prefix `Slice` then `TopK { k: 1 }`.
 /// The other outputs stay. `None` when output 0 is not one f32 row.
@@ -316,6 +346,28 @@ impl GraphProgram {
         self.segment.graph().recurrent_states()
     }
 
+    /// Names of the program's states its KV pool does not page (recurrent conv/ssm, `StateWrite`
+    /// caches, ...), sorted: what a prefix-cache boundary snapshots.
+    pub fn contiguous_states(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .segment
+            .graph()
+            .values
+            .iter()
+            .filter_map(|v| match &v.kind {
+                crate::graph::ValueKind::State { name, .. }
+                    if self.kv_pool.as_ref().is_none_or(|p| p.locate(name).is_none()) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// The program's graph nodes grouped by op kind, device and avenue, most numerous first.
     pub fn placement_summary(&self) -> Vec<PlacementRow> {
         let mut rows: Vec<PlacementRow> = Vec::new();
@@ -537,25 +589,7 @@ impl GraphProgram {
             if !Session::fed_stream_ok(g, plan) {
                 return Ok(None);
             }
-            // The positions this stream may write without regrowing state buffers: up to the next
-            // 4096-row boundary (the lazy KV growth step), within the declared rows.
-            let declared = plan
-                .state_vars
-                .iter()
-                .filter_map(|&(v, _)| {
-                    let val = g.value(v);
-                    let rec = matches!(
-                        val.kind,
-                        crate::graph::ValueKind::State {
-                            recurrent: true,
-                            ..
-                        }
-                    );
-                    (!rec && val.shape.len() == 2).then_some(val.shape[0])
-                })
-                .max();
-            let next = (pos as usize + 1).next_multiple_of(4096);
-            let cap = declared.map_or(next, |d| d.min(next));
+            let cap = stream_cap(g, plan, self.kv_pool.as_deref(), pos);
             let budget = max_new.min(cap.saturating_sub(pos as usize));
             if budget == 0 {
                 return Ok(None);
@@ -629,23 +663,7 @@ impl GraphProgram {
                 return Ok(None);
             }
             let vocab = if valid == 0 { cols } else { valid.min(cols) } as u32;
-            let declared = plan
-                .state_vars
-                .iter()
-                .filter_map(|&(v, _)| {
-                    let val = graph.value(v);
-                    let rec = matches!(
-                        val.kind,
-                        crate::graph::ValueKind::State {
-                            recurrent: true,
-                            ..
-                        }
-                    );
-                    (!rec && val.shape.len() == 2).then_some(val.shape[0])
-                })
-                .max();
-            let next = (pos as usize + 1).next_multiple_of(4096);
-            let cap = declared.map_or(next, |d| d.min(next));
+            let cap = stream_cap(graph, plan, self.kv_pool.as_deref(), pos);
             let budget = max_new.min(cap.saturating_sub(pos as usize));
             if budget == 0 {
                 return Ok(None);

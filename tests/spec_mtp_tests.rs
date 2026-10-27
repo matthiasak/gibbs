@@ -4,7 +4,6 @@
 //! it, the rollback check runs on the cached Qwen3.5-2B GGUF (which ships no MTP head).
 
 use gibbs_engine::hardware::{Device, PlacementMode};
-use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::hub::HuggingFaceHub;
 use gibbs_engine::model::native::NativeLm;
 use gibbs_engine::scheduler::{ContinuousBatchScheduler, ExecutableModel, SamplingParams};
@@ -88,11 +87,7 @@ fn deltanet_rollback_is_exact() {
 
 /// Greedy output of three concurrent requests: with the MTP drafter on (default) and off.
 fn run(m: &Arc<dyn NativeLm>, spec: bool, prompts: &[&str], max: usize) -> (Vec<Vec<u32>>, f32) {
-    let sched = ContinuousBatchScheduler::new(
-        REPO,
-        Arc::new(PagedKVPool::new(4096)),
-        Some(ExecutableModel::new(m.clone())),
-    );
+    let sched = ContinuousBatchScheduler::new(REPO, Some(ExecutableModel::new(m.clone())));
     if !spec {
         sched.set_drafter(None);
     }
@@ -187,11 +182,7 @@ fn mtp_sampling_keeps_target_distribution() {
     let mut counts = std::collections::HashMap::<u32, usize>::new();
     for _ in 0..n {
         // A fresh scheduler's k tuner starts at k = 1, so every sample takes a speculative step.
-        let sched = ContinuousBatchScheduler::new(
-            REPO,
-            Arc::new(PagedKVPool::new(64)),
-            Some(ExecutableModel::new(m.clone())),
-        );
+        let sched = ContinuousBatchScheduler::new(REPO, Some(ExecutableModel::new(m.clone())));
         let mut rx = sched.submit_with_params(params, |_| ids.clone()).1;
         while sched.step().active_sequences_count > 0 {}
         let out: Vec<u32> = std::iter::from_fn(|| rx.try_recv().ok()).collect();

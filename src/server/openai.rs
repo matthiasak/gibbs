@@ -109,8 +109,11 @@ fn finish_reason(f: &Finish) -> &'static str {
     }
 }
 
-fn usage(prompt: usize, completion: usize) -> Value {
-    json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion})
+/// OpenAI usage; `cached` is the prompt prefix reused from the radix KV cache.
+fn usage(prompt: usize, completion: usize, cached: &crate::scheduler::FinishSignal) -> Value {
+    let cached = cached.cached_tokens.load(std::sync::atomic::Ordering::Relaxed);
+    json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion,
+           "prompt_tokens_details": {"cached_tokens": cached}})
 }
 
 pub async fn chat_completions(
@@ -178,6 +181,7 @@ async fn chat(
     let id = format!("chatcmpl-{}", gen.id);
     let prompt_tokens = gen.prompt_tokens;
     let report = compaction.as_ref().map(|c| json!(c.report));
+    let cached = gen.finish.clone();
     if req.stream.unwrap_or(false) {
         let wire = ChatWire {
             id,
@@ -187,6 +191,7 @@ async fn chat(
             include_usage: include_usage(req.stream_options.as_ref()),
             prompt_tokens,
             compaction: report,
+            cached,
         };
         let mut resp = stream_response(gen, wire, Framing::SseDone);
         resp.headers_mut().extend(compaction.as_ref().map(|c| c.header()));
@@ -206,7 +211,7 @@ async fn chat(
         "created": unix_now(),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(&out.finish)}],
-        "usage": usage(prompt_tokens, out.completion_tokens),
+        "usage": usage(prompt_tokens, out.completion_tokens, &cached),
     });
     if let Some(c) = &compaction {
         body["usage"]["compaction"] = json!(c.report);
@@ -233,6 +238,7 @@ pub struct ChatWire {
     pub prompt_tokens: usize,
     /// `usage.compaction` of the final usage chunk.
     pub compaction: Option<Value>,
+    pub cached: crate::scheduler::FinishSignal,
 }
 
 impl ChatWire {
@@ -267,7 +273,7 @@ impl Wire for ChatWire {
                 let mut out = vec![self.delta(json!({}), Some(finish_reason(&finish)))];
                 if self.include_usage {
                     let mut last = self.chunk(json!([]));
-                    last["usage"] = usage(self.prompt_tokens, completion_tokens);
+                    last["usage"] = usage(self.prompt_tokens, completion_tokens, &self.cached);
                     if let Some(c) = &self.compaction {
                         last["usage"]["compaction"] = c.clone();
                     }
@@ -331,7 +337,7 @@ fn system1_tool_route(
             "role": "assistant", "content": null,
             "tool_calls": [{"id": format!("call_{id}"), "type": "function",
                             "function": {"name": selected, "arguments": "{}"}}]}}],
-        "usage": usage(prompt_tokens, 0),
+        "usage": usage(prompt_tokens, 0, &Default::default()),
     }))
     .into_response())
 }
@@ -380,6 +386,7 @@ async fn completion(
     let model = req.model.unwrap_or_else(|| state.scheduler.model_id());
     let id = format!("cmpl-{}", gen.id);
     let prompt_tokens = gen.prompt_tokens;
+    let cached = gen.finish.clone();
     if req.stream.unwrap_or(false) {
         let wire = CompletionWire {
             id,
@@ -387,6 +394,7 @@ async fn completion(
             created: unix_now(),
             include_usage: include_usage(req.stream_options.as_ref()),
             prompt_tokens,
+            cached,
         };
         return Ok(stream_response(gen, wire, Framing::SseDone));
     }
@@ -398,7 +406,7 @@ async fn completion(
         "model": model,
         "choices": [{"index": 0, "text": out.text, "logprobs": null,
                      "finish_reason": finish_reason(&out.finish)}],
-        "usage": usage(prompt_tokens, out.completion_tokens),
+        "usage": usage(prompt_tokens, out.completion_tokens, &cached),
     }))
     .into_response())
 }
@@ -409,6 +417,7 @@ pub struct CompletionWire {
     pub created: u64,
     pub include_usage: bool,
     pub prompt_tokens: usize,
+    pub cached: crate::scheduler::FinishSignal,
 }
 
 impl CompletionWire {
@@ -432,7 +441,7 @@ impl Wire for CompletionWire {
                 if self.include_usage {
                     let mut last = self.chunk("", None);
                     last["choices"] = json!([]);
-                    last["usage"] = usage(self.prompt_tokens, completion_tokens);
+                    last["usage"] = usage(self.prompt_tokens, completion_tokens, &self.cached);
                     out.push(last);
                 }
                 out
@@ -457,6 +466,7 @@ mod tests {
             include_usage: true,
             prompt_tokens: 7,
             compaction: None,
+            cached: Default::default(),
         };
         let call = |name: &str| {
             Event::Call(ToolCall {
