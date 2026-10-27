@@ -117,11 +117,11 @@ struct Rows<'a> {
     ld: usize,
 }
 
-/// Source of the B operand, packed into NR-wide k-major panels.
+/// Source of the B operand, packed into `W`-wide k-major panels.
 trait PackB: Sync {
-    /// Packs rows `j0..j0+nc`, cols `p0..p0+kc` into `dst` as panels of `NR * kc`,
-    /// element (j, p) at `panel[p * NR + j]`, zero-padding rows past `nc`.
-    fn pack(&self, dst: &mut [f32], j0: usize, nc: usize, p0: usize, kc: usize);
+    /// Packs rows `j0..j0+nc`, cols `p0..p0+kc` into `dst` as panels of `W * kc`,
+    /// element (j, p) at `panel[p * W + j]`, zero-padding rows past `nc`.
+    fn pack<const W: usize>(&self, dst: &mut [f32], j0: usize, nc: usize, p0: usize, kc: usize);
 }
 
 fn pack_rows<const R: usize>(
@@ -151,8 +151,8 @@ fn pack_rows<const R: usize>(
 }
 
 impl PackB for Rows<'_> {
-    fn pack(&self, dst: &mut [f32], j0: usize, nc: usize, p0: usize, kc: usize) {
-        pack_rows::<NR>(self, j0, nc, p0, kc, dst);
+    fn pack<const W: usize>(&self, dst: &mut [f32], j0: usize, nc: usize, p0: usize, kc: usize) {
+        pack_rows::<W>(self, j0, nc, p0, kc, dst);
     }
 }
 
@@ -169,36 +169,36 @@ struct Im2col<'a> {
 }
 
 impl PackB for Im2col<'_> {
-    fn pack(&self, dst: &mut [f32], j0: usize, nc: usize, p0: usize, kc: usize) {
+    fn pack<const W: usize>(&self, dst: &mut [f32], j0: usize, nc: usize, p0: usize, kc: usize) {
         let (h, w, k) = (self.h, self.w, self.k);
         let hw = h * w;
         let kk2 = k * k;
         let direct = k == 1 && self.stride == 1 && self.pad == 0;
-        for (pi, panel) in dst[..nc.div_ceil(NR) * NR * kc]
-            .chunks_exact_mut(NR * kc)
+        for (pi, panel) in dst[..nc.div_ceil(W) * W * kc]
+            .chunks_exact_mut(W * kc)
             .enumerate()
         {
-            let jb = j0 + pi * NR;
-            let cnt = NR.min(nc - pi * NR);
+            let jb = j0 + pi * W;
+            let cnt = W.min(nc - pi * W);
             if direct {
                 // 1x1 stride 1: B[pixel][ci] = x[ci][pixel], a contiguous run of pixels per channel.
-                for (kk, d) in panel.chunks_exact_mut(NR).enumerate() {
+                for (kk, d) in panel.chunks_exact_mut(W).enumerate() {
                     d[..cnt].copy_from_slice(&self.x[(p0 + kk) * hw + jb..][..cnt]);
                     d[cnt..].fill(0.0);
                 }
                 continue;
             }
-            let mut by = [0isize; NR];
-            let mut bx = [0isize; NR];
+            let mut by = [0isize; W];
+            let mut bx = [0isize; W];
             for jj in 0..cnt {
                 let p = jb + jj;
                 by[jj] = ((p / self.ow) * self.stride) as isize - self.pad as isize;
                 bx[jj] = ((p % self.ow) * self.stride) as isize - self.pad as isize;
             }
             let (mut ci, mut ky, mut kx) = (p0 / kk2, (p0 % kk2) / k, p0 % k);
-            for d in panel.chunks_exact_mut(NR) {
+            for d in panel.chunks_exact_mut(W) {
                 let plane = &self.x[ci * hw..][..hw];
-                for jj in 0..NR {
+                for jj in 0..W {
                     let iy = (by[jj] + ky as isize) as usize;
                     let ix = (bx[jj] + kx as isize) as usize;
                     // Negative coordinates wrap to huge usize and fail the bound check.
@@ -225,9 +225,9 @@ impl PackB for Im2col<'_> {
 /// tile[MR x NR] = sum over kc of packed A panel (k-major, MR wide) x packed B panel (k-major, NR wide).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn kernel(kc: usize, a: &[f32], b: &[f32], tile: &mut [f32; MR * NR]) {
+fn kernel(kc: usize, a: &[f32], b: &[f32], tile: &mut [f32]) {
     use core::arch::aarch64::*;
-    assert!(a.len() >= kc * MR && b.len() >= kc * NR);
+    assert!(a.len() >= kc * MR && b.len() >= kc * NR && tile.len() >= MR * NR);
     // SAFETY: the assert above bounds every load; stores stay inside `tile`.
     unsafe {
         let z = vdupq_n_f32(0.0);
@@ -267,7 +267,7 @@ fn kernel(kc: usize, a: &[f32], b: &[f32], tile: &mut [f32; MR * NR]) {
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
-fn kernel(kc: usize, a: &[f32], b: &[f32], tile: &mut [f32; MR * NR]) {
+fn kernel(kc: usize, a: &[f32], b: &[f32], tile: &mut [f32]) {
     tile.fill(0.0);
     for (ap, bp) in a[..kc * MR]
         .chunks_exact(MR)
@@ -281,9 +281,10 @@ fn kernel(kc: usize, a: &[f32], b: &[f32], tile: &mut [f32; MR * NR]) {
     }
 }
 
-/// Computes the full-k result for C rows `i0..i0+mc`, cols `j0..j0+nc`.
+/// Computes the full-k result for C rows `i0..i0+mc`, cols `j0..j0+nc` with `R x C` micro-tiles
+/// of `kern(kc, a_panel, b_panel, tile)`.
 #[allow(clippy::too_many_arguments)]
-fn gemm_tile<B: PackB>(
+fn gemm_tile<B: PackB, const R: usize, const C: usize>(
     a: &Rows,
     b: &B,
     i0: usize,
@@ -294,6 +295,7 @@ fn gemm_tile<B: PackB>(
     bias: Option<&[f32]>,
     out: Out,
     scratch: &mut Vec<f32>,
+    kern: fn(usize, &[f32], &[f32], &mut [f32]),
 ) {
     // SAFETY (all row slices below): rows i0..i0+mc and cols j0..j0+nc of `out` belong
     // to this tile alone; callers size `out` to cover the whole m x n result.
@@ -310,27 +312,28 @@ fn gemm_tile<B: PackB>(
         }
         return;
     }
-    let (pm, pn) = (mc.div_ceil(MR), nc.div_ceil(NR));
+    let (pm, pn) = (mc.div_ceil(R), nc.div_ceil(C));
     let kc_max = k.min(KC);
-    let need = (pm * MR + pn * NR) * kc_max;
+    let need = (pm * R + pn * C) * kc_max;
     if scratch.len() < need {
         scratch.resize(need, 0.0);
     }
-    let (ap, bp) = scratch.split_at_mut(pm * MR * kc_max);
-    let mut tile = [0.0f32; MR * NR];
+    let (ap, bp) = scratch.split_at_mut(pm * R * kc_max);
+    let mut tile = [0.0f32; 32 * 32];
+    let tile = &mut tile[..R * C];
     for p0 in (0..k).step_by(KC) {
         let kc = KC.min(k - p0);
-        pack_rows::<MR>(a, i0, mc, p0, kc, ap);
-        b.pack(bp, j0, nc, p0, kc);
+        pack_rows::<R>(a, i0, mc, p0, kc, ap);
+        b.pack::<C>(bp, j0, nc, p0, kc);
         for jp in 0..pn {
-            let bpan = &bp[jp * NR * kc..][..NR * kc];
-            let jb = j0 + jp * NR;
-            let nr = NR.min(nc - jp * NR);
+            let bpan = &bp[jp * C * kc..][..C * kc];
+            let jb = j0 + jp * C;
+            let nr = C.min(nc - jp * C);
             for ip in 0..pm {
-                kernel(kc, &ap[ip * MR * kc..][..MR * kc], bpan, &mut tile);
-                for i in 0..MR.min(mc - ip * MR) {
-                    let row = out_row(i0 + ip * MR + i, jb, nr);
-                    let src = &tile[i * NR..][..nr];
+                kern(kc, &ap[ip * R * kc..][..R * kc], bpan, tile);
+                for i in 0..R.min(mc - ip * R) {
+                    let row = out_row(i0 + ip * R + i, jb, nr);
+                    let src = &tile[i * C..][..nr];
                     if p0 > 0 {
                         for (d, s) in row.iter_mut().zip(src) {
                             *d += s;
@@ -362,7 +365,7 @@ fn gemm_serial<B: PackB>(
 ) {
     for i0 in (0..m).step_by(MC) {
         for j0 in (0..n).step_by(NC) {
-            gemm_tile(
+            gemm_tile::<B, MR, NR>(
                 a,
                 b,
                 i0,
@@ -373,30 +376,49 @@ fn gemm_serial<B: PackB>(
                 bias,
                 out,
                 scratch,
+                kernel,
             );
         }
     }
 }
 
-/// Multithreaded GEMM over MC x NC output tiles.
+/// SME2 32x32 tiles apply: the host streams 512-bit SME2 vectors and both sides span a tile.
+fn use_sme2(m: usize, n: usize) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    return m >= 32 && n >= 32 && crate::model::sme2::available();
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        let _ = (m, n);
+        false
+    }
+}
+
+/// Multithreaded GEMM over MC x NC output tiles, of SME2 32x32 micro-tiles when `sme`, else NEON
+/// MR x NR ones.
 // ponytail: m < MR (e.g. a single-row GEMV) pads to MR rows; fine while such calls are rare (time embedding).
-fn gemm<B: PackB>(a: Rows, b: &B, m: usize, n: usize, k: usize, bias: Option<&[f32]>, out: Out) {
+#[allow(clippy::too_many_arguments)]
+fn gemm<B: PackB>(
+    a: Rows,
+    b: &B,
+    m: usize,
+    n: usize,
+    k: usize,
+    bias: Option<&[f32]>,
+    out: Out,
+    sme: bool,
+) {
     let tn = n.div_ceil(NC);
     let tiles = m.div_ceil(MC) * tn;
     par_tasks::<Vec<f32>>(tiles, m * n * k >= PAR_MIN_FLOPS, |scratch, t| {
         let (i0, j0) = ((t / tn) * MC, (t % tn) * NC);
-        gemm_tile(
-            &a,
-            b,
-            i0,
-            MC.min(m - i0),
-            j0,
-            NC.min(n - j0),
-            k,
-            bias,
-            out,
-            scratch,
-        );
+        let (mc, nc) = (MC.min(m - i0), NC.min(n - j0));
+        if sme {
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            return gemm_tile::<B, 32, 32>(&a, b, i0, mc, j0, nc, k, bias, out, scratch, |kc, a, b, t| {
+                crate::model::sme2::sgemm_32x32(a, b, t, kc, 32, false)
+            });
+        }
+        gemm_tile::<B, MR, NR>(&a, b, i0, mc, j0, nc, k, bias, out, scratch, kernel);
     });
 }
 
@@ -409,6 +431,21 @@ pub fn matmul_nt(
     k: usize,
     n: usize,
     out: &mut [f32],
+) {
+    matmul_nt_with(a, b, bias, m, k, n, out, use_sme2(m, n));
+}
+
+/// [`matmul_nt`] on SME2 tiles (`sme`) or NEON ones.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_nt_with(
+    a: &[f32],
+    b: &[f32],
+    bias: Option<&[f32]>,
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+    sme: bool,
 ) {
     assert_eq!(a.len(), m * k, "matmul_nt: a is not m*k");
     assert_eq!(b.len(), n * k, "matmul_nt: b is not n*k");
@@ -424,6 +461,7 @@ pub fn matmul_nt(
         k,
         bias,
         Out::new(out, n),
+        sme,
     );
 }
 
@@ -432,21 +470,21 @@ pub fn matmul_nt(
 struct RowFn<'a>(&'a (dyn Fn(usize, usize, &mut [f32]) + Sync));
 
 impl PackB for RowFn<'_> {
-    fn pack(&self, dst: &mut [f32], j0: usize, nc: usize, p0: usize, kc: usize) {
+    fn pack<const W: usize>(&self, dst: &mut [f32], j0: usize, nc: usize, p0: usize, kc: usize) {
         let mut row = [0.0f32; KC];
-        for (pi, panel) in dst[..nc.div_ceil(NR) * NR * kc]
-            .chunks_exact_mut(NR * kc)
+        for (pi, panel) in dst[..nc.div_ceil(W) * W * kc]
+            .chunks_exact_mut(W * kc)
             .enumerate()
         {
-            for rr in 0..NR {
-                let j = pi * NR + rr;
+            for rr in 0..W {
+                let j = pi * W + rr;
                 if j < nc {
                     (self.0)(j0 + j, p0, &mut row[..kc]);
                 } else {
                     row[..kc].fill(0.0);
                 }
                 for (kk, &v) in row[..kc].iter().enumerate() {
-                    panel[kk * NR + rr] = v;
+                    panel[kk * W + rr] = v;
                 }
             }
         }
@@ -478,6 +516,7 @@ pub fn matmul_rows(
         k,
         bias,
         Out::new(out, n),
+        use_sme2(m, n),
     );
 }
 
@@ -574,6 +613,7 @@ pub fn conv2d(
         c_in * k * k,
         None,
         Out::new(&mut out, n),
+        use_sme2(c_out, n),
     );
     if let Some(bb) = bias {
         assert_eq!(bb.len(), c_out, "conv2d: bias is not c_out");
