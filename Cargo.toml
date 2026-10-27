@@ -52,4 +52,6 @@ egglog = "3.0.0"
 # Apple GPU: MTLDevice, runtime MSL compilation, shared buffers (--backend metal)
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33"
+# Apple Neural Engine: private AppleNeuralEngine.framework classes through the ObjC runtime
+objc = "0.2"
 

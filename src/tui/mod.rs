@@ -531,6 +531,11 @@ impl TuiApp {
             pinned_models(),
             hw.total_memory_bytes,
         );
+        // The Device panel's ANE line appears once the (disk-cached) probe finishes.
+        #[cfg(all(target_os = "macos", not(test)))]
+        std::thread::spawn(|| {
+            let _ = crate::graph::ane::probe();
+        });
         let (updates_tx, updates_rx) = mpsc::channel();
         let spark_total = telemetry.total_tokens_generated.load(Ordering::Relaxed);
         let mut gemm_peak_gflops = 0.0f64;

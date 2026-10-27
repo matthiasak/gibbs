@@ -373,6 +373,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             #[cfg(not(target_os = "macos"))]
             Device::Metal => return Err("--backend metal requires macOS".into()),
+            Device::Ane => {
+                let available: Vec<&str> = gibbs_engine::hardware::available_devices()
+                    .into_iter()
+                    .map(Device::name)
+                    .collect();
+                return Err(format!(
+                    "--backend ane: not available on this host (available: {})",
+                    available.join(", ")
+                )
+                .into());
+            }
             Device::Cuda => gibbs_engine::graph::cuda::device_name(),
             Device::Rocm => gibbs_engine::graph::rocm::device_name(),
             Device::Xla => gibbs_engine::graph::xla::device_name(),

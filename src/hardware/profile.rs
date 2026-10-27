@@ -34,6 +34,7 @@ impl HardwareProfile {
     pub fn for_device(device: Device) -> Self {
         match device {
             Device::Metal => Self::detect_metal(),
+            Device::Ane => Self::detect_ane(),
             Device::Cpu => Self::detect_cpu(),
             Device::Cuda => Self {
                 device: Device::Cuda,
@@ -178,6 +179,28 @@ impl HardwareProfile {
             has_unified_memory: true,
             compute_capability: None,
             max_systolic_tile: None,
+        }
+    }
+
+    /// The Neural Engine shares the GPU's unified memory; cores come from the cached ANE probe.
+    fn detect_ane() -> Self {
+        #[cfg(target_os = "macos")]
+        let probed = crate::graph::ane::probe().ok().map(|i| {
+            (
+                format!("Apple Neural Engine ({}-core {})", i.cores, i.arch),
+                i.cores as usize,
+            )
+        });
+        #[cfg(not(target_os = "macos"))]
+        let probed: Option<(String, usize)> = None;
+        let (name, compute_units) =
+            probed.unwrap_or_else(|| ("Apple Neural Engine (unavailable)".to_string(), 0));
+        Self {
+            device: Device::Ane,
+            name,
+            compute_units,
+            max_systolic_tile: None,
+            ..Self::detect_metal()
         }
     }
 

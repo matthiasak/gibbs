@@ -638,37 +638,7 @@ pub fn run(
                             if freq == 0.0 && *mscale == 1.0 {
                                 continue;
                             }
-                            let p = match variant {
-                                super::RopeVariant::MRope {
-                                    sections,
-                                    interleaved,
-                                    ..
-                                } => {
-                                    let p_t = pos.get(seq_idx * 3).copied().unwrap_or(0);
-                                    let p_h = pos.get(seq_idx * 3 + 1).copied().unwrap_or(0);
-                                    let p_w = pos.get(seq_idx * 3 + 2).copied().unwrap_or(0);
-                                    if *interleaved {
-                                        if j % 3 == 1 && (j as u32) < 3 * sections[1] {
-                                            p_h
-                                        } else if j % 3 == 2 && (j as u32) < 3 * sections[2] {
-                                            p_w
-                                        } else {
-                                            p_t
-                                        }
-                                    } else {
-                                        let s0 = sections[0] as usize;
-                                        let s1 = sections[1] as usize;
-                                        if j < s0 {
-                                            p_t
-                                        } else if j < s0 + s1 {
-                                            p_h
-                                        } else {
-                                            p_w
-                                        }
-                                    }
-                                }
-                                _ => pos.get(seq_idx).copied().unwrap_or(0),
-                            };
+                            let p = rope_position(variant, pos, seq_idx, j);
 
                             let theta = (p as f32) * freq;
                             let cos = theta.cos() * *mscale;
@@ -2492,6 +2462,47 @@ fn attention_general(
         }
     }
     out
+}
+
+/// Position of row `row` that rotates frequency `j` of an `Op::Rope`: MRope picks the temporal,
+/// height or width position of the row's `[t, h, w]` triple by section.
+pub(crate) fn rope_position(
+    variant: &super::RopeVariant,
+    pos: &[u32],
+    row: usize,
+    j: usize,
+) -> u32 {
+    match variant {
+        super::RopeVariant::MRope {
+            sections,
+            interleaved,
+            ..
+        } => {
+            let p_t = pos.get(row * 3).copied().unwrap_or(0);
+            let p_h = pos.get(row * 3 + 1).copied().unwrap_or(0);
+            let p_w = pos.get(row * 3 + 2).copied().unwrap_or(0);
+            if *interleaved {
+                if j % 3 == 1 && (j as u32) < 3 * sections[1] {
+                    p_h
+                } else if j % 3 == 2 && (j as u32) < 3 * sections[2] {
+                    p_w
+                } else {
+                    p_t
+                }
+            } else {
+                let s0 = sections[0] as usize;
+                let s1 = sections[1] as usize;
+                if j < s0 {
+                    p_t
+                } else if j < s0 + s1 {
+                    p_h
+                } else {
+                    p_w
+                }
+            }
+        }
+        _ => pos.get(row).copied().unwrap_or(0),
+    }
 }
 
 /// HF `_relative_position_bucket` of `rel = key_pos - query_pos` (f32 log with an f64 scale,
