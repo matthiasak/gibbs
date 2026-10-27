@@ -86,6 +86,9 @@ pub struct GraphProgram {
     pub plan: PlacementPlan,
     pub primary_device: Device,
     pub state: StateStore,
+    /// The pages of the program's paged KV states ([`crate::kv`]); every run attaches a view of it
+    /// to [`Self::state`].
+    pub kv_pool: Option<std::sync::Arc<crate::kv::KvPool>>,
     pub graph_inputs: Vec<ValueId>,
     pub graph_outputs: Vec<ValueId>,
     /// [`Self::stream_next`]'s argmax graph and plan, with the `valid` they were built for.
@@ -236,12 +239,19 @@ impl GraphProgram {
 
         let graph_inputs = graph.inputs.clone();
         let graph_outputs = graph.outputs.clone();
+        let paged = crate::graph::paged_states(&graph);
+        #[allow(unused_mut)]
+        let mut kv_pool = None;
         let segment = match primary_device {
             #[cfg(target_os = "macos")]
             Device::Metal if !plan.segments.is_empty() => {
                 let rt = crate::graph::metal::Runtime::shared()?;
                 let active = (!keep_folded).then_some(&graph);
-                let session = crate::graph::metal::Session::new_for_graph(rt, &weights, active)?;
+                let mut session =
+                    crate::graph::metal::Session::new_for_graph(rt, &weights, active)?;
+                if !paged.is_empty() {
+                    kv_pool = Some(session.new_kv_pool(&paged)?);
+                }
                 let prepared_plan = session.prepare_plan(&graph)?;
                 CompiledSegment::Metal {
                     graph,
@@ -272,11 +282,14 @@ impl GraphProgram {
             _ => CompiledSegment::Cpu { graph, weights },
         };
 
+        let kv_pool =
+            kv_pool.or_else(|| (!paged.is_empty()).then(|| crate::kv::KvPool::host(&paged)));
         let prog = Self {
             segment,
             plan,
             primary_device,
             state: StateStore::new(),
+            kv_pool,
             graph_inputs,
             graph_outputs,
             #[cfg(target_os = "macos")]
@@ -297,6 +310,23 @@ impl GraphProgram {
             CompiledSegment::Cpu { graph, .. } => graph.nodes.len(),
             _ => 0,
         }
+    }
+
+    /// Gives [`Self::state`] a view of the program's KV pool when it has none (a fresh state);
+    /// a view of another program's pool is kept when that pool pages this program's states alike
+    /// (separately compiled instances of one network sharing a state), else this errs.
+    fn attach_kv(&mut self) -> Result<(), String> {
+        let Some(pool) = &self.kv_pool else {
+            return Ok(());
+        };
+        match &self.state.kv {
+            None => self.state.kv = Some(crate::kv::KvView::new(pool.clone())),
+            Some(v) if !std::sync::Arc::ptr_eq(v.pool(), pool) && !v.pool().covers(pool) => {
+                return Err("this state holds another program's KV pages".into())
+            }
+            Some(_) => {}
+        }
+        Ok(())
     }
 
     /// Names of the program's recurrent states (`Graph::state(.., recurrent: true)`): those
@@ -389,6 +419,7 @@ impl GraphProgram {
     ) -> Result<Vec<Tensor>, String> {
         #[cfg(test)]
         crate::graph::shape::note(graph);
+        self.attach_kv()?;
         let shapes: Vec<Vec<usize>> = graph
             .inputs
             .iter()
@@ -458,7 +489,7 @@ impl GraphProgram {
                 inputs.len()
             ));
         }
-
+        self.attach_kv()?;
         match &mut self.segment {
             CompiledSegment::Cpu { graph, weights } => {
                 cpu::run(graph, weights, &mut self.state, inputs)
@@ -501,6 +532,7 @@ impl GraphProgram {
             self.stream_end()?;
             return Ok(None);
         }
+        self.attach_kv()?;
         let CompiledSegment::Metal { graph, session, .. } = &self.segment else {
             return Ok(None);
         };
@@ -596,6 +628,7 @@ impl GraphProgram {
             self.stream_end()?;
             return Ok(None);
         }
+        self.attach_kv()?;
         if let Some(s) = self.state.stream.0.as_deref() {
             if pos != s.next_pos || last != s.last || s.sample_spec.is_none() {
                 self.stream_end()?;
@@ -1046,7 +1079,6 @@ mod tests {
         for dev in [
             Device::Cuda,
             Device::Rocm,
-            Device::Xla,
             Device::IntelXpu,
             Device::Extropic,
         ] {

@@ -356,12 +356,13 @@ impl SpecEncDec {
     }
 
     /// A copy of `b` that continues independently: encoder-handed states are shared, the filled
-    /// rows of the others copied.
+    /// rows of the others copied, paged KV shared by page ([`crate::kv::KvView::fork`]).
     fn fork(&self, b: &Beam) -> Result<Beam, String> {
         // ponytail: on the CPU the host buffers (cross states included) are deep-copied per fork;
         // share them behind an `Arc` if CPU beam search memory matters.
         let mut state = StateStore::new();
         state.buffers = b.state.buffers.clone();
+        state.kv = b.state.kv.as_ref().map(|v| v.fork(b.len)).transpose()?;
         #[cfg(target_os = "macos")]
         if !b.state.metal_buffers.is_empty() {
             state.metal_f16 = b.state.metal_f16.clone();

@@ -697,8 +697,105 @@ impl Tensor {
     }
 }
 
+/// A paged KV state ([`crate::kv`]): `[rows, row_width]` rows stored in pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagedState {
+    pub name: String,
+    pub row_width: usize,
+    /// The attention window of every reader (`None`: full attention, or readers disagree).
+    pub window: Option<usize>,
+}
+
+/// The graph's paged KV states: non-recurrent 2-D states every reader of which is the k or v
+/// state operand of a `CachedAttention`, the two states of each such node both qualifying.
+/// Everything else (recurrent conv/ssm, `StateWrite` targets, states another op reads such as
+/// cross-attention `xk`/`xv`, graph outputs) stays a contiguous per-sequence buffer.
+pub fn paged_states(graph: &Graph) -> Vec<PagedState> {
+    use std::collections::{BTreeMap, HashSet};
+    let state_name = |v: ValueId| match &graph.value(v).kind {
+        ValueKind::State { name, recurrent } => Some((name.as_str(), *recurrent)),
+        _ => None,
+    };
+    // name -> (row width, windows of its readers)
+    let mut found: BTreeMap<&str, (usize, Vec<Option<usize>>)> = BTreeMap::new();
+    let mut bad: HashSet<&str> = HashSet::new();
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    for node in &graph.nodes {
+        let attn = match node.op {
+            Op::CachedAttention { window, .. } if node.inputs.len() >= 6 => Some(window),
+            _ => None,
+        };
+        if attn.is_some() {
+            if let (Some((k, _)), Some((v, _))) =
+                (state_name(node.inputs[3]), state_name(node.inputs[4]))
+            {
+                pairs.push((k, v));
+            }
+        }
+        for (i, &x) in node.inputs.iter().enumerate() {
+            let Some((name, recurrent)) = state_name(x) else {
+                continue;
+            };
+            let shape = &graph.value(x).shape;
+            match attn {
+                Some(window) if (i == 3 || i == 4) && !recurrent && shape.len() == 2 => {
+                    let e = found.entry(name).or_insert((shape[1], Vec::new()));
+                    if e.0 != shape[1] {
+                        bad.insert(name);
+                    }
+                    e.1.push(window);
+                }
+                _ => {
+                    bad.insert(name);
+                }
+            }
+        }
+    }
+    for &o in &graph.outputs {
+        if let Some((name, _)) = state_name(o) {
+            bad.insert(name);
+        }
+    }
+    let window_of = |ws: &[Option<usize>]| match ws.first() {
+        Some(&w) if ws.iter().all(|&x| x == w) => w,
+        _ => None,
+    };
+    let mut window: BTreeMap<&str, Option<usize>> =
+        found.iter().map(|(n, (_, ws))| (*n, window_of(ws))).collect();
+    // A node's two states are read by one kernel: both paged with one window, or neither.
+    loop {
+        let mut changed = false;
+        for &(k, v) in &pairs {
+            if bad.contains(k) != bad.contains(v) {
+                bad.insert(k);
+                bad.insert(v);
+                changed = true;
+            }
+            if window.get(k) != window.get(v) {
+                for n in [k, v] {
+                    if let Some(w) = window.get_mut(n) {
+                        changed |= w.take().is_some();
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    found
+        .into_iter()
+        .filter(|(n, _)| !bad.contains(n))
+        .map(|(n, (row_width, _))| PagedState {
+            name: n.to_string(),
+            row_width,
+            window: window[n],
+        })
+        .collect()
+}
+
 /// Persistent state buffers mapped by name for sequential / autoregressive decoding.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct StateStore {
     pub buffers: HashMap<String, Tensor>,
     #[cfg(target_os = "macos")]
@@ -710,6 +807,8 @@ pub struct StateStore {
     /// The greedy decode stream in flight on this state, if any (a clone starts without one).
     #[cfg(target_os = "macos")]
     pub stream: crate::graph::metal::StreamSlot,
+    /// The paged KV states' page tables ([`crate::kv`]); the program attaches it on first run.
+    pub kv: Option<crate::kv::KvView>,
 }
 
 impl StateStore {
@@ -753,9 +852,13 @@ impl StateStore {
         std::iter::empty()
     }
 
-    /// Device buffer `name` as f32 (f16 buffers are widened).
+    /// Device buffer `name` as f32 (f16 buffers are widened); a paged state gathers its stored
+    /// rows through its page table.
     #[cfg(target_os = "macos")]
     pub fn read_metal(&self, name: &str) -> Option<Vec<f32>> {
+        if let Some(v) = self.kv.as_ref().filter(|v| v.has(name)) {
+            return v.gather(name);
+        }
         let (buf, n) = self.metal_buffers.get(name)?;
         // SAFETY: shared-storage buffer of `n` elements of the recorded type; programs run
         // synchronously, so the GPU is idle.
@@ -771,10 +874,14 @@ impl StateStore {
         })
     }
 
-    /// Copies of the named states (device-resident ones are read back from their buffers).
+    /// Copies of the named states (device-resident ones are read back from their buffers);
+    /// paged KV states are skipped (they fork by page instead, [`Self::fork`]).
     pub fn snapshot(&self, names: &[&str]) -> HashMap<String, Tensor> {
         let mut snap = HashMap::new();
         for &name in names {
+            if self.kv.as_ref().is_some_and(|v| v.has(name)) {
+                continue;
+            }
             #[cfg(target_os = "macos")]
             if let Some(v) = self.read_metal(name) {
                 snap.insert(name.to_string(), Tensor::F32(v));
@@ -834,39 +941,40 @@ impl StateStore {
         }
     }
 
-    /// Deep-forks this `StateStore` so a new sequence sharing a cached token prefix gets its own
-    /// independent CPU and Metal KV/state buffers without aliasing the cached snapshot.
-    pub fn fork_prefix(&self) -> Self {
-        let buffers = self.buffers.clone();
+    /// An independent copy holding positions `..len`: contiguous states (host and device) are
+    /// copied whole, paged KV shares this store's pages ([`crate::kv::KvView::fork`]).
+    pub fn fork(&self, len: usize) -> Result<Self, String> {
         #[cfg(target_os = "macos")]
-        let (metal_buffers, metal_f16) = {
+        let metal_buffers = {
             let mut mb = HashMap::with_capacity(self.metal_buffers.len());
-            if let Some(dev) = ::metal::Device::system_default() {
-                for (name, (src_buf, n)) in &self.metal_buffers {
-                    let byte_len = src_buf.length();
-                    let dst_buf =
-                        dev.new_buffer(byte_len, ::metal::MTLResourceOptions::StorageModeShared);
+            if !self.metal_buffers.is_empty() {
+                let dev = crate::graph::metal::system_device()?;
+                for (name, (src, n)) in &self.metal_buffers {
+                    let bytes = src.length() as usize;
+                    let dst = crate::graph::metal::new_shared_buffer(&dev, bytes)?;
+                    // SAFETY: two shared buffers of `bytes` bytes; programs run synchronously.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            src_buf.contents() as *const u8,
-                            dst_buf.contents() as *mut u8,
-                            byte_len as usize,
-                        );
-                    }
-                    mb.insert(name.clone(), (std::sync::Arc::new(dst_buf), *n));
+                            src.contents() as *const u8,
+                            dst.contents() as *mut u8,
+                            bytes,
+                        )
+                    };
+                    mb.insert(name.clone(), (std::sync::Arc::new(dst), *n));
                 }
             }
-            (mb, self.metal_f16.clone())
+            mb
         };
-        Self {
-            buffers,
+        Ok(Self {
+            buffers: self.buffers.clone(),
             #[cfg(target_os = "macos")]
             metal_buffers,
             #[cfg(target_os = "macos")]
-            metal_f16,
+            metal_f16: self.metal_f16.clone(),
             #[cfg(target_os = "macos")]
             stream: crate::graph::metal::StreamSlot::default(),
-        }
+            kv: self.kv.as_ref().map(|v| v.fork(len)).transpose()?,
+        })
     }
 }
 
