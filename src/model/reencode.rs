@@ -381,7 +381,8 @@ pub fn classify_tensor(
     if is_lm_head_name(name) {
         return TensorRole::LmHead;
     }
-    let ffn_sub = ["mlp", "ffn", "feed_forward"]
+    // `.fc1.` / `.fc2.`: OPT-style feed-forward layers outside an `mlp` scope.
+    let ffn_sub = ["mlp", "ffn", "feed_forward", ".fc1.", ".fc2."]
         .iter()
         .any(|s| name.contains(s));
     if ffn_sub {
@@ -619,18 +620,18 @@ fn encode_blocks(
         .map_or(2, |n| n.get())
         .saturating_sub(1)
         .max(1);
-    // Runs of rows, not the whole tensor, and blocks kept only for the format that is stored: the
-    // allocator keeps freed large blocks resident, so whole-tensor trial buffers (decoded source,
-    // round trip, rejected blocks) would stay in the process's resident memory after the load.
+    // Runs of rows, not the whole tensor, and one trial's blocks alive at a time: the allocator
+    // keeps freed large blocks resident, so whole-tensor trial buffers (decoded source, round trip)
+    // would stay in the process's resident memory after the load.
     let run = (TRIAL_VALUES / cols).max(1);
     let mut x = vec![0.0f32; run.min(rows) * cols];
-    // `f`'s relative RMSE over the tensor, and with `keep` its blocks (`None`: no block format).
-    let mut encode = |f: Q, keep: bool| {
+    // `f`'s relative RMSE over the tensor and its blocks (`None`: no block format).
+    let mut encode = |f: Q| {
         if is_float(f) {
             return (0.0, None);
         }
         let mut err = (0.0, 0.0);
-        let mut blocks = keep.then(|| Vec::with_capacity(rows * f.tensor_bytes(cols)));
+        let mut blocks = Vec::with_capacity(rows * f.tensor_bytes(cols));
         for part in raw.chunks(run * row_bytes) {
             let x = &mut x[..part.len() / block_bytes * elems];
             for (b, out) in part
@@ -641,13 +642,12 @@ fn encode_blocks(
             }
             let w = encode_weight(x, cols, x.len() / cols, f, threads);
             add_sq_err(&mut err, x, &dequantize_gguf_blocks(f, &w).unwrap());
-            if let Some(b) = &mut blocks {
-                b.extend_from_slice(&w);
-            }
+            blocks.extend_from_slice(&w);
         }
-        (rmse_of(err), blocks)
+        (rmse_of(err), Some(blocks))
     };
-    let (mut f, mut rmse) = (f, encode(f, false).0);
+    let (mut rmse, mut blocks) = encode(f);
+    let mut f = f;
     let policy = cfg.policy;
     let role = classify_tensor(name, None, cfg.total_layers);
     let limit = match (policy, role) {
@@ -665,7 +665,10 @@ fn encode_blocks(
         let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else {
             break;
         };
-        (f, rmse) = (next, encode(next, false).0);
+        // The rejected trial's blocks go before the next trial allocates its own.
+        drop(blocks.take());
+        f = next;
+        (rmse, blocks) = encode(next);
     }
     // The RMSE bump may have walked past the source's own cost (Q4_K -> Q4_0 failing the gate lands on
     // Q5_K, bigger and slower than what was stored): then the stored blocks stay.
@@ -678,7 +681,7 @@ fn encode_blocks(
         return None;
     }
     // A float target stores no blocks.
-    let blocks = encode(f, true).1?;
+    let blocks = blocks?;
     let mut stats = NATIVE_STATS.lock();
     stats.reencoded += 1;
     (stats.bytes_before, stats.bytes_after) = (
@@ -855,7 +858,8 @@ pub fn choice_key(
             ReencodePolicy::MaxSpeed | ReencodePolicy::LowBitNative
         )
     {
-        for f in LADDER {
+        // Every format `rule_with` weighs by rate: the ladder and Q4_0.
+        for f in LADDER.into_iter().chain([Q::GGUF_Q4_0]) {
             let bits = crate::model::variant::host_gbps(f).map_or(0, f64::to_bits);
             h = (h ^ bits).wrapping_mul(0x100000001b3);
         }

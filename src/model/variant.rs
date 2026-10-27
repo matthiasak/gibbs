@@ -124,6 +124,11 @@ fn gathered(name: &str, untied_head: bool) -> bool {
     name.contains("per_layer_token_embd")
         || name.contains("embed_tokens_per_layer")
         || name.contains("position_embd")
+        || name.contains("ple_embedding")
+        || name.contains("embed_positions")
+        || name.contains("position_embeddings")
+        || name.contains("token_type_embeddings")
+        || name.contains("rel_embeddings")
         || name.starts_with("wpe.")
         || name.contains("vision")
         || name.contains("visual")
@@ -143,6 +148,7 @@ pub fn expert_frac_from_config(cfg: &serde_json::Value) -> Option<f64> {
         .get("num_experts_per_tok")
         .or_else(|| tc.get("num_selected_experts"))
         .or_else(|| tc.get("top_k"))
+        .or_else(|| tc.get("top_k_experts"))
         .and_then(|v| v.as_f64())?;
     let total = tc
         .get("num_local_experts")
@@ -247,16 +253,17 @@ impl WeightHeader {
             .iter()
             .any(|t| t.name == "output.weight" || t.name.ends_with("lm_head.weight"));
         self.tensors.iter().filter(move |t| {
-            (t.ndim == 2
-                || (t.ndim == 3 && (t.name.contains("exps") || t.name.contains(".experts."))))
-                && !gathered(&t.name, untied)
+            (t.ndim == 2 || Self::expert_bank(t)) && !gathered(&t.name, untied)
         })
     }
 
+    /// An MoE expert bank (or one expert's matrix): a token reads `expert_frac` of it.
+    fn expert_bank(t: &HeaderTensor) -> bool {
+        t.ndim >= 2 && (t.name.contains(".experts.") || t.name.contains("exps"))
+    }
+
     fn scale(&self, t: &HeaderTensor) -> f64 {
-        if (t.ndim == 3 && (t.name.contains("exps") || t.name.contains(".experts.")))
-            || (t.ndim == 2 && t.name.contains(".experts."))
-        {
+        if Self::expert_bank(t) {
             self.expert_frac
         } else {
             1.0
@@ -633,7 +640,8 @@ fn fnv1a(parts: &[&str]) -> u64 {
 }
 
 /// The header of `file` in Hub repo `repo_id` (`org/repo[@rev]`): cached under
-/// `~/.cache/gibbs/hub-headers/` by `(repo, file, etag)`, else range requests.
+/// `~/.cache/gibbs/hub-headers/` by `(repo, file, etag)`, else range requests. A safetensors
+/// file's `expert_frac` comes from the `config.json` beside it, as for a local file.
 pub fn fetch_remote_header(
     repo_id: &str,
     file: &str,
@@ -646,8 +654,9 @@ pub fn fetch_remote_header(
     );
     let (etag, size) = head(&url, token)?;
     let cache = default_cache_dir().ok().map(|d| {
+        // `expert_frac`: headers cached before the config was read carry 1.0.
         d.join("hub-headers")
-            .join(format!("{:016x}.json", fnv1a(&[repo, file, &etag])))
+            .join(format!("{:016x}.json", fnv1a(&[repo, file, &etag, "expert_frac"])))
     });
     if let Some(h) = cache
         .as_ref()
@@ -656,13 +665,24 @@ pub fn fetch_remote_header(
     {
         return Ok(h);
     }
-    let h = read_header(file, size, |start, len| {
+    let mut h = read_header(file, size, |start, len| {
         curl(
             &["-r".into(), format!("{start}-{}", start + len - 1)],
             &url,
             token,
         )
     })?;
+    if file.ends_with(".safetensors") && h.expert_frac == 1.0 {
+        // The file's own directory in the repo, as `read_local_header` reads it.
+        let cfg_url = format!("{}/config.json", url.rsplit_once('/').map_or("", |(d, _)| d));
+        if let Some(ef) = curl(&[], &cfg_url, token)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|cfg| expert_frac_from_config(&cfg))
+        {
+            h.expert_frac = ef;
+        }
+    }
     if let Some(p) = cache {
         let tmp = p.with_extension("tmp");
         let saved = p
