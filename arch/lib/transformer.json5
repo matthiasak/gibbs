@@ -5,6 +5,8 @@
 // every bias is optional (`w?:`). Activation names (`act`) are `graph::UnaryKind` variants.
 {
   macros: {
+    // `[x]` unchanged under another name (no node).
+    alias: {params: ["x"], body: [], returns: "x"},
     // RMSNorm with gain `{w}.weight`.
     rms_norm: {params: ["x"], body: [
       {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{w}.weight"], out: "out"},

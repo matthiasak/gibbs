@@ -83,7 +83,7 @@
   },
   components: {
     precompute: {body: [
-      {op: "Unary", args: {kind: {Scale: 1}}, in: ["w:deberta.encoder.rel_embeddings.weight"], out: "rel", name: "rel", when: "!norm_rel"},
+      {use: "alias", in: ["w:deberta.encoder.rel_embeddings.weight"], out: "rel", when: "!norm_rel"},
       {use: "layer_norm", args: {w: "'deberta.encoder.LayerNorm'"}, in: ["w:deberta.encoder.rel_embeddings.weight"], out: "rel",
        name: "rel_ln", when: "norm_rel"},
       {repeat: "i", count: "layers", body: [
@@ -137,9 +137,8 @@
         {op: "Linear", in: ["c", "w:pooler.dense.weight", "w?:pooler.dense.bias"], out: "c", name: "pool.dense", when: "head == 'classify'"},
         {op: "Unary", args: {kind: "GeluErf"}, in: ["c"], out: "c", name: "pool.act", when: "head == 'classify'"},
         {op: "Linear", in: ["c", "w:classifier.weight", "w?:classifier.bias"], out: "logits", name: "cls.out", when: "head == 'classify'"},
-        {op: "Unary", args: {kind: {Scale: 1}}, in: ["x"], out: "hidden", name: "hidden", when: "head == 'hidden'"},
       ],
-      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", when: "head == 'hidden'"}],
+      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", value: "x", when: "head == 'hidden'"}],
     },
   },
   // DebertaConverter (v1 only; v2 needs its tokenizer.json): `[CLS] A [SEP] B [SEP]`.

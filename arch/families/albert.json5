@@ -60,9 +60,8 @@
         {op: "Linear", in: ["c", "w:albert.pooler.weight", "w?:albert.pooler.bias"], out: "c", name: "pooler", when: "head == 'classify'"},
         {op: "Unary", args: {kind: "Tanh"}, in: ["c"], out: "c", name: "pooler.act", when: "head == 'classify'"},
         {op: "Linear", in: ["c", "w:classifier.weight", "w?:classifier.bias"], out: "logits", name: "classifier", when: "head == 'classify'"},
-        {op: "Unary", args: {kind: {Scale: 1}}, in: ["x"], out: "hidden", name: "hidden", when: "head == 'hidden'"},
       ],
-      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", when: "head == 'hidden'"}],
+      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", value: "x", when: "head == 'hidden'"}],
     },
   },
   // AlbertConverter, when a repo has no tokenizer.json.

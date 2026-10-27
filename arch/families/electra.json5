@@ -50,9 +50,8 @@
         {op: "Linear", in: ["c", "w:classifier.dense.weight", "w?:classifier.dense.bias"], out: "c", name: "cls.dense", when: "head == 'classify'"},
         {op: "Unary", args: {kind: "GeluErf"}, in: ["c"], out: "c", name: "cls.act", when: "head == 'classify'"},
         {op: "Linear", in: ["c", "w:classifier.out_proj.weight", "w?:classifier.out_proj.bias"], out: "logits", name: "cls.out", when: "head == 'classify'"},
-        {op: "Unary", args: {kind: {Scale: 1}}, in: ["x"], out: "hidden", name: "hidden", when: "head == 'hidden'"},
       ],
-      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", when: "head == 'hidden'"}],
+      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", value: "x", when: "head == 'hidden'"}],
     },
   },
 }
