@@ -642,7 +642,10 @@ impl SpecLm {
         }
         let stored = end - seq.state.kv.as_ref().map_or(0, |kv| kv.evicted);
         if stored > self.ctx {
-            return Err(format!("{stored} KV rows exceed the context of {} rows", self.ctx));
+            return Err(format!(
+                "{stored} KV rows exceed the context of {} rows",
+                self.ctx
+            ));
         }
         if end <= seq.len {
             // A block ran ahead: its end's logits answer every position inside it.
@@ -1016,6 +1019,10 @@ impl NativeLm for SpecLm {
         self.drain_stream(seq)
     }
 
+    fn recurrent(&self) -> bool {
+        !self.recurrent.is_empty()
+    }
+
     fn forward_all(
         &self,
         tokens: &[u32],
@@ -1194,11 +1201,22 @@ impl NativeLm for SpecLm {
         if seq.recurrent_ahead || self.contiguous.iter().any(|n| !self.recurrent.contains(n)) {
             return Err("this model's state cannot drop KV pages".into());
         }
-        let kv = seq.state.kv.as_mut().ok_or("this model's KV is not paged")?;
+        let kv = seq
+            .state
+            .kv
+            .as_mut()
+            .ok_or("this model's KV is not paged")?;
         kv.release_from(seq.len);
         // ponytail: half of the non-sink page budget recent, half heaviest keys; tune with evals.
-        let recent = (target_rows / crate::kv::PAGE_TOKENS).saturating_sub(1).div_ceil(2);
-        Ok(crate::compact::snapkv::evict_pages(kv, target_rows, 1, recent))
+        let recent = (target_rows / crate::kv::PAGE_TOKENS)
+            .saturating_sub(1)
+            .div_ceil(2);
+        Ok(crate::compact::snapkv::evict_pages(
+            kv,
+            target_rows,
+            1,
+            recent,
+        ))
     }
 
     fn radix_key(&self, state: &SeqState, ids: &[u32]) -> Vec<u32> {
@@ -1211,9 +1229,11 @@ impl NativeLm for SpecLm {
         if let Some((_, w, rows)) = seq.rows.first() {
             for (i, &q) in seq.media.media_index.iter().enumerate() {
                 let h = rows.get(i * w..(i + 1) * w).map_or(0x811c_9dc5u32, |r| {
-                    r.iter().flat_map(|x| x.to_bits().to_le_bytes()).fold(0x811c_9dc5u32, |h, b| {
-                        (h ^ b as u32).wrapping_mul(0x0100_0193)
-                    })
+                    r.iter()
+                        .flat_map(|x| x.to_bits().to_le_bytes())
+                        .fold(0x811c_9dc5u32, |h, b| {
+                            (h ^ b as u32).wrapping_mul(0x0100_0193)
+                        })
                 });
                 if let Some(k) = key.get_mut(q as usize) {
                     *k = 0x8000_0000 | (h.wrapping_add(i as u32) & 0x7fff_ffff);

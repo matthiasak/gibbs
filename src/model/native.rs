@@ -127,6 +127,12 @@ pub trait NativeLm: Send + Sync {
         Ok(())
     }
 
+    /// Whether the state holds recurrent layers: a decode stream's in-flight token then cannot
+    /// be taken back, so a sequence that may verify drafts later must not stream.
+    fn recurrent(&self) -> bool {
+        false
+    }
+
     // Speculative decoding (see `crate::scheduler::spec`): a model supports it by verifying
     // several positions in one pass and rewinding the ones the target rejects.
 

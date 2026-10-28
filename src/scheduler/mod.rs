@@ -237,8 +237,13 @@ impl ExecutableModel {
     }
 
     /// [`NativeLm::kv_evict`].
-    pub fn kv_evict(&self, state: &mut Option<SeqState>, target_rows: usize) -> Result<usize, String> {
-        self.0.kv_evict(state.as_mut().ok_or(NO_STATE)?, target_rows)
+    pub fn kv_evict(
+        &self,
+        state: &mut Option<SeqState>,
+        target_rows: usize,
+    ) -> Result<usize, String> {
+        self.0
+            .kv_evict(state.as_mut().ok_or(NO_STATE)?, target_rows)
     }
 
     /// Expands `ids` for the model ([`NativeLm::prepare_ctx`], media allowed) and builds the
@@ -1006,7 +1011,9 @@ impl ContinuousBatchScheduler {
         let n = ids.len();
         // Positions, not stored rows: past `--ctx` rows Tier 4 may evict, else the step ends it.
         if let Some(m) = &model {
-            params.max_new_tokens = params.max_new_tokens.min(m.max_positions().saturating_sub(n));
+            params.max_new_tokens = params
+                .max_new_tokens
+                .min(m.max_positions().saturating_sub(n));
         }
         if let Some((t, p)) = tokenizer.sampling_defaults {
             params.temperature.get_or_insert(t);
@@ -1195,14 +1202,20 @@ impl ContinuousBatchScheduler {
             .as_ref()
             .and_then(ExecutableModel::context_len)
             .unwrap_or(usize::MAX);
-        let max_positions = model.as_ref().map_or(context_len, ExecutableModel::max_positions);
+        let max_positions = model
+            .as_ref()
+            .map_or(context_len, ExecutableModel::max_positions);
         let tier4 = {
             use crate::compact::CompactionMode::{Aggressive, Auto};
             let (mode, target) = *self.tier4.lock();
             (matches!(mode, Auto | Aggressive) && max_positions > context_len)
                 .then(|| (context_len as f32 * target) as usize)
         };
-        let pos_limit = if tier4.is_some() { max_positions } else { context_len };
+        let pos_limit = if tier4.is_some() {
+            max_positions
+        } else {
+            context_len
+        };
         self.step_counter.fetch_add(1, Ordering::Relaxed);
         let decoding = active.iter().any(|s| s.state == SequenceState::Decoding);
         let prefill_budget = self.prefill_tuner.lock().budget(decoding);
@@ -1403,7 +1416,8 @@ impl ContinuousBatchScheduler {
                         }
                         r => {
                             if let Err(e) = r {
-                                self.telemetry.log_info(&format!("sequence {}: {e}", seq.id));
+                                self.telemetry
+                                    .log_info(&format!("sequence {}: {e}", seq.id));
                             }
                             let _ = seq.finish.set(FinishReason::Length);
                             seq.state = SequenceState::Finished;
@@ -1427,7 +1441,10 @@ impl ContinuousBatchScheduler {
                         .min(limit.saturating_sub(all.len()))
                 });
                 // Pages for the positions this step may add (cached prefixes evicted first).
-                if let Some(Err(e)) = pool.as_ref().map(|p| p.ensure_free(1 + spec_k.unwrap_or(0), false)) {
+                if let Some(Err(e)) = pool
+                    .as_ref()
+                    .map(|p| p.ensure_free(1 + spec_k.unwrap_or(0), false))
+                {
                     let _ = seq.finish.set(FinishReason::Error(e));
                     seq.state = SequenceState::Finished;
                     continue;
@@ -1435,6 +1452,12 @@ impl ContinuousBatchScheduler {
 
                 let started = Instant::now();
                 let logprobs = seq.params.top_logprobs;
+                // Tokens a device decode stream may queue: what the sequence may still emit or hold.
+                let stream_max = seq
+                    .params
+                    .max_new_tokens
+                    .saturating_sub(seq.output_tokens.len())
+                    .min(limit.saturating_sub(all.len()));
                 let result = match (spec_k, seq.spec.as_mut()) {
                     (Some(k), Some(sp)) => {
                         let vocab = tokenizer.vocab_size();
@@ -1447,6 +1470,7 @@ impl ContinuousBatchScheduler {
                             top_p,
                             vocab,
                             k,
+                            stream_max,
                             logprobs,
                         )
                         .map(|s| {
@@ -1483,10 +1507,7 @@ impl ContinuousBatchScheduler {
                             m.stream_token(
                                 last,
                                 all.len(),
-                                seq.params
-                                    .max_new_tokens
-                                    .saturating_sub(seq.output_tokens.len())
-                                    .min(limit.saturating_sub(all.len())),
+                                stream_max,
                                 temp,
                                 top_p,
                                 &mut seq.kv_cache,
@@ -1893,8 +1914,7 @@ mod tests {
         let model = cpu_exec(SHORT);
         let ctx = model.context_len().unwrap();
         assert_eq!(ctx, SHORT);
-        let scheduler =
-            ContinuousBatchScheduler::new("", Some(model));
+        let scheduler = ContinuousBatchScheduler::new("", Some(model));
         // Unclamped submit path: only the step's context check can stop this sequence.
         let (_, rx) = scheduler.submit_request_stream(vec![7u32; ctx - 12]);
         assert_eq!(run_to_completion(&scheduler, rx).len(), 12);
@@ -1914,7 +1934,10 @@ mod tests {
             let cpu = crate::hardware::PlacementMode::Pin(Device::Cpu);
             let lm = crate::runtime::lm::SpecLm::with_ctx(m, cpu, Some(stored)).unwrap();
             let s = ContinuousBatchScheduler::new("", Some(ExecutableModel::new(Arc::new(lm))));
-            s.set_compaction(&CompactionConfig { mode, ..Default::default() });
+            s.set_compaction(&CompactionConfig {
+                mode,
+                ..Default::default()
+            });
             let params = SamplingParams {
                 temperature: Some(0.0),
                 top_p: None,
@@ -1924,7 +1947,10 @@ mod tests {
             let (_, rx, ..) = s.submit_with_params(params, |_| vec![7u32; prompt]);
             assert_eq!(run_to_completion(&s, rx).len(), want - prompt, "{mode:?}");
             let logs = s.telemetry.get_recent_logs(500);
-            let evictions = logs.iter().filter(|l| l.message.contains("evicted")).count();
+            let evictions = logs
+                .iter()
+                .filter(|l| l.message.contains("evicted"))
+                .count();
             assert_eq!(evictions > 0, mode == CompactionMode::Auto, "{mode:?}");
         }
     }
@@ -1953,8 +1979,7 @@ mod tests {
         }
         let model = spec_model(SHORT, Device::Metal);
         assert_eq!(model.llm_backend(), Device::Metal);
-        let scheduler =
-            ContinuousBatchScheduler::new("", Some(model));
+        let scheduler = ContinuousBatchScheduler::new("", Some(model));
         let params = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -2123,7 +2148,11 @@ mod tests {
         // Turn one's sequence-end export holds its prompt and every reply token but the last.
         let reused = turn1.len() + reply.len() - 1;
         assert_eq!(finish.cached_tokens.load(Ordering::Relaxed), reused);
-        assert_eq!(step1.prefill.1, turn2.len() - reused, "only the new suffix is prefilled");
+        assert_eq!(
+            step1.prefill.1,
+            turn2.len() - reused,
+            "only the new suffix is prefilled"
+        );
         let mut got: Vec<u32> = std::iter::from_fn(|| rx2.try_recv().ok()).collect();
         got.extend(run_to_completion(&cached, rx2));
         assert_eq!(got, want, "prefix reuse diverged from a fresh prefill");

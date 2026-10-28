@@ -164,7 +164,8 @@ impl ExecutableModel {
 
 /// One decode step of a sequence whose model has run all of `all` but the last token: drafts up
 /// to `k` tokens (none when `k == 0`), verifies them with one target forward, and returns the
-/// tokens to emit. `vocab` is the tokenizer's vocabulary size (0 = all logits).
+/// tokens to emit. `vocab` is the tokenizer's vocabulary size (0 = all logits); a step without
+/// drafts streams on the device with at most `stream_max` tokens queued.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decode(
     m: &ExecutableModel,
@@ -175,6 +176,7 @@ pub(super) fn decode(
     top_p: f32,
     vocab: usize,
     k: usize,
+    stream_max: usize,
     top_logprobs: Option<usize>,
 ) -> Result<Step, String> {
     let last = *all.last().ok_or("empty sequence")?;
@@ -214,8 +216,18 @@ pub(super) fn decode(
         drafts
     };
     if drafts.is_empty() {
-        // Plain decode (no checkpoints); the drafter catches up on these taps next time.
-        let (t, lp) = m.step_token_with_kv(all, last, all.len(), temp, top_p, top_logprobs, kv)?;
+        // Plain decode (no checkpoints): the device stream, as without a drafter, unless a
+        // recurrent state could not take its in-flight token back before a later verify. The
+        // drafter catches up on these taps next time.
+        let streamed = if top_logprobs.is_none() && !m.0.recurrent() {
+            m.stream_token(last, all.len(), stream_max, temp, top_p, kv)?
+        } else {
+            None
+        };
+        let (t, lp) = match streamed {
+            Some(t) => (t, None),
+            None => m.step_token_with_kv(all, last, all.len(), temp, top_p, top_logprobs, kv)?,
+        };
         spec.pending.extend(m.take_taps(kv));
         spec.synced = false;
         return Ok(Step {
@@ -446,17 +458,19 @@ fn draw(p: &[(u32, f32)], u: f64) -> u32 {
 }
 
 /// Picks `k` from measured throughput (output tokens per second of decode time; `k = 0` is plain
-/// decoding, which skips the drafter and the checkpointing verify). It measures every `k` until
-/// the sample is [`Acc::decisive`], runs the fastest, and then sticks with it: every so often it
-/// probes another `k` and switches only if the probe, measured decisively too, beat the current
-/// `k`'s recent rate (a probe that is losing after [`PLAIN_STEPS`] steps just ends). Rates are
-/// total tokens over total time, never a mean of per-step rates: a drafting step's tokens swing
-/// with how many drafts were accepted, and a few lucky steps must not flip the choice. Comparing
-/// two rates measured moments apart keeps host-load drift from flipping it either. Probes rotate
-/// over the neighbours of the current `k` and plain decoding (or, from plain decoding, the `k`
-/// that rated best so far), so a stale rate never keeps a losing `k` running. The probe interval
-/// doubles, up to [`MAX_EXPLORE`] steps, while probes lose and drops to [`MIN_EXPLORE`] when one
-/// wins, so a losing drafter settles at a small fraction of plain decoding's cost.
+/// decoding, which skips the drafter and the checkpointing verify). It measures plain decoding,
+/// then every drafting `k` until the sample is [`Acc::decisive`] (or, like a probe, already loses
+/// to plain decoding after [`PLAIN_STEPS`] steps), runs the fastest, and then sticks with it:
+/// every so often it probes another `k` and switches only if the probe, measured decisively too,
+/// beat the current `k`'s recent rate (a probe that is losing after [`PLAIN_STEPS`] steps just
+/// ends). Rates are total tokens over total time, never a mean of per-step rates: a drafting
+/// step's tokens swing with how many drafts were accepted, and a few lucky steps must not flip
+/// the choice. Comparing two rates measured moments apart keeps host-load drift from flipping it
+/// either. Probes rotate over the neighbours of the current `k` and plain decoding (or, from
+/// plain decoding, the `k` that rated best so far), so a stale rate never keeps a losing `k`
+/// running. The probe interval doubles, up to [`MAX_EXPLORE`] steps, while probes lose and drops
+/// to [`MIN_EXPLORE`] when one wins, so a losing drafter settles at a small fraction of plain
+/// decoding's cost.
 #[derive(Default)]
 pub struct KTuner {
     /// Per `k`, EWMA (tokens, seconds) per step: current for the `k` being run, as of its last
@@ -464,7 +478,7 @@ pub struct KTuner {
     avg: Vec<(f64, f64)>,
     /// Per `k`, EWMA (accepted, drafted) per step for acceptance-rate gating.
     avg_accept: Vec<(f64, f64)>,
-    /// Per `k`, the first measurement, until every `k` has a decisive one.
+    /// Per `k`, the first measurement, until every `k` has a decisive (or losing) one.
     sweep: Vec<Acc>,
     /// The `k` being run, once every `k` was measured.
     cur: Option<usize>,
@@ -550,11 +564,8 @@ impl KTuner {
             };
         }
         let Some(cur) = self.cur else {
-            // Measure every k, plain decoding last.
-            return (1..=max_k)
-                .chain([0])
-                .find(|&k| !self.sweep[k].decisive(k))
-                .unwrap_or(0);
+            // Measure plain decoding, then every drafting k.
+            return (0..=max_k).find(|&k| !self.swept(k, knobs)).unwrap_or(0);
         };
         let cur = cur.min(max_k);
         if let Some(p) = &mut self.probe {
@@ -631,7 +642,7 @@ impl KTuner {
                 a.secs += secs;
                 self.avg[k] = a.per_step();
                 self.avg_accept[k] = a.accept_per_step();
-                if self.sweep.iter().enumerate().all(|(k, a)| a.decisive(k)) {
+                if (0..self.sweep.len()).all(|k| self.swept(k, knobs)) {
                     self.cur = self.fastest_for(knobs);
                 }
             }
@@ -758,6 +769,17 @@ impl KTuner {
         (0..self.avg.len()).max_by(|&a, &b| self.score(a, knobs).total_cmp(&self.score(b, knobs)))
     }
 
+    /// Whether the sweep is done with `k`: decisive, or a drafting `k` that already loses to plain
+    /// decoding after [`PLAIN_STEPS`] steps (later probes may still try it).
+    fn swept(&self, k: usize, knobs: &DraftKnobs) -> bool {
+        let a = &self.sweep[k];
+        a.decisive(k)
+            || (k > 0
+                && a.steps >= PLAIN_STEPS
+                && self.sweep[0].decisive(0)
+                && self.score(k, knobs) < self.score(0, knobs))
+    }
+
     /// The `k` being run; `None` until every `k` was measured.
     pub fn best(&self) -> Option<usize> {
         self.cur
@@ -872,7 +894,7 @@ mod tests {
         let mut spec = SpecSeq::start(&m, oracle.clone(), &mut kv, 7).unwrap();
         let (mut all, mut calls) = (prompt.clone(), Vec::new());
         for _ in 0..4 {
-            let s = decode(&m, &mut spec, &all, &mut kv, 0.0, 1.0, 256, 2, None).unwrap();
+            let s = decode(&m, &mut spec, &all, &mut kv, 0.0, 1.0, 256, 2, 0, None).unwrap();
             all.extend(s.tokens);
             calls.push(oracle.calls.load(std::sync::atomic::Ordering::Relaxed));
         }
