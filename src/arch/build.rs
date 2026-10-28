@@ -735,7 +735,7 @@ pub struct ShapeCache {
 }
 
 impl ShapeCache {
-    pub const CAP: usize = 8;
+    pub const CAP: usize = crate::graph::program::INSTANCE_SHAPES;
 
     pub fn new(component: &str) -> Self {
         Self {

@@ -209,6 +209,13 @@ fn secondary_for(mode: PlacementMode, available: &[Device]) -> Option<Secondary>
     }
 }
 
+/// How many instance shapes [`GraphProgram::run_reshaped`] keeps: as many as its callers'
+/// [`crate::arch::build::ShapeCache`] builds. Fewer thrash when a caller cycles through its
+/// shapes (an encoder over 8 sequence lengths), re-fusing and re-planning every call.
+// ponytail: a caller cycling through more shapes (arbitrary-length embedding items) still re-fuses
+// and re-plans every call (~4 ms on MiniLM); bucket its row counts if that matters.
+pub const INSTANCE_SHAPES: usize = 8;
+
 /// One [`GraphProgram::run_reshaped`] instance shape: the caller's graph canonicalized and fused
 /// onto the fused weights the program already binds.
 struct ReshapedInstance {
@@ -701,9 +708,7 @@ impl GraphProgram {
         let entry = match hit {
             Some(i) => self.reshaped_graphs.remove(i),
             None => {
-                // ponytail: 4 shapes (full chunk, tails, image blocks); more if callers vary
-                // their row counts more.
-                if self.reshaped_graphs.len() == 4 {
+                if self.reshaped_graphs.len() == INSTANCE_SHAPES {
                     self.reshaped_graphs.remove(0);
                 }
                 let mut g = graph.clone();
