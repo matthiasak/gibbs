@@ -1540,7 +1540,7 @@ impl ContinuousBatchScheduler {
                     }
                     _ => {
                         let last = all.last().copied().unwrap_or(1);
-                        let streamed = if logprobs.is_none() && !m.0.recurrent() {
+                        let streamed = if logprobs.is_none() {
                             m.stream_token(
                                 last,
                                 all.len(),
