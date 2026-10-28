@@ -637,6 +637,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 enc.set_buffer(2, Some(scratch), 0);
                 enc.set_buffer(3, Some(scratch), list_off);
                 e.bind(4, s.out);
+                let grid_x = (*slots).div_ceil((*experts).max(1) * 32).clamp(1, 4);
                 set_bytes(
                     enc,
                     5,
@@ -647,16 +648,13 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                         u32_of(*top_k)?,
                         u32_of(*experts)?,
                         *x_per_slot as u32,
+                        u32_of(grid_x)?,
                     ],
                 );
-                let shmem = 24576;
+                let shmem = 16384;
                 enc.set_threadgroup_memory_length(0, shmem);
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        (*slots as u64).div_ceil(128),
-                        (*rows as u64).div_ceil(64),
-                        *experts as u64,
-                    ),
+                    MTLSize::new(grid_x as u64, (*rows as u64).div_ceil(64), *experts as u64),
                     MTLSize::new(super::super::TG4, 1, 1),
                 );
             } else {

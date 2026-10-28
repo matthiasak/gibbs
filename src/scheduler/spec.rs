@@ -171,7 +171,7 @@ impl ExecutableModel {
     }
 
     /// Rewinds the sequence to `len` positions.
-    fn truncate(&self, kv: &mut Option<SeqState>, len: usize) -> Result<(), String> {
+    pub(super) fn truncate(&self, kv: &mut Option<SeqState>, len: usize) -> Result<(), String> {
         self.0.truncate(kv.as_mut().ok_or(NO_STATE)?, len)
     }
 

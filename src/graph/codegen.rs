@@ -259,6 +259,7 @@ struct MoeGemmParams {{
     uint top_k;
     uint experts;
     uint x_per_slot;
+    uint grid_x;
 }};
 
 kernel void {name}(
@@ -273,99 +274,97 @@ kernel void {name}(
     uint tid [[thread_index_in_threadgroup]]
 ) {{
     const uint e = tg.z;
-    if (e >= p.experts) return;
-    const uint cnt = counts[e];
-    const uint m0 = tg.x * 128;
     const uint n0 = tg.y * 64;
-    if (m0 >= cnt || n0 >= p.rows) return;
-    const uint tile_m = min(128u, cnt - m0);
+    if (e >= p.experts || n0 >= p.rows) return;
+    const uint cnt = counts[e];
+    if (tg.x * 64 >= cnt) return;
     threadgroup {sa_ty}* sa = (threadgroup {sa_ty}*)shmem;
     threadgroup float* sb = (threadgroup float*)(shmem + 64 * 32 * sizeof({sa_ty}));
-    device const uint* elist = slot_list + (ulong)e * p.slots + m0;
-
     auto tA = tensor(sa, dextents<int32_t, 2>(32, 64), array<int, 2>({{1, 32}}));
-    auto tB = tensor(sb, dextents<int32_t, 2>(32, 128), array<int, 2>({{1, 32}}));
+    auto tB = tensor(sb, dextents<int32_t, 2>(32, 64), array<int, 2>({{1, 32}}));
     constexpr auto desc = matmul2d_descriptor(
-        128, 64, static_cast<int>(dynamic_extent), false, true, {relaxed},
+        64, 64, static_cast<int>(dynamic_extent), false, true, {relaxed},
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<4>> mm;
-    auto c = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
-    #pragma unroll
-    for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
-        if (c.is_valid_element(i)) c[i] = 0.0f;
-    }}
-
-    for (uint k0 = 0; k0 < p.cols; k0 += 32) {{
-        for (uint work = tid; work < 256; work += 128) {{
-            const uint feat = work / 4;
-            const uint chunk = work % 4;
-            const uint col = n0 + feat;
-            const uint gk = k0 + chunk * 8;
-            threadgroup {sa_ty}* dst = sa + feat * 32 + chunk * 8;
-            if (col < p.rows && gk + 8 <= p.cols) {{
-                const uint s = gk / 8;
-                {decl}
-                float v[8];
-                {dec}(b, {sub}s % {subs}, v);
-                *((threadgroup float4*)dst) = float4(v[0], v[1], v[2], v[3]);
-                *((threadgroup float4*)(dst + 4)) = float4(v[4], v[5], v[6], v[7]);
-            }} else if (col < p.rows && gk < p.cols) {{
-                const uint s = gk / 8;
-                {decl}
-                float v[8];
-                {dec}(b, {sub}s % {subs}, v);
-                #pragma unroll
-                for (uint i = 0; i < 8; ++i) {{
-                    dst[i] = (gk + i < p.cols) ? {sa_ty}(v[i]) : {sa_ty}(0);
-                }}
-            }} else {{
-                #pragma unroll
-                for (uint i = 0; i < 8; ++i) dst[i] = {sa_ty}(0);
-            }}
+    for (uint m0 = tg.x * 64; m0 < cnt; m0 += p.grid_x * 64) {{
+        const uint tile_m = min(64u, cnt - m0);
+        device const uint* elist = slot_list + (ulong)e * p.slots + m0;
+        auto c = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+        #pragma unroll
+        for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
+            if (c.is_valid_element(i)) c[i] = 0.0f;
         }}
-        for (uint work = tid; work < 512; work += 128) {{
-            const uint r = work / 4;
-            const uint chunk = work % 4;
-            const uint gk = k0 + chunk * 8;
-            threadgroup float* dst = sb + r * 32 + chunk * 8;
-            if (r < tile_m && gk + 8 <= p.cols) {{
-                const uint slot = elist[r];
-                const uint x_row = p.x_per_slot != 0 ? slot : (slot / p.top_k);
-                device const float* xr = x + (ulong)x_row * p.cols + gk;
-                *((threadgroup float4*)dst) = *((device const float4*)xr);
-                *((threadgroup float4*)(dst + 4)) = *((device const float4*)(xr + 4));
-            }} else if (r < tile_m && gk < p.cols) {{
-                const uint slot = elist[r];
-                const uint x_row = p.x_per_slot != 0 ? slot : (slot / p.top_k);
-                device const float* xr = x + (ulong)x_row * p.cols + gk;
-                #pragma unroll
-                for (uint i = 0; i < 8; ++i) {{
-                    dst[i] = (gk + i < p.cols) ? xr[i] : 0.0f;
+        for (uint k0 = 0; k0 < p.cols; k0 += 32) {{
+            for (uint work = tid; work < 256; work += 128) {{
+                const uint feat = work / 4;
+                const uint chunk = work % 4;
+                const uint col = n0 + feat;
+                const uint gk = k0 + chunk * 8;
+                threadgroup {sa_ty}* dst = sa + feat * 32 + chunk * 8;
+                if (col < p.rows && gk + 8 <= p.cols) {{
+                    const uint s = gk / 8;
+                    {decl}
+                    float v[8];
+                    {dec}(b, {sub}s % {subs}, v);
+                    *((threadgroup float4*)dst) = float4(v[0], v[1], v[2], v[3]);
+                    *((threadgroup float4*)(dst + 4)) = float4(v[4], v[5], v[6], v[7]);
+                }} else if (col < p.rows && gk < p.cols) {{
+                    const uint s = gk / 8;
+                    {decl}
+                    float v[8];
+                    {dec}(b, {sub}s % {subs}, v);
+                    #pragma unroll
+                    for (uint i = 0; i < 8; ++i) {{
+                        dst[i] = (gk + i < p.cols) ? {sa_ty}(v[i]) : {sa_ty}(0);
+                    }}
+                }} else {{
+                    #pragma unroll
+                    for (uint i = 0; i < 8; ++i) dst[i] = {sa_ty}(0);
                 }}
-            }} else {{
-                #pragma unroll
-                for (uint i = 0; i < 8; ++i) dst[i] = 0.0f;
             }}
+            for (uint work = tid; work < 256; work += 128) {{
+                const uint r = work / 4;
+                const uint chunk = work % 4;
+                const uint gk = k0 + chunk * 8;
+                threadgroup float* dst = sb + r * 32 + chunk * 8;
+                if (r < tile_m && gk + 8 <= p.cols) {{
+                    const uint slot = elist[r];
+                    const uint x_row = p.x_per_slot != 0 ? slot : (slot / p.top_k);
+                    device const float* xr = x + (ulong)x_row * p.cols + gk;
+                    *((threadgroup float4*)dst) = *((device const float4*)xr);
+                    *((threadgroup float4*)(dst + 4)) = *((device const float4*)(xr + 4));
+                }} else if (r < tile_m && gk < p.cols) {{
+                    const uint slot = elist[r];
+                    const uint x_row = p.x_per_slot != 0 ? slot : (slot / p.top_k);
+                    device const float* xr = x + (ulong)x_row * p.cols + gk;
+                    #pragma unroll
+                    for (uint i = 0; i < 8; ++i) {{
+                        dst[i] = (gk + i < p.cols) ? xr[i] : 0.0f;
+                    }}
+                }} else {{
+                    #pragma unroll
+                    for (uint i = 0; i < 8; ++i) dst[i] = 0.0f;
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int kExt = int(min(32u, p.cols - k0));
+            auto xv = tensor(sb, dextents<int32_t, 2>(kExt, int(tile_m)), array<int, 2>({{1, 32}}));
+            auto sav = tensor(sa, dextents<int32_t, 2>(kExt, 64), array<int, 2>({{1, 32}}));
+            mm.run(xv, sav, c);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        const int kExt = int(min(32u, p.cols - k0));
-        auto xv = tensor(sb, dextents<int32_t, 2>(kExt, int(tile_m)), array<int, 2>({{1, 32}}));
-        auto sav = tensor(sa, dextents<int32_t, 2>(kExt, 64), array<int, 2>({{1, 32}}));
-        mm.run(xv, sav, c);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }}
-
-    #pragma unroll
-    for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
-        if (c.is_valid_element(i)) {{
-            auto idx = c.get_multidimensional_index(i);
-            const uint col = n0 + uint(idx[0]);
-            const uint r = uint(idx[1]);
-            if (r < tile_m && col < p.rows) {{
-                const uint slot = elist[r];
-                const float val = c[i];
-                out[(ulong)slot * p.rows + col] = {epi_expr};
+        #pragma unroll
+        for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
+            if (c.is_valid_element(i)) {{
+                auto idx = c.get_multidimensional_index(i);
+                const uint col = n0 + uint(idx[0]);
+                const uint r = uint(idx[1]);
+                if (r < tile_m && col < p.rows) {{
+                    const uint slot = elist[r];
+                    const float val = c[i];
+                    out[(ulong)slot * p.rows + col] = {epi_expr};
+                }}
             }}
         }}
     }}
@@ -422,7 +421,14 @@ kernel void {name}(
             const uint col = n0 + feat;
             const uint gk = k0 + chunk * 8;
             threadgroup {sa_ty}* dst = sa + feat * 32 + chunk * 8;
-            if (col < p.n && gk < p.k) {{
+            if (col < p.n && gk + 8 <= p.k) {{
+                const uint s = gk / 8;
+                {decl}
+                float v[8];
+                {dec}(b, {sub}s % {subs}, v);
+                #pragma unroll
+                for (uint i = 0; i < 8; ++i) dst[i] = {sa_ty}(v[i]);
+            }} else if (col < p.n && gk < p.k) {{
                 const uint s = gk / 8;
                 {decl}
                 float v[8];
@@ -635,8 +641,14 @@ pub fn gemv_packed_mr(codec: &Codec, p: GemvParams, mb: usize) -> String {
         .collect();
     let acc_decl = each(&|i, j| format!("    float acc{i}_{j} = 0.0f;\n"));
     let row = |i: usize, decode: &str, dots: &str, v_len: u32| {
-        let br = block_ref(codec, "w", &format!("(ulong)(row0 + {i}) * blocks_per_row + blk"));
-        let decode = decode.replace("{sub}", &br.sub).replace("{group}", &br.group);
+        let br = block_ref(
+            codec,
+            "w",
+            &format!("(ulong)(row0 + {i}) * blocks_per_row + blk"),
+        );
+        let decode = decode
+            .replace("{sub}", &br.sub)
+            .replace("{group}", &br.group);
         format!(
             "        if (row0 + {i} < p.rows) {{\n            {}\n            float v[{v_len}];\n            {decode}\n{dots}        }}\n",
             br.decl
@@ -1022,5 +1034,3 @@ kernel void {name}(
         wide_msl = wide_msl(codec, &dec, false),
     )
 }
-
-

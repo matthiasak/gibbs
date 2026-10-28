@@ -247,8 +247,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                     }
                     let m = xl / k;
                     fs.add("Lin", (id, o, (m * rows) as i64))?;
-                    // The batched GEMM kernels (m >= 16) only carry Gelu/Residual epilogues.
-                    if format.is_some_and(|f| !(m >= 16 && f.batched_gemm())) {
+                    if format.is_some_and(|f| !(m >= 16 && f.batched_gemm()) || k % 8 == 0) {
                         fs.add("PackedEpi", id)?;
                     }
                 }

@@ -393,9 +393,12 @@ struct PrefillTuner {
 }
 
 impl PrefillTuner {
-    fn budget(&self, decoding: bool) -> usize {
+    fn budget(&self, decoding: bool, solo_gpu: bool) -> usize {
         if self.whole_prompt {
             return usize::MAX;
+        }
+        if solo_gpu && !decoding {
+            return MAX_PREFILL_CHUNK;
         }
         if self.prefill_ns_per_token == 0.0 {
             return INITIAL_PREFILL_CHUNK;
@@ -406,24 +409,31 @@ impl PrefillTuner {
             (true, d) => d,
             (false, _) => IDLE_STEP.as_nanos() as f64,
         };
-        ((target_ns / self.prefill_ns_per_token) as usize).clamp(1, MAX_PREFILL_CHUNK)
+        let min_chunk = if decoding { 1 } else { INITIAL_PREFILL_CHUNK };
+        ((target_ns / self.prefill_ns_per_token) as usize).clamp(min_chunk, MAX_PREFILL_CHUNK)
     }
 
     /// `prefill` = (time, prompt tokens) and `decode` = (time, decoded tokens) spent in one step.
     fn record(&mut self, prefill: (Duration, usize), decode: (Duration, usize)) {
-        let ewma = |old: f64, new: f64| {
-            if old == 0.0 {
-                new
-            } else {
-                0.75 * old + 0.25 * new
-            }
-        };
         if prefill.1 > 0 {
             let per_token = prefill.0.as_nanos() as f64 / prefill.1 as f64;
-            self.prefill_ns_per_token = ewma(self.prefill_ns_per_token, per_token);
+            if self.prefill_ns_per_token == 0.0 {
+                self.prefill_ns_per_token = per_token;
+            } else {
+                // Weight-streaming prefill passes have fixed per-pass cost, so small tail chunks
+                // blend proportionally to their share of `INITIAL_PREFILL_CHUNK`.
+                let w = 0.25
+                    * (prefill.1.min(INITIAL_PREFILL_CHUNK) as f64 / INITIAL_PREFILL_CHUNK as f64);
+                self.prefill_ns_per_token = (1.0 - w) * self.prefill_ns_per_token + w * per_token;
+            }
         }
         if decode.1 > 0 {
-            self.decode_round_ns = ewma(self.decode_round_ns, decode.0.as_nanos() as f64);
+            let ns = decode.0.as_nanos() as f64;
+            self.decode_round_ns = if self.decode_round_ns == 0.0 {
+                ns
+            } else {
+                0.75 * self.decode_round_ns + 0.25 * ns
+            };
         }
     }
 }
@@ -532,6 +542,10 @@ pub struct Sequence {
     /// Positions Tier-4 page eviction dropped (stored rows = positions - evicted); an evicted
     /// sequence is never exported to the radix cache.
     pub evicted: usize,
+    /// Output tokens fed into the model's KV/recurrent state (all emitted tokens when stopping on
+    /// EOS or a clipped speculative batch; `output_tokens.len() - 1` when the final token was just
+    /// sampled).
+    pub committed_out: usize,
 }
 
 impl Sequence {
@@ -552,6 +566,7 @@ impl Sequence {
             finish: FinishSignal::default(),
             spec: None,
             evicted: 0,
+            committed_out: 0,
         }
     }
 
@@ -1218,7 +1233,7 @@ impl ContinuousBatchScheduler {
         };
         self.step_counter.fetch_add(1, Ordering::Relaxed);
         let decoding = active.iter().any(|s| s.state == SequenceState::Decoding);
-        let prefill_budget = self.prefill_tuner.lock().budget(decoding);
+        let mut prefill_budget = self.prefill_tuner.lock().budget(decoding, false);
 
         // 1. Cache-aware promotion: with several sequences waiting, cache hits go first.
         if waiting.len() > 1 {
@@ -1268,6 +1283,15 @@ impl ContinuousBatchScheduler {
         let waiting_len = waiting.len();
         *self.work_signal.0.lock() = false;
         drop(waiting);
+        let solo_gpu = !decoding
+            && active.len() == 1
+            && waiting_len == 0
+            && model
+                .as_ref()
+                .is_some_and(|m| m.llm_backend() != Device::Cpu);
+        if solo_gpu {
+            prefill_budget = self.prefill_tuner.lock().budget(false, true);
+        }
         // Show admitted sequences now: on CPU one prefill step can take seconds.
         self.publish(&active, waiting_len, prefill_budget, None);
 
@@ -1516,7 +1540,7 @@ impl ContinuousBatchScheduler {
                     }
                     _ => {
                         let last = all.last().copied().unwrap_or(1);
-                        let streamed = if logprobs.is_none() {
+                        let streamed = if logprobs.is_none() && !m.0.recurrent() {
                             m.stream_token(
                                 last,
                                 all.len(),
@@ -1585,6 +1609,11 @@ impl ContinuousBatchScheduler {
                         self.record_gap(itl);
                     }
                 }
+                seq.committed_out = if n < tokens.len() {
+                    seq.output_tokens.len()
+                } else {
+                    seq.output_tokens.len().saturating_sub(1)
+                };
                 if seq.total_tokens() >= pos_limit
                     || seq.output_tokens.len() >= seq.params.max_new_tokens
                 {
@@ -1607,9 +1636,10 @@ impl ContinuousBatchScheduler {
             if seq.state == SequenceState::Finished {
                 if let Some(m) = &model {
                     let _ = m.stream_end(&mut seq.kv_cache);
-                    if seq.output_tokens.len() > 1 {
-                        let committed_out = seq.output_tokens.len() - 1;
+                    if seq.committed_out > 0 {
+                        let committed_out = seq.committed_out;
                         let total_committed = seq.prompt_tokens.len() + committed_out;
+                        let _ = m.truncate(&mut seq.kv_cache, total_committed);
                         if let Some(e) = m.kv_export(&seq.kv_cache, total_committed) {
                             let mut full = Vec::with_capacity(total_committed);
                             full.extend_from_slice(&seq.key);
@@ -2171,5 +2201,12 @@ mod tests {
         let mut got: Vec<u32> = std::iter::from_fn(|| rx2.try_recv().ok()).collect();
         got.extend(run_to_completion(&cached, rx2));
         assert_eq!(got, want, "prefix reuse diverged from a fresh prefill");
+        let mut tuner = PrefillTuner::default();
+        tuner.record((Duration::from_millis(80), 4), (Duration::ZERO, 0));
+        assert!(
+            tuner.budget(false, false) >= INITIAL_PREFILL_CHUNK,
+            "idle prefill budget must never collapse below INITIAL_PREFILL_CHUNK after a short turn"
+        );
+        assert_eq!(tuner.budget(false, true), MAX_PREFILL_CHUNK);
     }
 }

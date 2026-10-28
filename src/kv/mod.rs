@@ -14,7 +14,7 @@
 //!   (f16 on Metal with `GIBBS_KV_DTYPE=f16`).
 //! - **Row address**: stored row `t` of a name with row width `stride` lives at `kv_row(t)`:
 //!   `lp = t >> 6; if ring { lp %= ring }; pg = table[lp];
-//!   addr = slabs[pg >> 8] + ((pg & 255) * 64 + (t & 63)) * stride` (Metal binds each name's
+//!   addr = slabs[pg / SLAB_PAGES] + ((pg % SLAB_PAGES) * 64 + (t & 63)) * stride` (Metal binds each name's
 //!   table already resolved to page addresses, so a lookup is one dependent load).
 //! - **Stored rows**: rows are stored in position order; `kv_base` (rows stored before a step)
 //!   equals the step's start position except in the full class after Tier-4 page eviction, where
@@ -48,10 +48,10 @@ use std::sync::Arc;
 
 /// Rows per page (a multiple of the MPP attention key tile, 32).
 pub const PAGE_TOKENS: usize = 64;
-/// Pages per slab.
-pub const SLAB_PAGES: usize = 256;
+/// Pages per slab (2,048 rows: small enough that 32-layer MHA models fit under default `--kv-mem`).
+pub const SLAB_PAGES: usize = 32;
 /// Slabs a name can grow to (16.7M rows).
-pub const MAX_SLABS: usize = 1024;
+pub const MAX_SLABS: usize = 8192;
 
 static KV_BUDGET: AtomicUsize = AtomicUsize::new(0);
 static KV_USED: AtomicUsize = AtomicUsize::new(0);
@@ -499,6 +499,7 @@ impl Drop for KvPool {
                 Some(set) => unsafe {
                     let () = msg_send![&*m.queue, removeResidencySet: set];
                     let () = msg_send![set, release];
+                    LIVE_SETS.fetch_sub(1, Ordering::Relaxed);
                 },
                 None => {
                     let id = self.id;
@@ -524,20 +525,30 @@ fn page_ptr(cm: &ClassMem, name: usize, pg: u32, page_bytes: usize) -> *mut u8 {
 static UNTRACKED: std::sync::Mutex<Vec<(usize, metal::Buffer)>> = std::sync::Mutex::new(Vec::new());
 #[cfg(target_os = "macos")]
 static ANY_UNTRACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static LIVE_SETS: AtomicUsize = AtomicUsize::new(0);
 
-/// A residency set on `queue` when the device supports them (macOS 15+).
+/// A residency set on `queue` when the device supports them (macOS 15+) and the command queue's
+/// 32-set hardware limit has room.
 #[cfg(target_os = "macos")]
 fn residency_set(
     device: &metal::DeviceRef,
     queue: &metal::CommandQueueRef,
 ) -> Option<*mut metal::objc::runtime::Object> {
     use metal::objc::runtime::{Class, Object, BOOL, NO};
-    // SAFETY: Objective-C calls on live Metal objects; selectors checked before use.
+    if LIVE_SETS.fetch_add(1, Ordering::Relaxed) >= 24 {
+        LIVE_SETS.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
     unsafe {
         let ok: BOOL =
             msg_send![device, respondsToSelector: sel!(newResidencySetWithDescriptor:error:)];
-        let desc_class = Class::get("MTLResidencySetDescriptor")?;
+        let Some(desc_class) = Class::get("MTLResidencySetDescriptor") else {
+            LIVE_SETS.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        };
         if ok == NO {
+            LIVE_SETS.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
         let desc: *mut Object = msg_send![desc_class, new];
@@ -546,6 +557,7 @@ fn residency_set(
             msg_send![device, newResidencySetWithDescriptor: desc error: &mut err];
         let () = msg_send![desc, release];
         if set.is_null() {
+            LIVE_SETS.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
         let () = msg_send![queue, addResidencySet: set];

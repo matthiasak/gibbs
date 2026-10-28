@@ -75,8 +75,16 @@ template <int EPI>
 static inline float epilogue(float acc, uint row, uint col, constant GemmParams& p,
                              device const float* bias, device const float* res) {
     float v = p.has_bias ? acc + bias[col] : acc;
-    if (EPI == EPI_GELU) v = gelu_erf(v);
-    if (EPI == EPI_RESIDUAL) v += res[(ulong)row * p.n + col];
+    if (EPI == 1) v = gelu_erf(v);
+    if (EPI == 2) v += res[(ulong)row * p.n + col];
+    if (EPI == 3) v = v / (1.0f + exp(-v));
+    if (EPI == 4) v = (v / (1.0f + exp(-v))) * res[(ulong)row * p.n + col];
+    if (EPI == 5) v = gelu_tanh(v) * res[(ulong)row * p.n + col];
+    if (EPI == 6) {
+        float g = res[(ulong)row * p.n + col];
+        v *= g / (1.0f + exp(-g));
+    }
+    if (EPI == 7) v *= gelu_tanh(res[(ulong)row * p.n + col]);
     return v;
 }
 // GEMM-COMMON-END

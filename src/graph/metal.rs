@@ -3677,77 +3677,115 @@ impl Session {
                         MTLSize::new((m as u64).div_ceil(128), (n as u64).div_ceil(64), 1),
                         MTLSize::new(TG4, 1, 1),
                     );
-                } else if let Some(fmt_name) = match format {
-                    WeightFormat::BF16 => Some("bf16"),
-                    WeightFormat::F16 => Some("f16"),
-                    WeightFormat::Q4_0 => Some("q4_0"),
-                    WeightFormat::Q8_0 => Some("q8_0"),
-                    _ => None,
-                } {
-                    let suffix = match epi {
-                        Epi::None => "none",
-                        Epi::Gelu => "gelu",
-                        Epi::Residual => "residual",
-                        _ => "none",
-                    };
-                    enc.set_compute_pipeline_state(
-                        rt.pso(&format!("gemm_batched_{fmt_name}_{suffix}"))?,
-                    );
-                    bind(0, x);
-                    bind(1, w);
-                    if let Some(b) = bias {
-                        bind(2, b);
-                    } else {
-                        bind(2, s.out);
-                    }
-                    if let Some(r) = res {
-                        bind(3, r);
-                    } else {
-                        bind(3, s.out);
-                    }
-                    bind(4, s.out);
-                    #[repr(C)]
-                    struct GemmParams(u32, u32, u32, u32);
-                    let p = GemmParams(u32_of(m)?, u32_of(n)?, u32_of(k)?, bias.is_some() as u32);
-                    set_bytes(enc, 5, &p);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(32), 1),
-                        MTLSize::new(TG4, 1, 1),
-                    );
                 } else {
-                    // Any other codec format: expand the weight to f32 in a session scratch buffer (one
-                    // pass over the packed blocks through the codec's `decode8`), then run the f32 GEMM.
-                    // luminal: crates/luminal_metal (dequantize-then-matmul for prefill shapes).
-                    let f = format.codec_format().ok_or_else(|| {
-                        format!("Metal executor: unsupported batched packed format {format:?}")
-                    })?;
-                    let bytes = n * k * 4;
-                    let mut guard = self.dequant_scratch.lock();
-                    if guard
-                        .as_ref()
-                        .map_or(true, |b| (b.length() as usize) < bytes)
-                    {
-                        *guard = Some(new_shared_buffer(&rt.device, bytes)?);
+                    let base_epi = match epi {
+                        Epi::None | Epi::Gelu | Epi::Residual => epi,
+                        _ => Epi::None,
+                    };
+                    if let Some(fmt_name) = match format {
+                        WeightFormat::BF16 => Some("bf16"),
+                        WeightFormat::F16 => Some("f16"),
+                        WeightFormat::Q4_0 => Some("q4_0"),
+                        WeightFormat::Q8_0 => Some("q8_0"),
+                        _ => None,
+                    } {
+                        let suffix = match base_epi {
+                            Epi::None => "none",
+                            Epi::Gelu => "gelu",
+                            Epi::Residual => "residual",
+                            _ => "none",
+                        };
+                        enc.set_compute_pipeline_state(
+                            rt.pso(&format!("gemm_batched_{fmt_name}_{suffix}"))?,
+                        );
+                        bind(0, x);
+                        bind(1, w);
+                        if let Some(b) = bias {
+                            bind(2, b);
+                        } else {
+                            bind(2, s.out);
+                        }
+                        if let Some(r) = res {
+                            bind(3, r);
+                        } else {
+                            bind(3, s.out);
+                        }
+                        bind(4, s.out);
+                        #[repr(C)]
+                        struct GemmParams(u32, u32, u32, u32);
+                        let p =
+                            GemmParams(u32_of(m)?, u32_of(n)?, u32_of(k)?, bias.is_some() as u32);
+                        set_bytes(enc, 5, &p);
+                        enc.dispatch_thread_groups(
+                            MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(32), 1),
+                            MTLSize::new(TG4, 1, 1),
+                        );
+                    } else {
+                        // Any other codec format: expand the weight to f32 in a session scratch buffer (one
+                        // pass over the packed blocks through the codec's `decode8`), then run the f32 GEMM.
+                        // luminal: crates/luminal_metal (dequantize-then-matmul for prefill shapes).
+                        let f = format.codec_format().ok_or_else(|| {
+                            format!("Metal executor: unsupported batched packed format {format:?}")
+                        })?;
+                        let bytes = n * k * 4;
+                        let mut guard = self.dequant_scratch.lock();
+                        if guard
+                            .as_ref()
+                            .map_or(true, |b| (b.length() as usize) < bytes)
+                        {
+                            *guard = Some(new_shared_buffer(&rt.device, bytes)?);
+                        }
+                        let scratch = guard.as_ref().unwrap();
+                        let pso = rt.dequant_pso(f)?;
+                        enc.set_compute_pipeline_state(&pso);
+                        bind(0, w);
+                        enc.set_buffer(1, Some(scratch), 0);
+                        set_bytes(enc, 2, &[u32_of(n)?, u32_of(k)?]);
+                        grid1(n * (k / 8));
+                        let kind = self.gemm.unwrap_or_else(|| rt.profile.gemm_for([m, n, k]));
+                        rt.encode_gemm(
+                            enc,
+                            kind,
+                            base_epi,
+                            loc(x),
+                            (scratch, 0),
+                            bias.map(loc),
+                            res.map(loc),
+                            loc(s.out),
+                            [m, n, k],
+                        )?;
                     }
-                    let scratch = guard.as_ref().unwrap();
-                    let pso = rt.dequant_pso(f)?;
-                    enc.set_compute_pipeline_state(&pso);
-                    bind(0, w);
-                    enc.set_buffer(1, Some(scratch), 0);
-                    set_bytes(enc, 2, &[u32_of(n)?, u32_of(k)?]);
-                    grid1(n * (k / 8));
-                    let kind = self.gemm.unwrap_or_else(|| rt.profile.gemm_for([m, n, k]));
-                    rt.encode_gemm(
-                        enc,
-                        kind,
-                        epi,
-                        loc(x),
-                        (scratch, 0),
-                        bias.map(loc),
-                        res.map(loc),
-                        loc(s.out),
-                        [m, n, k],
-                    )?;
+                    let total = m * n;
+                    match (epi, res) {
+                        (Epi::Silu, _) => {
+                            enc.set_compute_pipeline_state(rt.pso("unary_f32")?);
+                            bind(0, s.out);
+                            bind(1, s.out);
+                            #[repr(C)]
+                            struct UnaryP(u32, u32, f32, f32);
+                            set_bytes(enc, 2, &UnaryP(u32_of(total)?, 2, 0.0, 0.0));
+                            grid1(total);
+                        }
+                        (Epi::SwiGlu | Epi::UpSwiGlu | Epi::GeGlu | Epi::UpGeGlu, Some(r)) => {
+                            let pso_name = if matches!(epi, Epi::GeGlu | Epi::UpGeGlu) {
+                                "geglu_f32"
+                            } else {
+                                "swiglu_f32"
+                            };
+                            enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                            let (g_id, u_id) = if matches!(epi, Epi::UpSwiGlu | Epi::UpGeGlu) {
+                                (r, s.out)
+                            } else {
+                                (s.out, r)
+                            };
+                            bind(0, g_id);
+                            bind(1, u_id);
+                            bind(2, s.out);
+                            set_bytes(enc, 3, &u32_of(total)?);
+                            grid1(total);
+                        }
+                        _ => {}
+                    }
                 }
             }
             Step::SwiGlu { gate, up, n } => {
