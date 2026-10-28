@@ -347,7 +347,11 @@ fn compact_turns(
     if !system_prompt.is_empty() {
         msgs.push(ChatMessage::new("system", system_prompt));
     }
-    msgs.extend(turns.iter().map(|(r, c)| ChatMessage::new(r.as_str(), c.as_str())));
+    msgs.extend(
+        turns
+            .iter()
+            .map(|(r, c)| ChatMessage::new(r.as_str(), c.as_str())),
+    );
     let has_current = current.is_some();
     msgs.extend(current);
     let report = crate::compact::compact_for_scheduler(
@@ -897,7 +901,7 @@ impl TuiApp {
                      · /settings  : Show the policy settings modal (F4) and the current policies\n\
                      · /profile on|off|sort <time|bandwidth|share> : Sample one decode token every 5 s, step by step, into the KERNELS panel; sort its rows (key s cycles)\n\
                      · /bench     : Benchmark the loaded model on Metal (128 tokens x 3 runs): tok/s, roofline % and where each token's time goes; refuses while generating\n\
-                     · /placement : Where every graph node of the loaded model runs (op, device, avenue): 100% Metal, or the CPU ops\n\
+                     · /placement : Where every graph node of the loaded model runs (op, device, avenue): 100% accelerated (Metal n, Ane m), or the CPU ops\n\
                      · /roofline  : Focus ROOFLINE detail & run the calibration sweep\n\
                      · /spec [mode=|objective=|k=|accept=|cost=|suffix=|lr=|sigma=|steps=|shortlist=|probes=|window=] : Live-tune speculative decoding & the online drafter (no args: status)\n\
                      · /quant     : Display active weight quantization formats\n\
@@ -1157,7 +1161,10 @@ impl TuiApp {
         let mut o = crate::compact::CompactionOverride::default();
         let mut run_now = false;
         for word in arg.split_whitespace() {
-            let num = |v: &str| v.parse::<f32>().map_err(|_| format!("{word}: not a number"));
+            let num = |v: &str| {
+                v.parse::<f32>()
+                    .map_err(|_| format!("{word}: not a number"))
+            };
             match word.split_once('=') {
                 Some(("mode", v)) => o.mode = Some(v.parse()?),
                 Some(("threshold", v)) => o.trigger = Some(num(v)?),
@@ -1325,8 +1332,8 @@ impl TuiApp {
         ))
     }
 
-    /// `/placement`: where every graph node of the loaded model runs. All on one GPU is one text
-    /// entry ending in `100% Metal`; CPU ops follow the table as an error entry.
+    /// `/placement`: where every graph node of the loaded model runs. All on accelerators is one
+    /// text entry ending in `100% accelerated (..)`; CPU ops follow the table as an error entry.
     fn placement_report(&mut self, prompt: &str) -> Result<String, String> {
         use crate::graph::placement::{placement_table, placement_verdict};
         let rows = self
@@ -3399,7 +3406,10 @@ mod tests {
         );
         let c = settings::load_settings().compact;
         assert_eq!(c.mode, crate::compact::CompactionMode::Aggressive);
-        assert_eq!((c.trigger_ratio, c.target_ratio, c.keep_recent_turns), (0.3, 0.2, 3));
+        assert_eq!(
+            (c.trigger_ratio, c.target_ratio, c.keep_recent_turns),
+            (0.3, 0.2, 3)
+        );
         assert_eq!(c.summarizer.as_deref(), Some("org/sum"));
         let restarted = TuiApp::new(EngineTelemetry::new());
         assert_eq!(
@@ -3409,14 +3419,20 @@ mod tests {
         assert_eq!(restarted.compact_config, c);
         type_and_run(&mut app, "/compact light summarizer=active");
         let c = settings::load_settings().compact;
-        assert_eq!((c.mode, c.summarizer), (crate::compact::CompactionMode::Light, None));
+        assert_eq!(
+            (c.mode, c.summarizer),
+            (crate::compact::CompactionMode::Light, None)
+        );
         type_and_run(&mut app, "/compact keep=x");
         assert_eq!(app.history.last().unwrap().kind, Kind::Error);
         app.handle_key(key(KeyCode::Char('1')));
         app.handle_key(key(KeyCode::Char('1')));
         app.handle_key(key(KeyCode::Char('2')));
         app.handle_key(key(KeyCode::Char('2')));
-        assert_eq!((app.reencode_policy, app.variant_policy), (R::MaxSpeed, V::Fastest));
+        assert_eq!(
+            (app.reencode_policy, app.variant_policy),
+            (R::MaxSpeed, V::Fastest)
+        );
         type_and_run(&mut app, "/compact auto");
 
         // 5. '3' toggles show_roofline_hud
@@ -3776,7 +3792,7 @@ mod tests {
         assert_eq!(app.history.last().unwrap().output, "benchmark running");
     }
 
-    /// `/placement` prints the table and ends in `100% Metal`, or lists the CPU ops as an error.
+    /// `/placement` prints the table and ends in `100% accelerated (..)`, or lists the CPU ops as an error.
     #[test]
     fn placement_command_explains_the_loaded_program() {
         let mut app = TuiApp::new(EngineTelemetry::new());
@@ -3788,7 +3804,11 @@ mod tests {
         let last = app.history.last().unwrap();
         if sched.model().unwrap().llm_backend() == crate::hardware::Device::Metal {
             assert_eq!(last.kind, Kind::Text);
-            assert!(last.output.contains("100% accelerated (Metal "), "{}", last.output);
+            assert!(
+                last.output.contains("100% accelerated (Metal "),
+                "{}",
+                last.output
+            );
         } else {
             assert_eq!(last.kind, Kind::Error);
             assert!(last.output.contains("CPU node"), "{}", last.output);
@@ -4157,7 +4177,10 @@ mod tests {
             serde_json::json!({}),
             crate::hardware::Device::Cpu,
         );
-        let sched = Arc::new(ContinuousBatchScheduler::new("foundry/smollm-1m", Some(llm)));
+        let sched = Arc::new(ContinuousBatchScheduler::new(
+            "foundry/smollm-1m",
+            Some(llm),
+        ));
         let mut app = TuiApp::new(EngineTelemetry::new()).with_runtime(
             sched,
             HuggingFaceHub::new(),
