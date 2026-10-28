@@ -1229,7 +1229,11 @@ fn gemv_matches_cpu_for_every_packed_format() {
     // Every other codec format with random blocks that decode finite.
     let all: Vec<QuantFormat> = formats
         .into_iter()
-        .chain(crate::graph::codec::formats().into_iter().filter(|f| !formats.contains(f)))
+        .chain(
+            crate::graph::codec::formats()
+                .into_iter()
+                .filter(|f| !formats.contains(f)),
+        )
         .collect();
     for (f, m) in all.into_iter().flat_map(|f| ms.map(|m| (f, m))) {
         let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
@@ -4709,4 +4713,51 @@ fn sample_topk_matches_cpu_nucleus() {
     // SAFETY: the command buffer completed.
     let tok = unsafe { *(ob.contents() as *const u32) };
     assert!(got.iter().any(|e| e.0 == tok), "drawn token {tok} is kept");
+}
+
+#[test]
+fn plan_windows_packs_deterministically_without_overlap_explosion() {
+    use super::plan_windows;
+
+    let page = 16_384usize;
+    let max_buf = 4 * page; // 65,536 B
+    let map_len = 9 * page; // 147,456 B
+                            // Spans crossing multiple windows, including one straddling a 4-page boundary (50_000..70_000).
+    let spans = vec![
+        (110_000, 30_000),
+        (4_096, 20_000),
+        (50_000, 20_000),
+        (25_000, 20_000),
+        (72_000, 35_000),
+    ];
+    let mut rev = spans.clone();
+    rev.reverse();
+
+    let w1 = plan_windows(&spans, map_len, max_buf, page);
+    let w2 = plan_windows(&rev, map_len, max_buf, page);
+    assert_eq!(
+        w1, w2,
+        "window planning must be independent of HashMap iteration order"
+    );
+    assert_eq!(
+        w1.len(),
+        3,
+        "9 pages of spans with 4-page max_buf should need 3 windows: {w1:?}"
+    );
+
+    for &(base, end) in &w1 {
+        assert_eq!(base % page, 0);
+        assert!(end > base && end - base <= max_buf && end <= map_len);
+    }
+    for &(off, len) in &spans {
+        assert!(
+            w1.iter().any(|&(b, e)| b <= off && off + len <= e),
+            "span ({off}, {len}) not covered by any window in {w1:?}"
+        );
+    }
+    let total_mapped: usize = w1.iter().map(|&(b, e)| e - b).sum();
+    assert!(
+        total_mapped <= map_len + (w1.len() - 1) * page,
+        "total mapped bytes {total_mapped} exceeded map_len {map_len} + 1 page per boundary"
+    );
 }

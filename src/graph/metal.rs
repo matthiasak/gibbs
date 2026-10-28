@@ -298,6 +298,14 @@ pub fn system_device_name() -> Result<String, String> {
 pub fn system_has_unified_memory() -> Result<bool, String> {
     Ok(system_device()?.has_unified_memory())
 }
+
+pub fn system_max_working_set_bytes() -> Result<u64, String> {
+    Ok(system_device()?.recommended_max_working_set_size())
+}
+
+pub fn system_max_buffer_bytes() -> Result<u64, String> {
+    Ok(system_device()?.max_buffer_length())
+}
 use crate::hardware::{sysctl, QuantFormat};
 
 use super::tune::{self, GemvKernel, GemvVariant};
@@ -1719,6 +1727,61 @@ pub struct Session {
     kv_paged: HashSet<String>,
 }
 
+/// Plans deterministic, page-aligned `(base, end)` zero-copy windows of at most `max_buf` bytes
+/// covering `spans` (`(offset, byte_len)`) within a mapping of `map_len` bytes.
+pub(crate) fn plan_windows(
+    spans: &[(usize, usize)],
+    map_len: usize,
+    max_buf: usize,
+    page: usize,
+) -> Vec<(usize, usize)> {
+    let page = page.max(1);
+    let max_buf = (max_buf / page * page).max(page);
+    let mut sorted: Vec<(usize, usize)> = spans
+        .iter()
+        .copied()
+        .filter(|&(off, len)| {
+            len > 0
+                && off
+                    .checked_add(len)
+                    .is_some_and(|end| end <= map_len && end - (off / page) * page <= max_buf)
+        })
+        .collect();
+    sorted.sort_unstable_by_key(|&(off, len)| (off, len));
+    let mut windows = Vec::new();
+    let mut cur: Option<(usize, usize)> = None;
+    for (off, len) in sorted {
+        let t_end = off + len;
+        match cur {
+            None => {
+                let base = if t_end <= max_buf {
+                    0
+                } else {
+                    (off / page) * page
+                };
+                cur = Some((base, t_end));
+            }
+            Some((base, end)) if t_end <= base + max_buf => {
+                cur = Some((base, end.max(t_end)));
+            }
+            Some((base, end)) => {
+                let win_end = (end.div_ceil(page) * page).min(map_len).min(base + max_buf);
+                if win_end > base {
+                    windows.push((base, win_end));
+                }
+                cur = Some(((off / page) * page, t_end));
+            }
+        }
+    }
+    if let Some((base, end)) = cur {
+        let win_end = (end.div_ceil(page) * page).min(map_len).min(base + max_buf);
+        if win_end > base {
+            windows.push((base, win_end));
+        }
+    }
+    windows
+}
+
 impl Session {
     /// Uploads every weight once. Preserves packed formats without f32 expansion.
     pub fn new(rt: Arc<Runtime>, weights: &Weights) -> Result<Self, String> {
@@ -1738,11 +1801,18 @@ impl Session {
                 .map(|v| v.name.as_str())
                 .collect()
         });
-        let mut map_buffers: HashMap<*const u8, Buffer> = HashMap::new();
-        let mut maps = Vec::new();
-        let mut bufs = HashMap::new();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let max_buf = ((rt.device.max_buffer_length() as usize) / page * page).max(page);
+        let mut map_spans: HashMap<
+            *const u8,
+            (
+                usize,
+                Arc<crate::model::loaders::gguf::GgufData>,
+                Vec<(usize, usize)>,
+            ),
+        > = HashMap::new();
         for (name, t) in weights.iter() {
-            if let Some(ref active) = active_names {
+            if let Some(active) = &active_names {
                 if !active.contains(name) {
                     continue;
                 }
@@ -1750,7 +1820,62 @@ impl Session {
             if let Tensor::Mat(m) = t {
                 if let Some(p) = m.packed() {
                     let map_ptr = p.map.as_ptr();
-                    let map_len = p.map.len();
+                    if (map_ptr as usize) % page != 0 {
+                        continue;
+                    }
+                    let fmt = match WeightFormat::of_quant(p.format) {
+                        WeightFormat::F32 | WeightFormat::Q2_K => None,
+                        WeightFormat::Gen(f) if codec::planar(f).is_some() => None,
+                        wfmt => Some(wfmt),
+                    };
+                    if let Some(fmt) = fmt {
+                        let map_len = match *p.map {
+                            crate::model::loaders::gguf::GgufData::Map(_) => {
+                                p.map.len().div_ceil(page) * page
+                            }
+                            crate::model::loaders::gguf::GgufData::Buf(_) => p.map.len(),
+                        };
+                        let byte_len = weight_format_bytes(fmt, m.rows * m.cols);
+                        map_spans
+                            .entry(map_ptr)
+                            .or_insert_with(|| (map_len, p.map.clone(), Vec::new()))
+                            .2
+                            .push((p.off, byte_len));
+                    }
+                }
+            }
+        }
+        let mut map_buffers: HashMap<*const u8, Vec<(usize, usize, Buffer)>> = HashMap::new();
+        let mut maps = Vec::new();
+        for (map_ptr, (map_len, map_arc, spans)) in map_spans {
+            let mut chunks = Vec::new();
+            for (base, end) in plan_windows(&spans, map_len, max_buf, page) {
+                let ptr = unsafe { map_ptr.add(base) } as *const c_void;
+                let buf = rt.device.new_buffer_with_bytes_no_copy(
+                    ptr,
+                    (end - base) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                );
+                if !buf.contents().is_null() {
+                    chunks.push((base, end, buf));
+                }
+            }
+            if !chunks.is_empty() {
+                maps.push(map_arc);
+                map_buffers.insert(map_ptr, chunks);
+            }
+        }
+        let mut bufs = HashMap::new();
+        for (name, t) in weights.iter() {
+            if let Some(active) = &active_names {
+                if !active.contains(name) {
+                    continue;
+                }
+            }
+            if let Tensor::Mat(m) = t {
+                if let Some(p) = m.packed() {
+                    let map_ptr = p.map.as_ptr();
                     let num_elements = m.rows * m.cols;
                     let fmt = match WeightFormat::of_quant(p.format) {
                         WeightFormat::F32 | WeightFormat::Q2_K => None,
@@ -1758,22 +1883,15 @@ impl Session {
                         wfmt => Some(wfmt),
                     };
                     if let Some(fmt) = fmt {
-                        if !map_buffers.contains_key(&map_ptr) {
-                            let buf = rt.device.new_buffer_with_bytes_no_copy(
-                                map_ptr as *const c_void,
-                                map_len as u64,
-                                MTLResourceOptions::StorageModeShared,
-                                None,
-                            );
-                            if !buf.contents().is_null() {
-                                map_buffers.insert(map_ptr, buf);
-                                maps.push(p.map.clone());
-                            }
-                        }
-                        if let Some(map_buf) = map_buffers.get(&map_ptr) {
+                        let byte_len = weight_format_bytes(fmt, num_elements);
+                        let t_end = p.off + byte_len;
+                        if let Some((base, _, map_buf)) = map_buffers
+                            .get(&map_ptr)
+                            .and_then(|c| c.iter().find(|&&(b, e, _)| b <= p.off && t_end <= e))
+                        {
                             bufs.insert(
                                 name.to_string(),
-                                (map_buf.clone(), p.off, num_elements, fmt),
+                                (map_buf.clone(), p.off - base, num_elements, fmt),
                             );
                             continue;
                         }
@@ -1920,14 +2038,15 @@ impl Session {
             reads: vec![x],
         };
         plan.device_inputs.extend(unpack.iter().map(|u| u.2));
-        let pre = unpack.into_iter().map(|(surface, io, x)| {
-            step("ane_unpack", x, Step::AneUnpack { x, surface, io })
-        });
+        let pre = unpack
+            .into_iter()
+            .map(|(surface, io, x)| step("ane_unpack", x, Step::AneUnpack { x, surface, io }));
         let mut steps: Vec<Planned> = pre.collect();
         steps.append(&mut plan.steps);
-        steps.extend(pack.into_iter().map(|(x, surface, io)| {
-            step("ane_pack", x, Step::AnePack { x, surface, io })
-        }));
+        steps.extend(
+            pack.into_iter()
+                .map(|(x, surface, io)| step("ane_pack", x, Step::AnePack { x, surface, io })),
+        );
         plan.steps = steps;
         plan.device_outputs = device_outputs;
     }
@@ -1968,7 +2087,9 @@ impl Session {
             )
         };
         let words = |b: &[u8]| -> Vec<u16> {
-            b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+            b.chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
         };
         Some(match fmt {
             WeightFormat::F32 | WeightFormat::U32 => {
@@ -1984,14 +2105,15 @@ impl Session {
             WeightFormat::Gen(f) if codec::planar(f).is_some() => return None,
             _ => {
                 let f = fmt.codec_format()?;
-                let mut v = crate::model::layers::dequantize_gguf_blocks(f, bytes).or_else(|| {
-                    let (n, bb, dequant) = crate::model::repack::block_codec(f)?;
-                    let mut out = vec![0.0f32; bytes.len() / bb * n];
-                    for (b, y) in bytes.chunks_exact(bb).zip(out.chunks_exact_mut(n)) {
-                        dequant(b, y);
-                    }
-                    Some(out)
-                })?;
+                let mut v =
+                    crate::model::layers::dequantize_gguf_blocks(f, bytes).or_else(|| {
+                        let (n, bb, dequant) = crate::model::repack::block_codec(f)?;
+                        let mut out = vec![0.0f32; bytes.len() / bb * n];
+                        for (b, y) in bytes.chunks_exact(bb).zip(out.chunks_exact_mut(n)) {
+                            dequant(b, y);
+                        }
+                        Some(out)
+                    })?;
                 v.truncate(n);
                 Tensor::F16(v.into_iter().map(crate::model::f32_to_f16).collect())
             }
@@ -3361,7 +3483,10 @@ impl Session {
                 // A few x rows (verify, short prefill) share each weight read: up to `GEMV_MR` rows per
                 // threadgroup through the generated multi-row kernel, for every codec format.
                 // `m` split evenly into the fewest groups of at most `gemv_mr_max` rows.
-                let mr = match format.codec_format().and_then(|q| Some((q, codec::codec(q)?))) {
+                let mr = match format
+                    .codec_format()
+                    .and_then(|q| Some((q, codec::codec(q)?)))
+                {
                     Some((q, c)) if m >= 2 => {
                         let mb = m.div_ceil(m.div_ceil(crate::graph::codegen::gemv_mr_max(c)));
                         Some((rt.gen_mr_pso(q, mb)?, mb))
@@ -3380,7 +3505,8 @@ impl Session {
                         )
                     }
                     None => {
-                        let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
+                        let (pso, rows_per_tg, threads) =
+                            self.gemv_pipeline(format, variant, cols)?;
                         (pso, rows_per_tg, threads, m as u64)
                     }
                 };
@@ -4378,7 +4504,11 @@ impl Session {
             }
             Step::AnePack { x, ref surface, io } | Step::AneUnpack { x, ref surface, io } => {
                 let pack = matches!(s.op, Step::AnePack { .. });
-                enc.set_compute_pipeline_state(rt.pso(if pack { "ane_pack" } else { "ane_unpack" })?);
+                enc.set_compute_pipeline_state(rt.pso(if pack {
+                    "ane_pack"
+                } else {
+                    "ane_unpack"
+                })?);
                 let (b, off) = loc(x);
                 enc.set_buffer(0, Some(b), off as u64);
                 enc.set_buffer(1, Some(surface), 0);
@@ -4770,7 +4900,6 @@ pub struct GemvPairLeg {
     pub out: ValueId,
     pub variant: GemvVariant,
 }
-
 
 /// Pairs already-adjacent small-row (`rows <= 512`) `HAND` `Step::GemvPacked` projections sharing
 /// `x`, `cols`, and `format` after variant assignment and arena allocation, verifying disjoint
