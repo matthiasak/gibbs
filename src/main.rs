@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
     name = "gibbs",
     author = "Gibbs Systems <engineering@gibbs.ai>",
     version = "0.1.0",
-    about = "Gibbs: local inference engine (Metal, CUDA, ROCm, XLA, Intel XPU, CPU)"
+    about = "Gibbs: local inference engine (Metal + ANE, CUDA, ROCm, XLA, Intel XPU, CPU)"
 )]
 struct Cli {
     #[arg(short, long, default_value = "HuggingFaceTB/SmolLM2-135M-Instruct")]
@@ -201,9 +201,12 @@ struct Cli {
     #[arg(long)]
     variant: Option<String>,
 
+    /// Run a benchmark suite (JSON lines; a row or `defaults` may set `"placement"`, default
+    /// `metal`), then exit.
     #[arg(long)]
     bench: Option<String>,
 
+    /// Run the Metal-vs-CPU parity suite of this benchmark file, then exit.
     #[arg(long)]
     bench_parity: Option<String>,
 
@@ -211,7 +214,9 @@ struct Cli {
     #[arg(long)]
     probe_top5: Option<String>,
 
-    /// Print where the graph nodes of --model run (op kind, device, avenue) on Metal, then exit.
+    /// Print where the graph nodes of --model run (op kind, device, avenue) under --backend and,
+    /// unless pinned to metal, run one full prefill pass and print each ANE region's decision
+    /// (Metal ms, ANE ms, rel err, kept device) and the whole-program decision, then exit.
     #[arg(long, default_value_t = false)]
     explain_placement: bool,
 
