@@ -25,6 +25,10 @@ else:
     else:
         d.setdefault("runs", 2)
 json.dump({"defaults": d, "models": [m]}, open(out, "w"))
+# ABBA_PLACEMENT: candidate legs load under this placement; the base binary predates the field.
+if os.environ.get("ABBA_PLACEMENT"):
+    d["placement"] = os.environ["ABBA_PLACEMENT"]
+json.dump({"defaults": d, "models": [m]}, open(out.replace(".json", "-cand.json"), "w"))
 PY
 }
 mkdir -p target/quick
@@ -50,8 +54,8 @@ d=target/quick/$label
 rm -rf "$d" && mkdir -p "$d"
 for row in "$@"; do
   for leg in base1 cand1 cand2 base2; do
-    case $leg in base*) c=$base ;; *) c=$cand ;; esac
-    echo "$c --bench target/quick/${suite_prefix}-$row.json > $d/r$row-$leg.out 2> $d/r$row-$leg.err"
+    case $leg in base*) c=$base s=${suite_prefix}-$row.json ;; *) c=$cand s=${suite_prefix}-$row-cand.json ;; esac
+    echo "$c --bench target/quick/$s > $d/r$row-$leg.out 2> $d/r$row-$leg.err"
   done > "$d/row-$row.sh"
   python3 ~/.cache/gibbs/central_scheduler.py run --label "qa-$label-$row" -- bash "$d/row-$row.sh"
 done

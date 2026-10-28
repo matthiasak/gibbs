@@ -1408,6 +1408,7 @@ fn gpu_fixture(family: &str) -> Outcome {
             let c = gibbs_engine::model::classifier::SequenceClassifier::from_fasttext(
                 "golden/fasttext",
                 &path,
+                Device::Metal,
             )
             .unwrap_or_else(|e| panic!("fasttext: {e}"));
             assert_eq!(c.device(), Device::Metal, "fasttext");

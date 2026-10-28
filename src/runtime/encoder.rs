@@ -78,7 +78,7 @@ impl SpecEncoder {
     pub fn load(
         artifacts: &ModelArtifacts,
         family: Option<&str>,
-        device: Device,
+        mode: impl Into<PlacementMode>,
         head: &str,
     ) -> Result<Self, String> {
         let reencode = ReencodeConfig {
@@ -86,11 +86,12 @@ impl SpecEncoder {
             ..Default::default()
         };
         let model = load::load_with(artifacts, crate::arch::registry()?, family, reencode)?;
-        Self::new(model, device, head)
+        Self::new(model, mode.into(), head)
     }
 
-    /// Compiles `model`'s `head` instance on `device`; refuses checkpoint tensors it never reads.
-    pub fn new(model: Model, device: Device, head: &str) -> Result<Self, String> {
+    /// Compiles `model`'s `head` instance under `mode`; refuses checkpoint tensors it never reads.
+    pub fn new(model: Model, mode: PlacementMode, head: &str) -> Result<Self, String> {
+        let device = crate::graph::avenues::resolved_backend(mode);
         load::check(&model)?;
         let fam = model.spec.family.clone();
         let rt: Runtime = model.spec.runtime_as()?;
@@ -115,7 +116,7 @@ impl SpecEncoder {
         }
         let weights = model.store.materialize(&first.weights)?;
         let params = weights.parameter_count();
-        let program = GraphProgram::compile_reshapable(first.graph.clone(), weights, PlacementMode::Pin(device))?;
+        let program = GraphProgram::compile_reshapable(first.graph.clone(), weights, mode)?;
         if program.primary_device() != device || (device != Device::Cpu && program.cpu_node_count() > 0) {
             return Err(format!(
                 "gpu-only: {fam} compiled for {} with {} CPU nodes, wanted every node on {device}",
@@ -220,7 +221,7 @@ impl SpecEncoder {
             .iter()
             .map(|d| self.input(d, ids, types))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut out = self.program.lock().run_reshaped(&inst.graph, inputs)?;
+        let mut out = self.program.lock().run_reshaped(&inst.graph, inputs, true)?;
         if out.is_empty() {
             return Err("encoder graph produced no output".into());
         }
@@ -498,7 +499,7 @@ impl Classifier {
     /// A Hugging Face `*ForSequenceClassification` checkpoint `r` of `repo_id` on its encoder
     /// family. A PEFT adapter is merged into its base once (`peft::prepare_seq_cls`), and the
     /// resolved config (classification class, labels) is written beside the merged weights.
-    pub fn from_hf(hub: &HuggingFaceHub, repo_id: &str, r: Resolved, device: Device) -> Result<(Meta, Self), String> {
+    pub fn from_hf(hub: &HuggingFaceHub, repo_id: &str, r: Resolved, mode: PlacementMode) -> Result<(Meta, Self), String> {
         let token = std::env::var("HF_TOKEN").ok();
         // A PEFT adapter reads its base model's tokenizer unless it ships one.
         let tok_repo = match &r.peft {
@@ -523,7 +524,7 @@ impl Classifier {
             std::fs::write(&path, cfg.to_string()).map_err(|e| format!("{}: {e}", path.display()))?;
             a.config_path = Some(path);
         }
-        let enc = SpecEncoder::load(&a, None, device, "classify").map_err(|e| format!("{repo_id}: {e}"))?;
+        let enc = SpecEncoder::load(&a, None, mode, "classify").map_err(|e| format!("{repo_id}: {e}"))?;
         let tok_cfg = hub
             .fetch_file(tok_repo, "tokenizer_config.json")
             .ok()
@@ -550,7 +551,7 @@ impl Classifier {
     /// A sentence-transformers repo with a scikit-learn head (`config_setfit.json`): the body
     /// pooled per `1_Pooling/config.json` (and normalized) in its encoder spec, then the joblib
     /// `model_head.pkl` LogisticRegression; scores are its `predict_proba`.
-    pub fn from_sentence_transformers(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<(Meta, Self), String> {
+    pub fn from_sentence_transformers(hub: &HuggingFaceHub, repo_id: &str, mode: PlacementMode) -> Result<(Meta, Self), String> {
         let err = |e: String| format!("{repo_id}: {e}");
         let st = read_json(&hub.fetch_file(repo_id, "config_setfit.json")?)?;
         let cfg = read_json(&hub.fetch_file(repo_id, "config.json")?)?;
@@ -598,7 +599,7 @@ impl Classifier {
         }
         let token = std::env::var("HF_TOKEN").ok();
         let art = hub.auto_download_and_cache(repo_id, token.as_deref())?;
-        let enc = SpecEncoder::load(&art, None, device, &head_kind).map_err(err)?;
+        let enc = SpecEncoder::load(&art, None, mode, &head_kind).map_err(err)?;
         let hidden = enc.var("hidden")?;
         let sbert = hub
             .fetch_file(repo_id, "sentence_bert_config.json")
@@ -644,7 +645,7 @@ impl Classifier {
     /// A GGUF classifier or reranker export at `path` on the encoder family of its
     /// architecture: labels from `<arch>.classifier.output_labels`; one logit is a raw score, more
     /// are softmaxed.
-    pub fn from_gguf(path: &Path, device: Device) -> Result<(Meta, Self), String> {
+    pub fn from_gguf(path: &Path, mode: PlacementMode) -> Result<(Meta, Self), String> {
         let meta = crate::model::gguf_meta::GgufMeta::open(path)?;
         let arch = meta.arch().unwrap_or_default();
         let fam = gguf_family(&arch)
@@ -656,7 +657,7 @@ impl Classifier {
             is_cached: true,
             ..Default::default()
         };
-        let enc = SpecEncoder::load(&artifacts, Some(&fam), device, "classify")?;
+        let enc = SpecEncoder::load(&artifacts, Some(&fam), mode, "classify")?;
         let n = enc.var("labels")?;
         let labels = match meta.strings(&format!("{arch}.classifier.output_labels")) {
             Some(l) if l.len() == n => l,

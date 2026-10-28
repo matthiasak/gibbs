@@ -376,7 +376,7 @@ impl Towers {
             tower.program = Some((key.clone(), p));
         }
         let (k, p) = tower.program.as_mut().unwrap();
-        let out = if *k == key { p.run(inputs)? } else { p.run_reshaped(&inst.graph, inputs)? };
+        let out = if *k == key { p.run(inputs)? } else { p.run_reshaped(&inst.graph, inputs, true)? };
         inst.outputs
             .iter()
             .cloned()

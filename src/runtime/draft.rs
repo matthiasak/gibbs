@@ -197,7 +197,7 @@ impl Comp {
         std::mem::swap(&mut p.state, state);
         let out = match ShapeCache::key(vars) == self.key {
             true => p.run(ins),
-            false => p.run_reshaped(&inst.graph, ins),
+            false => p.run_reshaped(&inst.graph, ins, true),
         };
         std::mem::swap(&mut p.state, state);
         Ok(inst.outputs.iter().cloned().zip(out?).collect())

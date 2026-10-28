@@ -301,7 +301,7 @@ impl SpecEncDec {
             p.state = StateStore::new();
             match *b0 == bucket {
                 true => p.run(inputs)?,
-                false => p.run_reshaped(&inst.graph, inputs)?,
+                false => p.run_reshaped(&inst.graph, inputs, true)?,
             }
         };
         let mut state = StateStore::new();

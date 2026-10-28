@@ -9,7 +9,7 @@ mod gpu_tests;
 #[cfg(test)]
 pub(crate) mod synth;
 
-use crate::hardware::Device;
+use crate::hardware::{Device, PlacementMode};
 use crate::model::hf_loader::ChatMessage;
 use crate::model::hub::{is_synthetic_model_id, split_weight_file, HuggingFaceHub};
 use crate::model::loaders::{read_checkpoint, SafetensorsWeightReader, WeightReader};
@@ -350,12 +350,14 @@ pub fn architecture_in(path: &Path) -> Option<String> {
 
 impl SequenceClassifier {
     /// Fetches config.json, the tokenizer files, and the weights of `repo_id`, and builds the
-    /// classifier on `device`.
-    pub fn load(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
+    /// classifier under `mode` (a device pins it).
+    pub fn load(hub: &HuggingFaceHub, repo_id: &str, mode: impl Into<PlacementMode>) -> Result<Self, String> {
+        let mode = mode.into();
+        let device = crate::graph::avenues::resolved_backend(mode);
         let resolved = encoder::resolve_config(hub, repo_id);
         // SetFit: a sentence-transformers body + a scikit-learn head.
         if resolved.is_err() && hub.fetch_file(repo_id, "config_setfit.json").is_ok() {
-            return Self::from_setfit(hub, repo_id, device);
+            return Self::from_setfit(hub, repo_id, mode);
         }
         if resolved.is_err()
             && crate::model::gguf_meta::hub_arch(hub, repo_id).is_some_and(|a| encoder::gguf_family(&a).is_some())
@@ -365,7 +367,7 @@ impl SequenceClassifier {
             let path = art
                 .weights_path
                 .ok_or_else(|| format!("{repo_id}: no GGUF file"))?;
-            return Self::from_gguf(repo_id, &path, device);
+            return Self::from_gguf(repo_id, &path, mode);
         }
         if resolved.is_err() {
             let cfg = hub
@@ -374,15 +376,15 @@ impl SequenceClassifier {
             if cfg.is_ok_and(|c| c["architecture"] == FASTTEXT_EXPORT) {
                 hub.fetch_file(repo_id, "vocab.json")?;
                 let w = hub.fetch_file(repo_id, "weights.pt")?;
-                return Self::from_fasttext(repo_id, w.parent().unwrap_or(Path::new(".")));
+                return Self::from_fasttext(repo_id, w.parent().unwrap_or(Path::new(".")), mode);
             }
             if let Some(file) = crate::model::fasttext::hub_file(hub, repo_id) {
-                return Self::from_fasttext(repo_id, &hub.fetch_file(repo_id, &file)?);
+                return Self::from_fasttext(repo_id, &hub.fetch_file(repo_id, &file)?, mode);
             }
         }
         let r = resolved?;
         if encoder::family(&r.cfg, Some(&r.arch)).is_some() {
-            let (m, c) = encoder::Classifier::from_hf(hub, repo_id, r, device)?;
+            let (m, c) = encoder::Classifier::from_hf(hub, repo_id, r, mode)?;
             return Ok(Self::encoder(repo_id, m, c));
         }
         let (cfg, arch, peft) = (r.cfg, r.arch, r.peft);
@@ -486,26 +488,21 @@ impl SequenceClassifier {
     }
 
     /// A SetFit repo: a sentence-transformers encoder body + a scikit-learn LogisticRegression.
-    pub fn from_setfit(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
-        let (m, c) = encoder::Classifier::from_sentence_transformers(hub, repo_id, device)?;
+    pub fn from_setfit(hub: &HuggingFaceHub, repo_id: &str, mode: impl Into<PlacementMode>) -> Result<Self, String> {
+        let (m, c) = encoder::Classifier::from_sentence_transformers(hub, repo_id, mode.into())?;
         Ok(Self::encoder(repo_id, m, c))
     }
 
     /// A fastText `.bin`/`.ftz` classifier, or (when `path` is a directory) a fastText
     /// hierarchical-softmax re-export (`config.json` + `vocab.json` + `weights.pt`).
-    pub fn from_fasttext(repo_id: &str, path: &Path) -> Result<Self, String> {
-        // The graph runs on the CPU, or on Metal once the GPU-only tripwire is armed.
-        let dev = if crate::hardware::cpu_compute::banned() {
-            Device::Metal
-        } else {
-            Device::Cpu
-        };
+    /// Its bag graph compiles under `mode`.
+    pub fn from_fasttext(repo_id: &str, path: &Path, mode: impl Into<PlacementMode>) -> Result<Self, String> {
         let m = if path.is_dir() {
             crate::model::fasttext::load_export(path)?
         } else {
             crate::model::fasttext::load(path)?
         };
-        let ft = crate::runtime::bag::BagClassifier::new("fasttext", m, dev)?;
+        let ft = crate::runtime::bag::BagClassifier::new("fasttext", m, mode)?;
         Ok(Self {
             repo_id: repo_id.to_string(),
             architecture: "fastText".into(),
@@ -516,8 +513,8 @@ impl SequenceClassifier {
     }
 
     /// A GGUF classifier or reranker export at `path`.
-    pub fn from_gguf(repo_id: &str, path: &Path, device: Device) -> Result<Self, String> {
-        let (m, c) = encoder::Classifier::from_gguf(path, device)?;
+    pub fn from_gguf(repo_id: &str, path: &Path, mode: impl Into<PlacementMode>) -> Result<Self, String> {
+        let (m, c) = encoder::Classifier::from_gguf(path, mode.into())?;
         Ok(Self::encoder(repo_id, m, c))
     }
 

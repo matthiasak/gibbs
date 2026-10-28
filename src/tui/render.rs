@@ -698,7 +698,7 @@ mod tests {
         };
         let gpu = placement_modal_lines(&[row("Linear", Device::Metal, 4)]);
         assert!(gpu.iter().all(|l| !l.1), "{gpu:?}");
-        assert_eq!(gpu.last().unwrap().0, "100% Metal");
+        assert_eq!(gpu.last().unwrap().0, "100% accelerated (Metal 4)");
         let mixed =
             placement_modal_lines(&[row("Linear", Device::Metal, 3), row("Relu", Device::Cpu, 2)]);
         let flagged: Vec<&str> = mixed.iter().filter(|l| l.1).map(|l| l.0.as_str()).collect();

@@ -73,10 +73,7 @@ pub fn runs_spec_lm_gguf(arch: &str) -> bool {
 }
 
 fn device(p: PlacementMode) -> Device {
-    match p {
-        PlacementMode::Pin(d) => d,
-        PlacementMode::Auto => crate::hardware::default_device(),
-    }
+    crate::graph::avenues::resolved_backend(p)
 }
 
 /// Resolves, downloads and loads `id`.
@@ -85,23 +82,23 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
     if o.family.is_none() {
         // Encoders: System 1 and sequence classifiers run their family specs (`runtime::encoder`).
         let system1 = || {
-            let dev = match device(o.placement) {
+            let mode = match device(o.placement) {
                 // The CLI runs the System 1 encoder on Metal wherever it exists.
                 Device::Cpu
                     if o.system1_first
                         && crate::hardware::available_devices().contains(&Device::Metal) =>
                 {
-                    Device::Metal
+                    PlacementMode::Pin(Device::Metal)
                 }
-                d => d,
+                _ => o.placement,
             };
-            JevSystem1Model::load(hub, id, dev).map(Loaded::System1)
+            JevSystem1Model::load(hub, id, mode).map(Loaded::System1)
         };
         if o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();
         }
         if classifier::detect(hub, id).is_some() {
-            return SequenceClassifier::load(hub, id, device(o.placement)).map(Loaded::Classifier);
+            return SequenceClassifier::load(hub, id, o.placement).map(Loaded::Classifier);
         }
         if !o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();

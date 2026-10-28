@@ -1,13 +1,15 @@
-//! Execution of placed computational graphs: one device per program.
+//! Execution of placed computational graphs: one primary device per program, plus (on Apple
+//! hosts) Neural Engine regions split off it when they pass the measured gate ([`gate`]).
 
 use crate::graph::passes::fusion::FuseWeights;
 use crate::graph::placement::{
-    device_supports_op, place_graph, placement_rows, PlacementPlan, PlacementRow,
+    device_supports_op, place_graph, placement_rows, PlacementPlan, PlacementRow, Secondary,
 };
-use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, ValueId, Weights};
+use crate::graph::{cpu, DType, Graph, NodeId, Op, StateStore, Tensor, ValueId, ValueKind, Weights};
 use crate::hardware::{available_devices, Device, PlacementMode};
+use std::collections::HashMap;
 
-/// The program's executable form on its one device.
+/// The program's executable form on one device.
 pub enum CompiledSegment {
     Cpu {
         graph: Graph,
@@ -16,8 +18,17 @@ pub enum CompiledSegment {
     #[cfg(target_os = "macos")]
     Metal {
         graph: Graph,
-        session: crate::graph::metal::Session,
+        session: std::sync::Arc<crate::graph::metal::Session>,
         plan: crate::graph::metal::PreparedPlan,
+    },
+    /// A region lowered to one ANE program; `tables` holds the `inv_freq` weights its host-side
+    /// Rope tables read.
+    #[cfg(target_os = "macos")]
+    Ane {
+        graph: Graph,
+        program: crate::graph::ane::AneProgram,
+        io: crate::graph::ane::IoLayout,
+        tables: Weights,
     },
     /// CUDA, ROCm or Intel XPU: the portable executor.
     Portable {
@@ -37,6 +48,8 @@ impl CompiledSegment {
             Self::Cpu { .. } => Device::Cpu,
             #[cfg(target_os = "macos")]
             Self::Metal { .. } => Device::Metal,
+            #[cfg(target_os = "macos")]
+            Self::Ane { .. } => Device::Ane,
             Self::Portable { device, .. } => *device,
             Self::Xla { .. } => Device::Xla,
         }
@@ -48,8 +61,151 @@ impl CompiledSegment {
                 graph
             }
             #[cfg(target_os = "macos")]
-            Self::Metal { graph, .. } => graph,
+            Self::Metal { graph, .. } | Self::Ane { graph, .. } => graph,
         }
+    }
+
+    /// Runs the segment's graph with `inputs` bound to its inputs inside `state`.
+    fn run(&mut self, state: &mut StateStore, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
+        match self {
+            Self::Cpu { graph, weights } => cpu::run(graph, weights, state, inputs),
+            Self::Portable { session, .. } => session.run(state, inputs),
+            Self::Xla { graph, session } => session.run(graph, state, inputs),
+            #[cfg(target_os = "macos")]
+            Self::Metal {
+                graph,
+                session,
+                plan,
+            } => session.run_prepared(graph, plan, Some(state), inputs),
+            #[cfg(target_os = "macos")]
+            Self::Ane {
+                graph,
+                program,
+                io,
+                tables,
+            } => crate::graph::ane::run(program, io, graph, tables, &inputs),
+        }
+    }
+}
+
+/// One segment of a heterogeneous program: its compiled fragment and the program values bound,
+/// in order, to the fragment's inputs and outputs.
+pub struct SegmentExec {
+    pub compiled: CompiledSegment,
+    pub inputs: Vec<ValueId>,
+    pub outputs: Vec<ValueId>,
+}
+
+/// Runs `segments` in order: `inputs` bind to `graph_inputs`, each segment reads the values
+/// earlier segments (or the inputs) produced, and `graph_outputs` are returned.
+fn run_segments(
+    segments: &mut [SegmentExec],
+    state: &mut StateStore,
+    graph_inputs: &[ValueId],
+    graph_outputs: &[ValueId],
+    inputs: Vec<Tensor>,
+) -> Result<Vec<Tensor>, String> {
+    let mut vals: HashMap<ValueId, Tensor> = graph_inputs.iter().copied().zip(inputs).collect();
+    let take = |vals: &HashMap<ValueId, Tensor>, v: &ValueId| {
+        vals.get(v)
+            .cloned()
+            .ok_or_else(|| format!("segment value {v:?} was never produced"))
+    };
+    for seg in segments {
+        let ins = seg
+            .inputs
+            .iter()
+            .map(|v| take(&vals, v))
+            .collect::<Result<Vec<_>, _>>()?;
+        let outs = seg.compiled.run(state, ins)?;
+        vals.extend(seg.outputs.iter().copied().zip(outs));
+    }
+    graph_outputs.iter().map(|v| take(&vals, v)).collect()
+}
+
+/// `nodes` of `graph` as a standalone graph: operands produced outside become inputs (first-use
+/// order), weights and states keep their names, and its outputs are the values a node outside
+/// `nodes` or `graph.outputs` reads. Returns it with the `graph` values bound to its inputs and
+/// outputs.
+fn fragment(graph: &Graph, nodes: &[NodeId]) -> (Graph, Vec<ValueId>, Vec<ValueId>) {
+    let inside: std::collections::HashSet<u32> = nodes.iter().map(|n| n.0).collect();
+    let mut read_outside: std::collections::HashSet<ValueId> =
+        graph.outputs.iter().copied().collect();
+    for (i, n) in graph.nodes.iter().enumerate() {
+        if !inside.contains(&(i as u32)) {
+            read_outside.extend(n.inputs.iter().copied());
+        }
+    }
+    let mut g = Graph::new();
+    let mut map: HashMap<ValueId, ValueId> = HashMap::new();
+    let (mut ins, mut outs) = (Vec::new(), Vec::new());
+    for &n in nodes {
+        let node = graph.node(n);
+        let mut operands = Vec::with_capacity(node.inputs.len());
+        for &v in &node.inputs {
+            let id = *map.entry(v).or_insert_with(|| {
+                let id = ValueId(g.values.len() as u32);
+                let mut val = graph.value(v).clone();
+                if !matches!(val.kind, ValueKind::Weight | ValueKind::State { .. }) {
+                    val.kind = ValueKind::Input;
+                    g.inputs.push(id);
+                    ins.push(v);
+                }
+                g.values.push(val);
+                id
+            });
+            operands.push(id);
+        }
+        let nid = NodeId(g.nodes.len() as u32);
+        let mut results = Vec::with_capacity(node.outputs.len());
+        for &v in &node.outputs {
+            let id = ValueId(g.values.len() as u32);
+            let mut val = graph.value(v).clone();
+            val.kind = ValueKind::Node(nid);
+            g.values.push(val);
+            map.insert(v, id);
+            results.push(id);
+            if read_outside.contains(&v) {
+                g.outputs.push(id);
+                outs.push(v);
+            }
+        }
+        g.nodes.push(crate::graph::Node {
+            name: node.name.clone(),
+            op: node.op.clone(),
+            inputs: operands,
+            outputs: results,
+            device: node.device,
+        });
+    }
+    (g, ins, outs)
+}
+
+/// Whether `graph` is a decode instance (an attention over cached keys for one query row): the
+/// ANE's ~0.1 ms per evaluation never pays there.
+fn is_decode(graph: &Graph) -> bool {
+    graph.nodes.iter().any(|n| {
+        matches!(n.op, Op::CachedAttention { .. }) && {
+            let s = &graph.value(n.inputs[0]).shape;
+            s.len() > 1 && s[..s.len() - 1].iter().product::<usize>() == 1
+        }
+    })
+}
+
+/// The ANE secondary a program compiled under `mode` may offload to: forced by `Pin(Ane)`,
+/// gated under `Auto` on a Metal host, otherwise none.
+fn secondary_for(mode: PlacementMode, available: &[Device]) -> Option<Secondary> {
+    let ane = available.contains(&Device::Ane) && available.contains(&Device::Metal);
+    match mode {
+        PlacementMode::Pin(Device::Ane) if ane => Some(Secondary {
+            device: Device::Ane,
+            force: true,
+        }),
+        PlacementMode::Auto if ane => Some(Secondary {
+            device: Device::Ane,
+            force: false,
+        }),
+        _ => None,
     }
 }
 
@@ -62,11 +218,17 @@ struct ReshapedInstance {
     graph: Graph,
     #[cfg(target_os = "macos")]
     plan: Option<crate::graph::metal::PreparedPlan>,
+    /// The instance split into Metal and ANE segments when the gate chose that; empty: `plan`.
+    segments: Vec<SegmentExec>,
 }
 
 /// An executable graph program with state persistence.
 pub struct GraphProgram {
+    /// The whole graph on the primary device (its nodes' `device` marks the ANE regions).
     pub segment: CompiledSegment,
+    /// The graph split into primary-device and ANE segments when the gate chose that; empty:
+    /// [`Self::segment`] runs it.
+    pub segments: Vec<SegmentExec>,
     pub plan: PlacementPlan,
     pub primary_device: Device,
     pub state: StateStore,
@@ -83,6 +245,16 @@ pub struct GraphProgram {
     /// The one-element f32 weights: the constants the canonical reductions of a reshaped
     /// instance test.
     scalars: Weights,
+    /// The device reshaped instances may offload regions to.
+    secondary: Option<Secondary>,
+    /// Host copies of the weights the secondary lowers (it compiles them into its programs), for
+    /// reshaped instances; `None` for decode programs under `Auto`.
+    // ponytail: duplicates the offloadable weights in host memory for the program's lifetime;
+    // read them back from the Metal buffers if that RSS matters.
+    ane_weights: Option<Weights>,
+    /// Reshaped instance keys whose gate kept every region on Metal: re-planned instances skip
+    /// the gate (an evicted instance is rebuilt often).
+    ane_metal_only: std::collections::HashSet<((usize, usize), Vec<Vec<usize>>)>,
 }
 
 /// The positions a fed stream from `pos` may write without regrowing contiguous state buffers:
@@ -230,8 +402,32 @@ impl GraphProgram {
         } else {
             available_devices()
         };
+        let secondary = secondary_for(mode, &available).filter(|_| dump.is_none());
+        // `--backend ane`: Metal runs what the ANE does not.
+        let primary_mode = match secondary {
+            Some(s) if s.force => PlacementMode::Pin(Device::Metal),
+            _ => mode,
+        };
+        let offload = secondary.filter(|_| !is_decode(&graph));
         #[allow(unused_mut)]
-        let mut plan = place_and_adapt(&mut graph, mode, &available)?;
+        let mut plan = place_and_adapt(&mut graph, primary_mode, &available, offload)?;
+        let ane_weights = secondary
+            .filter(|s| keep_folded && (s.force || offload.is_some()))
+            .map(|s| {
+                let mut w = Weights::new();
+                for node in &graph.nodes {
+                    if !crate::graph::placement::secondary_supports(s.device, &graph, node) {
+                        continue;
+                    }
+                    for &v in &node.inputs {
+                        let val = graph.value(v);
+                        if let (ValueKind::Weight, Some(t)) = (&val.kind, weights.get(&val.name)) {
+                            w.insert(val.name.clone(), t.clone());
+                        }
+                    }
+                }
+                w
+            });
         if let Some(unfused) = &unfused {
             for (name, t) in unfused.iter() {
                 if weights.get(name).is_none() {
@@ -255,6 +451,8 @@ impl GraphProgram {
         let graph_outputs = graph.outputs.clone();
         let paged = crate::graph::paged_states(&graph);
         let mut kv_pool = None;
+        #[allow(unused_mut)]
+        let mut segments = Vec::new();
         let segment = match primary_device {
             #[cfg(target_os = "macos")]
             Device::Metal if !plan.segments.is_empty() => {
@@ -265,7 +463,11 @@ impl GraphProgram {
                 if !paged.is_empty() {
                     kv_pool = Some(session.new_kv_pool(&paged)?);
                 }
+                let session = std::sync::Arc::new(session);
                 let prepared_plan = session.prepare_plan(&graph)?;
+                if let Some(s) = offload {
+                    segments = gate(&mut graph, &mut plan, &session, &weights, s)?;
+                }
                 CompiledSegment::Metal {
                     graph,
                     session,
@@ -290,13 +492,15 @@ impl GraphProgram {
                 let session = crate::graph::xla::XlaSession::compile(&graph, weights)?;
                 CompiledSegment::Xla { graph, session }
             }
-            _ => CompiledSegment::Cpu { graph, weights },
+            Device::Cpu => CompiledSegment::Cpu { graph, weights },
+            d => return Err(format!("--backend {d}: no executor for it on this host")),
         };
 
         let kv_pool =
             kv_pool.or_else(|| (!paged.is_empty()).then(|| crate::kv::KvPool::host(&paged)));
         let prog = Self {
             segment,
+            segments,
             plan,
             primary_device,
             state: StateStore::new(),
@@ -307,6 +511,9 @@ impl GraphProgram {
             argmax: None,
             reshaped_graphs: Vec::new(),
             scalars,
+            secondary,
+            ane_weights,
+            ane_metal_only: Default::default(),
         };
         if mode != PlacementMode::Pin(Device::Cpu) {
             COMPILED_CPU_NODES
@@ -434,9 +641,34 @@ impl GraphProgram {
     /// Whether the program is exactly one Metal segment.
     pub fn is_single_metal(&self) -> bool {
         #[cfg(target_os = "macos")]
-        return matches!(self.segment, CompiledSegment::Metal { .. });
+        return self.segments.is_empty() && matches!(self.segment, CompiledSegment::Metal { .. });
         #[cfg(not(target_os = "macos"))]
         false
+    }
+
+    /// The ANE segments of a reshaped instance `g` (on `session`) when the program has a
+    /// secondary, `allow` (or `--backend ane`) admits it and the gate keeps regions; empty
+    /// otherwise.
+    #[cfg(target_os = "macos")]
+    fn instance_segments(
+        &self,
+        g: &mut Graph,
+        session: &std::sync::Arc<crate::graph::metal::Session>,
+        allow: bool,
+    ) -> Result<Vec<SegmentExec>, String> {
+        let (Some(sec), Some(weights)) = (self.secondary, &self.ane_weights) else {
+            return Ok(Vec::new());
+        };
+        if !allow || is_decode(g) {
+            return Ok(Vec::new());
+        }
+        // A secondary exists only on a host with Metal and the ANE: no device probing per instance.
+        let (mode, devices) = (PlacementMode::Pin(Device::Metal), [Device::Metal, sec.device]);
+        let Ok(mut placed) = place_graph(g, mode, &devices, &device_supports_op, Some(sec))
+        else {
+            return Ok(Vec::new());
+        };
+        gate(g, &mut placed, session, weights, sec)
     }
 
     /// Runs `graph` with the program's weights inside the program's state: another instance shape of
@@ -444,10 +676,13 @@ impl GraphProgram {
     /// are cached by the graph's node and output counts and input shapes, which identify such a
     /// graph (prefill chunks repeat): on a miss the graph is canonicalized and fused onto the fused
     /// weights the program binds ([`FuseWeights::ReuseOnly`]), and Metal plans it.
+    /// `allow_secondary`: the instance may offload ANE regions (gated under `Auto`, forced under
+    /// `--backend ane`); callers pass `false` for latency-bound passes such as speculative verify.
     pub fn run_reshaped(
         &mut self,
         graph: &Graph,
         inputs: Vec<Tensor>,
+        allow_secondary: bool,
     ) -> Result<Vec<Tensor>, String> {
         #[cfg(test)]
         crate::graph::shape::note(graph);
@@ -476,20 +711,40 @@ impl GraphProgram {
                 crate::graph::passes::prefuse(&mut g);
                 crate::graph::passes::fuse(&mut g, FuseWeights::ReuseOnly(program))?;
                 crate::graph::passes::canonical::run(&mut g, &self.scalars);
+                #[cfg(target_os = "macos")]
+                let (plan, segments, metal_only) = match &self.segment {
+                    CompiledSegment::Metal { session, .. } => {
+                        let plan = session.prepare_plan(&g)?;
+                        let gated = allow_secondary && !self.ane_metal_only.contains(&(key, shapes.clone()));
+                        let segs = self.instance_segments(&mut g, session, gated)?;
+                        let metal_only = gated && segs.is_empty();
+                        (Some(plan), segs, metal_only)
+                    }
+                    _ => (None, Vec::new(), false),
+                };
+                #[cfg(target_os = "macos")]
+                if metal_only {
+                    self.ane_metal_only.insert((key, shapes.clone()));
+                }
+                #[cfg(not(target_os = "macos"))]
+                let (segments, _) = (Vec::new(), allow_secondary);
                 ReshapedInstance {
                     key,
                     shapes,
                     #[cfg(target_os = "macos")]
-                    plan: match &self.segment {
-                        CompiledSegment::Metal { session, .. } => Some(session.prepare_plan(&g)?),
-                        _ => None,
-                    },
+                    plan,
+                    segments,
                     graph: g,
                 }
             }
         };
         self.reshaped_graphs.push(entry);
-        let r = &self.reshaped_graphs[self.reshaped_graphs.len() - 1];
+        let last = self.reshaped_graphs.len() - 1;
+        let r = &mut self.reshaped_graphs[last];
+        if !r.segments.is_empty() {
+            let g = &r.graph;
+            return run_segments(&mut r.segments, &mut self.state, &g.inputs, &g.outputs, inputs);
+        }
         let graph = &r.graph;
         match &mut self.segment {
             CompiledSegment::Cpu { weights, .. } => {
@@ -507,6 +762,8 @@ impl GraphProgram {
                     .expect("a Metal program plans its instances");
                 session.run_prepared(graph, plan, Some(&mut self.state), inputs)
             }
+            #[cfg(target_os = "macos")]
+            CompiledSegment::Ane { .. } => unreachable!("the primary segment is never the ANE"),
         }
     }
 
@@ -520,19 +777,11 @@ impl GraphProgram {
             ));
         }
         self.attach_kv()?;
-        match &mut self.segment {
-            CompiledSegment::Cpu { graph, weights } => {
-                cpu::run(graph, weights, &mut self.state, inputs)
-            }
-            CompiledSegment::Portable { session, .. } => session.run(&mut self.state, inputs),
-            CompiledSegment::Xla { graph, session } => session.run(graph, &mut self.state, inputs),
-            #[cfg(target_os = "macos")]
-            CompiledSegment::Metal {
-                graph,
-                session,
-                plan,
-            } => session.run_prepared(graph, plan, Some(&mut self.state), inputs),
+        if !self.segments.is_empty() {
+            let (ins, outs) = (&self.graph_inputs, &self.graph_outputs);
+            return run_segments(&mut self.segments, &mut self.state, ins, outs, inputs);
         }
+        self.segment.run(&mut self.state, inputs)
     }
 
     /// The next token of a greedy decode stream: `last` is the input token at position `pos` (the
@@ -556,7 +805,9 @@ impl GraphProgram {
             return Ok(None);
         }
         self.attach_kv()?;
-        let CompiledSegment::Metal { graph, session, .. } = &self.segment else {
+        let (true, CompiledSegment::Metal { graph, session, .. }) =
+            (self.segments.is_empty(), &self.segment)
+        else {
             return Ok(None);
         };
         if let Some(s) = self.state.stream.0.as_deref() {
@@ -638,11 +889,14 @@ impl GraphProgram {
                 self.state.stream.0 = None;
             }
         }
-        let CompiledSegment::Metal {
-            graph,
-            session,
-            plan,
-        } = &self.segment
+        let (
+            true,
+            CompiledSegment::Metal {
+                graph,
+                session,
+                plan,
+            },
+        ) = (self.segments.is_empty(), &self.segment)
         else {
             return Ok(None);
         };
@@ -753,18 +1007,15 @@ impl GraphProgram {
     }
 }
 
-/// Places `graph` (at most one segment) and, on Metal, adapts its dtypes to the Metal kernels.
+/// Places `graph` (offloading regions to `secondary` when given) and, on Metal, adapts its dtypes
+/// to the Metal kernels.
 fn place_and_adapt(
     graph: &mut Graph,
     mode: PlacementMode,
     available: &[Device],
+    secondary: Option<Secondary>,
 ) -> Result<PlacementPlan, String> {
-    let plan = place_graph(graph, mode, available, &device_supports_op)
-        .map_err(|report| report.error())?;
-    assert!(
-        plan.segments.len() <= 1,
-        "placement yields at most one segment"
-    );
+    let plan = place_graph(graph, mode, available, &device_supports_op, secondary)?;
     let device = plan.primary_device();
     if device == Device::Metal || crate::graph::portable::is_portable(device) {
         crate::graph::passes::dtype_adapt::run(graph);
@@ -773,6 +1024,403 @@ fn place_and_adapt(
         })?;
     }
     Ok(plan)
+}
+
+/// Relative RMS error every output of an ANE region may show against Metal's.
+const ANE_REL_ERR: f32 = 2e-2;
+/// A region's ANE median must be at most this fraction of Metal's to be kept (`Auto`).
+const ANE_SPEEDUP: f64 = 0.95;
+
+/// A measured ANE offload decision for one region signature ([`gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AneDecision {
+    /// Median of 3 timed runs of the region on Metal and on the ANE (host boundary copies
+    /// included).
+    pub metal_ms: f64,
+    pub ane_ms: f64,
+    /// Largest relative RMS error of an ANE output against Metal's (non-finite stored as
+    /// `f32::MAX`).
+    pub rel_err: f32,
+    /// `ane_ms <= 0.95 × metal_ms` and `rel_err <= 2e-2`: what `Auto` does.
+    pub chosen: bool,
+}
+
+/// One gated ANE region: its signature, extent and decision.
+#[derive(Debug, Clone)]
+pub struct AneReport {
+    pub signature: u64,
+    /// `{n} nodes: {first} … {last}`.
+    pub region: String,
+    pub decision: AneDecision,
+    /// This process measured it (else the host cache held it).
+    pub measured: bool,
+    /// The program runs the region on the ANE.
+    pub offloaded: bool,
+}
+
+impl std::fmt::Display for AneReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let d = &self.decision;
+        write!(
+            f,
+            "ANE region {:016x} ({}): Metal {:.3} ms, ANE {:.3} ms, rel err {:.2e}{} -> {}",
+            self.signature,
+            self.region,
+            d.metal_ms,
+            d.ane_ms,
+            d.rel_err,
+            if self.measured { "" } else { " (cached)" },
+            if self.offloaded { "ANE" } else { "Metal" }
+        )
+    }
+}
+
+static ANE_REPORTS: std::sync::Mutex<Vec<AneReport>> = std::sync::Mutex::new(Vec::new());
+
+/// Every ANE gate decision this process made or reused, in order.
+pub fn ane_reports() -> Vec<AneReport> {
+    ANE_REPORTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Decisions by signature (hex) from `<cache>/host/ane-decisions-<os build>.json`.
+static ANE_DECISIONS: std::sync::Mutex<Option<std::collections::BTreeMap<String, AneDecision>>> =
+    std::sync::Mutex::new(None);
+
+fn ane_decisions_path() -> Option<std::path::PathBuf> {
+    let os = crate::hardware::sysctl::string(c"kern.osversion").unwrap_or_default();
+    let dir = crate::hardware::default_cache_dir().ok()?.join("host");
+    Some(dir.join(format!("ane-decisions-{os}.json")))
+}
+
+/// Runs `f` over the persisted decisions (loaded on first use); `store` writes them back.
+fn with_ane_decisions<R>(
+    store: bool,
+    f: impl FnOnce(&mut std::collections::BTreeMap<String, AneDecision>) -> R,
+) -> R {
+    let mut slot = ANE_DECISIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = slot.get_or_insert_with(|| {
+        ane_decisions_path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    });
+    let r = f(map);
+    if let (true, Some(path)) = (store, ane_decisions_path()) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_vec_pretty(map) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+    r
+}
+
+/// FNV-64 over the node ops, devices, operand shapes and dtypes and weight names of `graph`, and
+/// the ANE lowering source (an edited lowering re-measures).
+fn signature(graph: &Graph) -> u64 {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for n in &graph.nodes {
+        let _ = write!(s, "{:?}|{:?}|", n.op, n.device);
+        for &v in n.inputs.iter().chain(&n.outputs) {
+            let val = graph.value(v);
+            let _ = write!(s, "{:?}{:?}", val.shape, val.dtype);
+            if val.kind == ValueKind::Weight {
+                s += &val.name;
+            }
+            s.push(';');
+        }
+    }
+    let lowering = include_bytes!("ane/mil.rs");
+    crate::graph::ane::fnv64(&[s.as_bytes(), lowering])
+}
+
+/// Deterministic inputs for `graph`: standard-normal f32, and u32 `iota` clamped below the rows
+/// of every embedding table the input indexes.
+fn synth_inputs(graph: &Graph) -> Vec<Tensor> {
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut uniform = move || {
+        s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    graph
+        .inputs
+        .iter()
+        .map(|&v| {
+            let val = graph.value(v);
+            let n: usize = val.shape.iter().product();
+            if val.dtype == DType::U32 {
+                let rows = graph
+                    .nodes
+                    .iter()
+                    .filter(|nd| matches!(nd.op, Op::Embedding) && nd.inputs.get(1) == Some(&v))
+                    .filter_map(|nd| graph.value(nd.inputs[0]).shape.first().copied())
+                    .min()
+                    .unwrap_or(usize::MAX);
+                Tensor::U32((0..n).map(|i| i.min(rows.saturating_sub(1)) as u32).collect())
+            } else {
+                Tensor::F32(
+                    (0..n)
+                        .map(|_| {
+                            let (a, b) = (uniform().max(1e-12), uniform());
+                            ((-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()) as f32
+                        })
+                        .collect(),
+                )
+            }
+        })
+        .collect()
+}
+
+/// One warm-up run of `f`, then the median of 3 timed runs (ms) and the warm-up's outputs.
+fn time_ms(
+    mut f: impl FnMut() -> Result<Vec<Tensor>, String>,
+) -> Result<(f64, Vec<Tensor>), String> {
+    let out = f()?;
+    let mut t = [0.0f64; 3];
+    for x in &mut t {
+        let start = std::time::Instant::now();
+        f()?;
+        *x = start.elapsed().as_secs_f64() * 1e3;
+    }
+    t.sort_by(f64::total_cmp);
+    Ok((t[1], out))
+}
+
+/// Puts every node of `graph` back on the primary device: one segment.
+fn demote(graph: &mut Graph, placed: &mut PlacementPlan) {
+    for n in &mut graph.nodes {
+        n.device = placed.primary;
+    }
+    *placed = crate::graph::placement::segments_of(graph, placed.primary);
+}
+
+/// Bytes of the weights the ANE regions of `graph` compile, in the encoding [`crate::graph::ane::lower`]
+/// picks: int4 `Q4_0`, int8 other quantized formats, fp16 floats.
+#[cfg(target_os = "macos")]
+fn ane_weight_bytes(graph: &Graph, info: &crate::graph::ane::AneInfo) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0;
+    for n in graph.nodes.iter().filter(|n| n.device == Device::Ane) {
+        for &v in &n.inputs {
+            let val = graph.value(v);
+            if val.kind != ValueKind::Weight || !seen.insert(v) {
+                continue;
+            }
+            let e: usize = val.shape.iter().product();
+            total += match val.dtype {
+                DType::Quant(crate::hardware::QuantFormat::GGUF_Q4_0) if info.int4.is_ok() => {
+                    e * 9 / 16
+                }
+                DType::Quant(_) if info.int8.is_ok() || info.int4.is_ok() => e * 17 / 16,
+                _ => e * 2,
+            };
+        }
+    }
+    total
+}
+
+/// The ANE region `g` lowered over `weights` and compiled.
+#[cfg(target_os = "macos")]
+fn compile_ane(
+    g: Graph,
+    weights: &Weights,
+    info: &crate::graph::ane::AneInfo,
+) -> Result<CompiledSegment, String> {
+    use crate::graph::ane;
+    let (mil, blob, io) = ane::lower(&g, weights, info)?;
+    let (n_in, n_out) = (io.inputs.len(), io.outputs.len());
+    let program = ane::AneProgram::compile(&mil, &blob, n_in, io.in_bytes(), n_out, io.out_bytes())?;
+    let mut tables = Weights::new();
+    for b in &io.inputs {
+        if let ane::IoSource::RopeTable(n) = b.source {
+            let name = &g.value(g.nodes[n].inputs[2]).name;
+            let t = weights
+                .get(name)
+                .ok_or_else(|| format!("weight '{name}' is not bound"))?;
+            tables.insert(name.clone(), t.clone());
+        }
+    }
+    Ok(CompiledSegment::Ane {
+        graph: g,
+        program,
+        io,
+        tables,
+    })
+}
+
+/// Times region `g` as the Metal plan `metal` and as the ANE program `ane` on [`synth_inputs`]
+/// (1 warm-up, median of 3) and compares their outputs.
+#[cfg(target_os = "macos")]
+fn measure_region(
+    g: &Graph,
+    metal: &crate::graph::metal::PreparedPlan,
+    ane: &mut CompiledSegment,
+    session: &crate::graph::metal::Session,
+) -> Result<AneDecision, String> {
+    let inputs = synth_inputs(g);
+    let mut st = StateStore::new();
+    let (metal_ms, want) = time_ms(|| session.run_prepared(g, metal, Some(&mut st), inputs.clone()))?;
+    let (ane_ms, got) = time_ms(|| ane.run(&mut st, inputs.clone()))?;
+    let rel = want
+        .iter()
+        .zip(&got)
+        .map(|(w, o)| crate::graph::ane::rel_rms(&o.to_f32(), &w.to_f32()))
+        .fold(0.0f32, f32::max);
+    let rel_err = if rel.is_finite() { rel } else { f32::MAX };
+    Ok(AneDecision {
+        metal_ms,
+        ane_ms,
+        rel_err,
+        chosen: rel_err <= ANE_REL_ERR && ane_ms <= ANE_SPEEDUP * metal_ms,
+    })
+}
+
+/// The measured gate for `graph` placed with ANE regions (`placed`). Each region is lowered and
+/// compiled, then measured against its own Metal plan ([`measure_region`]) unless the host cache
+/// holds its decision (keyed by the region's [`signature`]). A region stays on the ANE when its
+/// outputs are within [`ANE_REL_ERR`] and (`Auto`) its median is at most [`ANE_SPEEDUP`] of
+/// Metal's (`--backend ane` skips the speed test); one that cannot be built (budget, memory,
+/// lowering) or loses goes back to Metal. `--backend ane` fails when every measured region
+/// fails the error test. Returns the program's segments (empty: `graph` runs on Metal alone),
+/// with `graph` and `placed` updated to the final placement.
+#[cfg(target_os = "macos")]
+fn gate(
+    graph: &mut Graph,
+    placed: &mut PlacementPlan,
+    session: &std::sync::Arc<crate::graph::metal::Session>,
+    weights: &Weights,
+    sec: Secondary,
+) -> Result<Vec<SegmentExec>, String> {
+    use crate::graph::ane;
+    let regions: Vec<Vec<NodeId>> = placed
+        .segments
+        .iter()
+        .filter(|s| s.device == Device::Ane)
+        .map(|s| s.nodes.clone())
+        .collect();
+    if regions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let info = ane::probe()?;
+    let memsize = crate::hardware::sysctl::int(c"hw.memsize").unwrap_or(u64::MAX) as f64;
+    let need = ane_weight_bytes(graph, info) + crate::hardware::current_resident_memory_bytes();
+    let refused = if ane::programs_compiled() + regions.len() > ane::ANE_MAX_PROGRAMS {
+        Some("ANE program budget reached".to_string())
+    } else if need as f64 > 0.75 * memsize {
+        Some(format!("{need} B of ANE weights and RSS exceed 75% of memory"))
+    } else {
+        None
+    };
+    if let Some(why) = refused {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| eprintln!("ANE: regions stay on Metal from here on: {why}"));
+        demote(graph, placed);
+        return Ok(Vec::new());
+    }
+    let mut kept: HashMap<NodeId, SegmentExec> = HashMap::new();
+    let mut best_err: Option<f32> = None;
+    for nodes in &regions {
+        let (g, inputs, outputs) = fragment(graph, nodes);
+        let sig = signature(&g);
+        let key = format!("{sig:016x}");
+        let name = |i: usize| graph.node(nodes[i]).name.as_str();
+        let label = format!("{} nodes: {} … {}", nodes.len(), name(0), name(nodes.len() - 1));
+        let known = with_ane_decisions(false, |m| m.get(&key).copied());
+        // A cached region that cannot run on the ANE (lost, failed the error test or failed to
+        // build) is not rebuilt.
+        let usable = |d: &AneDecision| d.rel_err <= ANE_REL_ERR && (sec.force || d.chosen);
+        if let Some(d) = known.filter(|d| !usable(d)) {
+            record(sig, label, d, false, false);
+            continue;
+        }
+        let built = session
+            .prepare_plan(&g)
+            .and_then(|p| Ok((p, compile_ane(g.clone(), weights, info)?)));
+        let measured = built.and_then(|(plan, mut seg)| {
+            let d = match known {
+                Some(d) => (d, false),
+                None => (measure_region(&g, &plan, &mut seg, session)?, true),
+            };
+            Ok((d, seg))
+        });
+        let ((d, fresh), seg) = match measured {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("ANE region {label} stays on Metal: {e}");
+                let failed = AneDecision {
+                    metal_ms: 0.0,
+                    ane_ms: 0.0,
+                    rel_err: f32::MAX,
+                    chosen: false,
+                };
+                with_ane_decisions(true, |m| m.insert(key, failed));
+                continue;
+            }
+        };
+        if fresh {
+            with_ane_decisions(true, |m| m.insert(key, d));
+        }
+        best_err = Some(best_err.map_or(d.rel_err, |b| b.min(d.rel_err)));
+        let offloaded = d.rel_err <= ANE_REL_ERR && (sec.force || d.chosen);
+        record(sig, label, d, fresh, offloaded);
+        if offloaded {
+            let compiled = seg;
+            kept.insert(nodes[0], SegmentExec { compiled, inputs, outputs });
+        }
+    }
+    if kept.is_empty() {
+        demote(graph, placed);
+        return match best_err {
+            Some(e) if sec.force => Err(format!(
+                "--backend ane: every ANE region's outputs differ from Metal's (best relative RMS {e:.3e}, limit {ANE_REL_ERR:e})"
+            )),
+            _ => Ok(Vec::new()),
+        };
+    }
+    for nodes in regions.iter().filter(|r| !kept.contains_key(&r[0])) {
+        for n in nodes {
+            graph.nodes[n.0 as usize].device = placed.primary;
+        }
+    }
+    *placed = crate::graph::placement::segments_of(graph, placed.primary);
+    placed
+        .segments
+        .iter()
+        .map(|s| {
+            if s.device == Device::Ane {
+                return kept
+                    .remove(&s.nodes[0])
+                    .ok_or_else(|| "an ANE segment lost its program".to_string());
+            }
+            let (g, inputs, outputs) = fragment(graph, &s.nodes);
+            let plan = session.prepare_plan(&g)?;
+            let compiled = CompiledSegment::Metal {
+                graph: g,
+                session: session.clone(),
+                plan,
+            };
+            Ok(SegmentExec { compiled, inputs, outputs })
+        })
+        .collect()
+}
+
+/// Logs a region's gate decision and keeps it for [`ane_reports`].
+#[cfg(target_os = "macos")]
+fn record(sig: u64, region: String, decision: AneDecision, measured: bool, offloaded: bool) {
+    let r = AneReport {
+        signature: sig,
+        region,
+        decision,
+        measured,
+        offloaded,
+    };
+    eprintln!("{r}");
+    ANE_REPORTS.lock().unwrap_or_else(|e| e.into_inner()).push(r);
 }
 
 #[cfg(test)]
@@ -790,6 +1438,72 @@ mod tests {
         let mut weights = Weights::new();
         weights.insert("w", Tensor::F32(vec![0.1; 16]));
         (g, weights)
+    }
+
+    /// `[rows, 128]` → two ANE-lowerable MLP regions around a `Concat` (Metal only).
+    fn ane_sandwich(rows: usize) -> Graph {
+        let (mut g, f) = (Graph::new(), DType::F32);
+        let silu = Op::Unary {
+            kind: crate::graph::UnaryKind::Silu,
+        };
+        let x = g.input("x", vec![rows, 128], f);
+        let w = |g: &mut Graph, n: &str, o: usize, i: usize| g.weight(n, vec![o, i], f);
+        let (w1, w2) = (w(&mut g, "mlp0.up", 256, 128), w(&mut g, "mlp0.down", 128, 256));
+        let (w3, w4) = (w(&mut g, "mlp1.up", 128, 256), w(&mut g, "mlp1.down", 128, 128));
+        let a = g.add("up0", Op::Linear, &[x, w1], vec![rows, 256], f);
+        let a = g.add("act0", silu.clone(), &[a], vec![rows, 256], f);
+        let a = g.add("down0", Op::Linear, &[a, w2], vec![rows, 128], f);
+        let add = Op::Binary {
+            kind: crate::graph::BinaryKind::Add,
+        };
+        let a = g.add("res0", add.clone(), &[a, x], vec![rows, 128], f);
+        let c = g.add("cat", Op::Concat { axis: -1 }, &[a, a], vec![rows, 256], f);
+        let b = g.add("up1", Op::Linear, &[c, w3], vec![rows, 128], f);
+        let b = g.add("act1", silu, &[b], vec![rows, 128], f);
+        let b = g.add("down1", Op::Linear, &[b, w4], vec![rows, 128], f);
+        // Residuals keep each region's output well above fp16 accumulation noise.
+        let b = g.add("res1", add, &[b, a], vec![rows, 128], f);
+        g.output(b);
+        g
+    }
+
+    /// `--backend ane`: both MLP regions run on the ANE between Metal's `Concat`, for the compiled
+    /// shape and a reshaped instance, and every output matches the single-device Metal program.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "ANE: cargo test --release --lib segmented_program_matches_single_device -- --ignored"]
+    fn segmented_program_matches_single_device() {
+        // Uniform in [-0.5, 0.5) from a multiplicative hash (periodic data cancels in fp16 sums).
+        let hashed = |j: usize| {
+            let h = (j as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            (h >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let mut weights = Weights::new();
+        let names = [("mlp0.up", 256 * 128), ("mlp0.down", 128 * 256), ("mlp1.up", 128 * 256), ("mlp1.down", 128 * 128)];
+        for (i, (name, n)) in names
+            .into_iter()
+            .enumerate()
+        {
+            let v = (0..n).map(|j| hashed(j + (i << 20)) * 0.1).collect();
+            weights.insert(name, Tensor::F32(v));
+        }
+        let x = |rows: usize| vec![Tensor::F32((0..rows * 128).map(|j| hashed(j + (9 << 20))).collect())];
+        let ane = PlacementMode::Pin(Device::Ane);
+        let mut mixed =
+            GraphProgram::compile_reshapable(ane_sandwich(64), weights.clone(), ane).unwrap();
+        let devices: Vec<Device> = mixed.segments.iter().map(|s| s.compiled.device()).collect();
+        assert_eq!(devices, [Device::Ane, Device::Metal, Device::Ane]);
+        let metal = PlacementMode::Pin(Device::Metal);
+        let mut single = GraphProgram::compile_reshapable(ane_sandwich(64), weights, metal).unwrap();
+        assert!(single.segments.is_empty());
+        let rel = |a: &Tensor, b: &Tensor| crate::graph::ane::rel_rms(&a.to_f32(), &b.to_f32());
+        let (got, want) = (mixed.run(x(64)).unwrap(), single.run(x(64)).unwrap());
+        assert!(rel(&got[0], &want[0]) <= ANE_REL_ERR, "{}", rel(&got[0], &want[0]));
+        let g = ane_sandwich(40);
+        let got = mixed.run_reshaped(&g, x(40), true).unwrap();
+        let want = single.run_reshaped(&g, x(40), true).unwrap();
+        assert_eq!(mixed.reshaped_graphs[0].segments.len(), 3);
+        assert!(rel(&got[0], &want[0]) <= ANE_REL_ERR, "{}", rel(&got[0], &want[0]));
     }
 
     /// GPU: `run_reshaped` plans a row count once and reuses it; another row count gets its own plan.
@@ -810,8 +1524,8 @@ mod tests {
         };
         let x = |m: usize| vec![Tensor::F32((0..m * 4).map(|i| i as f32 * 0.25).collect())];
         // Callers rebuild the graph per chunk: the second call's graph is a fresh, equal one.
-        let a = prog.run_reshaped(&rows(2), x(2)).unwrap();
-        let b = prog.run_reshaped(&rows(2), x(2)).unwrap();
+        let a = prog.run_reshaped(&rows(2), x(2), true).unwrap();
+        let b = prog.run_reshaped(&rows(2), x(2), true).unwrap();
         assert_eq!(prog.reshaped_graphs.len(), 1);
         assert_eq!(a[0].as_f32().unwrap(), b[0].as_f32().unwrap());
         // 0.25 * i through two all-0.1 4x4 layers: every output of row r is 0.04 * (sum of its x).
@@ -821,7 +1535,7 @@ mod tests {
         for (got, want) in a[0].as_f32().unwrap().iter().zip(&want) {
             assert!((got - want).abs() < 1e-4, "{got} vs {want}");
         }
-        prog.run_reshaped(&rows(3), x(3)).unwrap();
+        prog.run_reshaped(&rows(3), x(3), true).unwrap();
         assert_eq!(prog.reshaped_graphs.len(), 2);
     }
 
@@ -857,7 +1571,7 @@ mod tests {
         assert_eq!(prog.primary_device(), Device::Cpu);
         assert_eq!(prog.recurrent_states(), ["conv"]);
         let got1 = prog.run(vec![x(1, 0.0)]).unwrap();
-        let got3 = prog.run_reshaped(&rows(3), vec![x(3, 1.0)]).unwrap();
+        let got3 = prog.run_reshaped(&rows(3), vec![x(3, 1.0)], true).unwrap();
         let mut st = StateStore::new();
         let want1 = cpu::run(&rows(1), &weights, &mut st, vec![x(1, 0.0)]).unwrap();
         let want3 = cpu::run(&rows(3), &weights, &mut st, vec![x(3, 1.0)]).unwrap();
@@ -1943,7 +2657,7 @@ mod tests {
                 for (step, ((g, ins), want)) in case.runs.iter().zip(&wants).enumerate() {
                     let got = match g {
                         None => gpu.run(ins.clone()),
-                        Some(g) => gpu.run_reshaped(g, ins.clone()),
+                        Some(g) => gpu.run_reshaped(g, ins.clone(), true),
                     };
                     let got = got.unwrap_or_else(|e| panic!("{dev} {} run {step}: {e}", case.name));
                     assert_eq!(want.len(), got.len());
@@ -1995,7 +2709,7 @@ mod tests {
             .map(|(g, ins)| {
                 match g {
                     None => cpu.run(ins.clone()),
-                    Some(g) => cpu.run_reshaped(g, ins.clone()),
+                    Some(g) => cpu.run_reshaped(g, ins.clone(), true),
                 }
                 .unwrap()
             })

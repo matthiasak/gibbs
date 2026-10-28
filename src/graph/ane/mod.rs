@@ -104,7 +104,7 @@ pub fn run(
 }
 
 /// Relative RMS error of `got` against `want`.
-fn rel_rms(got: &[f32], want: &[f32]) -> f32 {
+pub(crate) fn rel_rms(got: &[f32], want: &[f32]) -> f32 {
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for (&g, &w) in got.iter().zip(want) {
         num += ((g - w) as f64).powi(2);
@@ -178,7 +178,7 @@ fn probe_forms() -> [(QuantFormat, AneInfo); 3] {
 }
 
 /// FNV-1a 64 over `parts` (each length-prefixed): a hash stable across builds and toolchains.
-fn fnv64(parts: &[&[u8]]) -> u64 {
+pub(crate) fn fnv64(parts: &[&[u8]]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for p in parts {
         for &b in (p.len() as u64).to_le_bytes().iter().chain(p.iter()) {

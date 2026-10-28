@@ -13,6 +13,9 @@ pub struct BenchDefaults {
     pub reencode: String,
     #[serde(default)]
     pub prefill_tokens: usize,
+    /// `--backend` spelling every row loads under unless it names one (default `metal`).
+    #[serde(default)]
+    pub placement: Option<String>,
 }
 
 /// The prompt a benchmark decodes from unless the suite names one.
@@ -66,6 +69,9 @@ pub struct BenchModel {
     pub items: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// `--backend` spelling this row loads under (`auto`: Metal with gated ANE regions).
+    #[serde(default)]
+    pub placement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,11 +164,12 @@ pub fn applied_policy() -> Applied {
     }
 }
 
-/// Loads `artifacts` on Metal under the `reencode` policy name (the effective policy of every
-/// loader during the load).
+/// Loads `artifacts` under `placement` and the `reencode` policy name (the effective policy of
+/// every loader during the load).
 pub fn load_for_bench(
     artifacts: &crate::model::hub::ModelArtifacts,
     reencode: &str,
+    placement: crate::hardware::PlacementMode,
 ) -> Result<BenchLoad, String> {
     let cfg = crate::model::weight_format::ReencodeConfig {
         policy: reencode.parse()?,
@@ -171,7 +178,7 @@ pub fn load_for_bench(
     let exec = crate::arch::dispatch::load_lm(
         artifacts,
         &crate::arch::LoadOpts {
-            placement: crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+            placement,
             token: None,
             quant_name: None,
             hw: &crate::hardware::HardwareCapability::probe_system(),
@@ -416,6 +423,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         runs: default_runs(),
         reencode: default_reencode(),
         prefill_tokens: 0,
+        placement: None,
     });
 
     let mut had_error = false;
@@ -446,6 +454,20 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         let prefill_tokens = model_cfg.prefill_tokens.unwrap_or(defaults.prefill_tokens);
         let runs = model_cfg.runs.unwrap_or(defaults.runs);
         let reencode = model_cfg.reencode.as_ref().unwrap_or(&defaults.reencode);
+        let placement: crate::hardware::PlacementMode = match model_cfg
+            .placement
+            .as_deref()
+            .or(defaults.placement.as_deref())
+            .unwrap_or("metal")
+            .parse()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                println!("{}", serde_json::json!({"model": model_cfg.id, "error": e}));
+                had_error = true;
+                continue;
+            }
+        };
         let kind = model_cfg.kind.as_deref().unwrap_or("lm");
         let slug = model_cfg.name.clone().unwrap_or_else(|| {
             model_cfg
@@ -484,7 +506,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
 
                 // Held until this model's row is printed: concurrent benchmarks would corrupt each other.
                 let _lock = crate::hardware::gpu_lock()?;
-                let load = match load_for_bench(&artifacts, reencode) {
+                let load = match load_for_bench(&artifacts, reencode, placement) {
                     Ok(x) => x,
                     Err(e) => {
                         fail(&e);
@@ -550,7 +572,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                 let _lock = crate::hardware::gpu_lock()?;
                 let hw = crate::hardware::HardwareCapability::probe_system();
                 let opts = crate::arch::LoadOpts {
-                    placement: crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+                    placement,
                     token: None,
                     quant_name: None,
                     hw: &hw,
@@ -653,7 +675,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                 let _lock = crate::hardware::gpu_lock()?;
                 let hw = crate::hardware::HardwareCapability::probe_system();
                 let opts = crate::arch::LoadOpts {
-                    placement: crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+                    placement,
                     token: None,
                     quant_name: None,
                     hw: &hw,
@@ -892,7 +914,8 @@ pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
     let _lock = crate::hardware::gpu_lock()?;
     let policy =
         crate::model::weight_format::reencode_override().map_or("max-speed", |c| c.policy.name());
-    let exec = load_for_bench(&artifacts, policy)?.exec;
+    let metal = crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal);
+    let exec = load_for_bench(&artifacts, policy, metal)?.exec;
     let ids = exec.tokenizer().encode(prompt);
     let logits = exec.prompt_logits(ids.clone())?;
     let vocab = exec.tokenizer().vocab_size();
@@ -911,31 +934,41 @@ pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `--explain-placement`: loads `model_id` on Metal under the effective re-encode policy and
-/// prints where its graph nodes run (op kind, device, avenue) and whether that is 100% on the GPU.
-/// Returns the process exit code: 0 only when every node runs on Metal ([`placement_exit_code`]).
+/// `--explain-placement`: loads `model_id` under `placement` and the effective re-encode policy
+/// and prints where its graph nodes run (op kind, device, avenue), whether that is 100% on
+/// accelerators, and every ANE region with its gate decision.
+/// Returns the process exit code: 0 only when nodes exist and none runs on the CPU
+/// ([`placement_exit_code`]).
 pub fn explain_placement(
     hub: &crate::model::hub::HuggingFaceHub,
     model_id: &str,
+    placement: crate::hardware::PlacementMode,
 ) -> Result<i32, String> {
     use crate::graph::placement::{placement_table, placement_verdict};
     let artifacts = hub.auto_download_and_cache(model_id, None)?;
     let _lock = crate::hardware::gpu_lock()?;
     let policy = crate::model::weight_format::ReencodeConfig::effective().policy;
-    let exec = load_for_bench(&artifacts, policy.name())?.exec;
+    let exec = load_for_bench(&artifacts, policy.name(), placement)?.exec;
     let rows = exec
         .placement_summary()
         .ok_or("this model runs no graph program: there is no placement to explain")?;
     println!("{}", placement_table(&rows));
     let code = placement_exit_code(&rows);
     println!("{}", placement_verdict(&rows).unwrap_or_else(|cpu| cpu));
+    let reports = crate::graph::program::ane_reports();
+    if reports.is_empty() {
+        println!("ANE decisions ({placement}): none (no graph this load compiled has an ANE candidate region)");
+    }
+    for r in reports {
+        println!("{r}");
+    }
     Ok(code)
 }
 
-/// 0 when every placed node runs on Metal, else 1 (CPU nodes, another device, or no nodes).
+/// 0 when placed nodes exist and none runs on the CPU, else 1.
 pub fn placement_exit_code(rows: &[crate::graph::placement::PlacementRow]) -> i32 {
-    let metal = crate::hardware::Device::Metal;
-    i32::from(rows.is_empty() || rows.iter().any(|r| r.device != metal))
+    let cpu = crate::hardware::Device::Cpu;
+    i32::from(rows.is_empty() || rows.iter().any(|r| r.device == cpu))
 }
 
 #[cfg(test)]
@@ -954,9 +987,13 @@ mod placement_exit_tests {
     }
 
     #[test]
-    fn explain_placement_exits_zero_only_when_everything_is_metal() {
+    fn explain_placement_exits_zero_only_when_no_node_is_on_the_cpu() {
         assert_eq!(
             placement_exit_code(&[row(Device::Metal), row(Device::Metal)]),
+            0
+        );
+        assert_eq!(
+            placement_exit_code(&[row(Device::Metal), row(Device::Ane)]),
             0
         );
         assert_eq!(

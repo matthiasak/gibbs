@@ -147,6 +147,12 @@ pub fn available_devices() -> Vec<Device> {
         if metal::Device::system_default().is_some() {
             devices.push(Device::Metal);
         }
+        // The ANE counts only once its fp16 probe program compiled and matched the CPU.
+        match crate::graph::ane::probe() {
+            Ok(info) if info.fp16.is_ok() => devices.push(Device::Ane),
+            Ok(info) => log_ane_once(&format!("fp16 probe failed: {:?}", info.fp16)),
+            Err(e) => log_ane_once(&e),
+        }
     }
     if crate::graph::cuda::is_available() {
         devices.push(Device::Cuda);
@@ -161,6 +167,13 @@ pub fn available_devices() -> Vec<Device> {
         devices.push(Device::IntelXpu);
     }
     devices
+}
+
+/// Logs once per process why the ANE is not used (`auto` then runs Metal only).
+#[cfg(target_os = "macos")]
+fn log_ane_once(why: &str) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| eprintln!("ANE unavailable ({why}); placement uses Metal only"));
 }
 
 /// The default high-performance compute device on this machine.

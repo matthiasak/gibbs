@@ -1291,16 +1291,22 @@ impl<'a> Lower<'a> {
         v
     }
 
-    /// `x · rsqrt(mean(x²) + eps)` over the channel axis of a token-form `x`; squares are taken
-    /// after scaling by `1/sqrt(d)` so fp16 holds them.
+    /// `x · rsqrt(mean(x²) + eps)` over the channel axis of a token-form `x`, computed on
+    /// `xs = x / m` with `m = max|x|` (at least 1e-3) as `xs · rsqrt(mean(xs²) + eps / m²)`, so
+    /// fp16 holds the squares of residual streams whose outlier channels exceed 256.
     fn rms(&mut self, x: &str, eps: f32) -> String {
-        let d = self.sh(x)[1];
-        let xs = self.bin_s("mul", x, 1.0 / (d as f32).sqrt());
+        let ab = self.un("abs", x);
+        let m = self.reduce("reduce_max", &ab, &[1]);
+        let m = self.bin_s("maximum", &m, 1e-3);
+        let inv = self.bin_s("pow", &m, -1.0);
+        let xs = self.bin("mul", x, &inv);
         let sq = self.bin("mul", &xs, &xs);
-        let ss = self.reduce("reduce_sum", &sq, &[1]);
-        let e = self.bin_s("add", &ss, eps);
+        let ms = self.reduce("reduce_mean", &sq, &[1]);
+        let ei = self.bin_s("mul", &inv, eps);
+        let ei = self.bin("mul", &ei, &inv);
+        let e = self.bin("add", &ms, &ei);
         let r = self.bin_s("pow", &e, -0.5);
-        self.bin("mul", x, &r)
+        self.bin("mul", &xs, &r)
     }
 
     fn gelu_tanh(&mut self, x: &str) -> String {

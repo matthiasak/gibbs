@@ -221,7 +221,7 @@ impl Net {
         let mut slot = self.program.lock();
         let out = match slot.as_mut() {
             Some((k, p)) if *k == key => p.run(ins)?,
-            Some((_, p)) => p.run_reshaped(&inst.graph, ins)?,
+            Some((_, p)) => p.run_reshaped(&inst.graph, ins, true)?,
             None => {
                 let w = self.model.store.materialize(&inst.weights)?;
                 let mut p = GraphProgram::compile_reshapable(inst.graph.clone(), w, self.mode)?;

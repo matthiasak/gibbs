@@ -1,11 +1,12 @@
-//! Strict device placement and the single-segment partition for the graph IR.
+//! Strict device placement and the segment partition for the graph IR.
 //!
 //! On a host with Metal, `Auto` and `Pin(Metal)` put every node on Metal or fail with the
-//! [`GpuReport`] of avenues each unlowered node was tried against. The CPU executor runs only for an
-//! explicit `Pin(Cpu)` (or when no GPU exists).
+//! [`GpuReport`](crate::graph::avenues::GpuReport) of avenues each unlowered node was tried against. The CPU executor runs only for an
+//! explicit `Pin(Cpu)` (or when no GPU exists). A [`Secondary`] device (the ANE) then takes the
+//! maximal runs of nodes it lowers that hold at least two matrix nodes.
 
-use crate::graph::avenues::{explore_node, GpuReport};
-use crate::graph::{DType, Graph, NodeId, Op};
+use crate::graph::avenues::explore_node;
+use crate::graph::{DType, Graph, NodeId, Op, ValueKind};
 use crate::hardware::{Device, PlacementMode};
 use std::collections::HashMap;
 
@@ -30,27 +31,30 @@ impl PlacementReport {
             .collect::<Vec<_>>()
             .join(", ")
     }
-
-    pub fn primary_device(&self) -> Device {
-        self.device_op_counts
-            .iter()
-            .max_by_key(|a| a.1)
-            .map(|(&dev, _)| dev)
-            .unwrap_or(Device::Cpu)
-    }
 }
 
-/// The execution plan: at most one segment, since every node shares one device.
+/// The execution plan: maximal runs of one device in node order (one segment unless a
+/// [`Secondary`] took some runs).
 #[derive(Debug, Clone)]
 pub struct PlacementPlan {
     pub segments: Vec<Segment>,
     pub report: PlacementReport,
+    /// The device every node not offloaded to the secondary runs on.
+    pub primary: Device,
 }
 
 impl PlacementPlan {
     pub fn primary_device(&self) -> Device {
-        self.report.primary_device()
+        self.primary
     }
+}
+
+/// The device a Metal-primary placement offloads lowerable regions to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Secondary {
+    pub device: Device,
+    /// `--backend ane`: regions skip the speed gate (the error test still applies).
+    pub force: bool,
 }
 
 /// Returns whether `device` can execute `op` with element type `dtype`.
@@ -106,10 +110,12 @@ pub fn placement_rows(graph: &Graph) -> Vec<PlacementRow> {
     let mut counts: HashMap<(String, Device, String), usize> = HashMap::new();
     for node in &graph.nodes {
         let dtype = node_dtype(graph, node);
-        let avenue = if device_supports_op(node.device, &node.op, dtype) {
+        let avenue = if node.device == Device::Ane {
+            "mil".to_string()
+        } else if device_supports_op(node.device, &node.op, dtype) {
             "kernel".to_string()
         } else {
-            explore_node(&node.name, &node.op, dtype)
+            explore_node(&node.name, &node.op, dtype, node.device)
                 .lowered_by()
                 .map_or("unlowered", |(avenue, _)| avenue.name())
                 .to_string()
@@ -153,13 +159,21 @@ pub fn placement_table(rows: &[PlacementRow]) -> String {
     out + &format!("{} nodes", rows.iter().map(|r| r.count).sum::<usize>())
 }
 
-/// `Ok("100% Metal")` when no node runs on the CPU, else `Err` with the CPU node count and the CPU
-/// ops with their counts (`5 CPU nodes (of 237): Relu ×2, …`).
+/// `Ok("100% accelerated (Metal 812, Ane 340)")` when no node runs on the CPU, else `Err` with the
+/// CPU node count and the CPU ops with their counts (`5 CPU nodes (of 237): Relu ×2, …`).
 pub fn placement_verdict(rows: &[PlacementRow]) -> Result<String, String> {
     let cpu: Vec<&PlacementRow> = rows.iter().filter(|r| r.device == Device::Cpu).collect();
     if cpu.is_empty() {
-        let device = rows.first().map_or(Device::Cpu, |r| r.device);
-        return Ok(format!("100% {device:?}"));
+        let mut per: Vec<(Device, usize)> = Vec::new();
+        for r in rows {
+            match per.iter_mut().find(|p| p.0 == r.device) {
+                Some(p) => p.1 += r.count,
+                None => per.push((r.device, r.count)),
+            }
+        }
+        per.sort_by(|a, b| b.1.cmp(&a.1));
+        let parts: Vec<String> = per.iter().map(|(d, n)| format!("{d:?} {n}")).collect();
+        return Ok(format!("100% accelerated ({})", parts.join(", ")));
     }
     let (n, total) = (
         cpu.iter().map(|r| r.count).sum::<usize>(),
@@ -176,29 +190,91 @@ pub fn placement_verdict(rows: &[PlacementRow]) -> Result<String, String> {
     ))
 }
 
-/// Places every node of `graph` on one device.
+/// Whether the secondary `device` lowers `node` of `graph` (the ANE decides per node and shape).
+pub(crate) fn secondary_supports(device: Device, graph: &Graph, node: &crate::graph::Node) -> bool {
+    let reads_state = node
+        .inputs
+        .iter()
+        .any(|&v| matches!(graph.value(v).kind, ValueKind::State { .. }));
+    !reads_state
+        && match device {
+            #[cfg(target_os = "macos")]
+            Device::Ane => crate::graph::ane::supports_op(graph, node),
+            d => device_supports_op(d, &node.op, node_dtype(graph, node)),
+        }
+}
+
+/// Moves every maximal run of nodes `device` lowers onto it, unless the run holds fewer than two
+/// matrix nodes (a lone norm or add costs more in dispatch and boundary copies than it saves).
+fn offload(graph: &mut Graph, device: Device) {
+    let ok: Vec<bool> = graph
+        .nodes
+        .iter()
+        .map(|n| secondary_supports(device, graph, n))
+        .collect();
+    let heavy = |op: &Op| {
+        matches!(
+            op,
+            Op::Linear
+                | Op::MatMul { .. }
+                | Op::Conv1d { .. }
+                | Op::Conv2d { .. }
+                | Op::Conv3d { .. }
+                | Op::Megakernel(_)
+        )
+    };
+    let mut i = 0;
+    while i < ok.len() {
+        if !ok[i] {
+            i += 1;
+            continue;
+        }
+        let end = (i..ok.len()).find(|&j| !ok[j]).unwrap_or(ok.len());
+        let run = &mut graph.nodes[i..end];
+        if run.iter().filter(|n| heavy(&n.op)).count() >= 2 {
+            for n in run {
+                n.device = device;
+            }
+        }
+        i = end;
+    }
+}
+
+/// Places every node of `graph` on the primary device, then (with `secondary`) offloads the runs
+/// the secondary lowers ([`offload`]). Segments are maximal runs of one device in node order;
+/// `graph.nodes` is topological, so segments only read earlier segments.
 ///
 /// `supports` answers whether a device runs `(op, dtype)`; production passes
 /// [`device_supports_op`]. A node the target rejects still places when another avenue lowers it
 /// (e.g. load-time dequantization); otherwise the call fails with one report per such node.
+/// `Pin(d)` of a device not in `available` fails.
 pub fn place_graph(
     graph: &mut Graph,
     mode: PlacementMode,
     available: &[Device],
     supports: &dyn Fn(Device, &Op, DType) -> bool,
-) -> Result<PlacementPlan, GpuReport> {
+    secondary: Option<Secondary>,
+) -> Result<PlacementPlan, String> {
     let target = match mode {
-        PlacementMode::Pin(d) if available.contains(&d) || d != Device::Metal => d,
+        PlacementMode::Pin(d) if available.contains(&d) => d,
+        PlacementMode::Pin(d) => {
+            let names: Vec<&str> = available.iter().map(|d| d.name()).collect();
+            return Err(format!(
+                "--backend {d}: not available on this host (available: {})",
+                names.join(", ")
+            ));
+        }
         PlacementMode::Auto if available.contains(&Device::Metal) => Device::Metal,
         PlacementMode::Auto if available.contains(&Device::Cuda) => Device::Cuda,
         PlacementMode::Auto if available.contains(&Device::Rocm) => Device::Rocm,
         PlacementMode::Auto if available.contains(&Device::Xla) => Device::Xla,
         PlacementMode::Auto if available.contains(&Device::IntelXpu) => Device::IntelXpu,
-        _ => Device::Cpu,
+        PlacementMode::Auto => Device::Cpu,
     };
 
     if target != Device::Cpu {
-        let mut report = GpuReport {
+        let mut report = crate::graph::avenues::GpuReport {
+            device: target,
             total_nodes: graph.nodes.len(),
             unlowered: Vec::new(),
         };
@@ -207,34 +283,45 @@ pub fn place_graph(
             if supports(target, &node.op, dtype) {
                 continue;
             }
-            let explored = explore_node(&node.name, &node.op, dtype);
+            let explored = explore_node(&node.name, &node.op, dtype, target);
             if explored.lowered_by().is_none() {
                 report.unlowered.push(explored);
             }
         }
         if !report.unlowered.is_empty() {
-            return Err(report);
+            return Err(report.error());
         }
     }
 
     for node in &mut graph.nodes {
         node.device = target;
     }
-    let all: Vec<NodeId> = (0..graph.nodes.len()).map(|i| NodeId(i as u32)).collect();
+    if let Some(s) = secondary {
+        offload(graph, s.device);
+    }
+    Ok(segments_of(graph, target))
+}
+
+/// The plan of a placed `graph`: maximal runs of one node device in node order, and per-device
+/// node counts.
+pub(crate) fn segments_of(graph: &Graph, primary: Device) -> PlacementPlan {
+    let mut segments: Vec<Segment> = Vec::new();
     let mut device_op_counts = HashMap::new();
-    let segments = if all.is_empty() {
-        Vec::new()
-    } else {
-        device_op_counts.insert(target, all.len());
-        vec![Segment {
-            device: target,
-            nodes: all,
-        }]
-    };
-    Ok(PlacementPlan {
+    for (i, node) in graph.nodes.iter().enumerate() {
+        *device_op_counts.entry(node.device).or_insert(0) += 1;
+        match segments.last_mut() {
+            Some(s) if s.device == node.device => s.nodes.push(NodeId(i as u32)),
+            _ => segments.push(Segment {
+                device: node.device,
+                nodes: vec![NodeId(i as u32)],
+            }),
+        }
+    }
+    PlacementPlan {
         segments,
         report: PlacementReport { device_op_counts },
-    })
+        primary,
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +342,7 @@ mod tests {
             PlacementMode::Pin(Device::Cpu),
             &[Device::Cpu],
             &device_supports_op,
+            None,
         )
         .unwrap();
         assert_eq!(plan.segments.len(), 1);
@@ -301,9 +389,10 @@ mod tests {
             PlacementMode::Auto,
             &[Device::Cpu, Device::Metal],
             &no_relu,
+            None,
         )
         .unwrap_err();
-        let text = err.error();
+        let text = err;
         assert!(text.starts_with("gpu-only: 1 of 2 graph nodes"), "{text}");
         assert!(text.contains("act"), "{text}");
         for avenue in crate::graph::avenues::Avenue::ALL {
@@ -323,6 +412,7 @@ mod tests {
             PlacementMode::Pin(Device::Cpu),
             &[Device::Cpu, Device::Metal],
             &no_relu,
+            None,
         )
         .unwrap();
         assert_eq!(plan.segments.len(), 1);
@@ -337,6 +427,7 @@ mod tests {
             PlacementMode::Auto,
             &[Device::Cpu, Device::Metal],
             &|_, _, _| true,
+            None,
         )
         .unwrap();
         assert_eq!(plan.segments.len(), 1);
@@ -464,6 +555,7 @@ mod tests {
             PlacementMode::Pin(Device::Cpu),
             &[Device::Cpu],
             &device_supports_op,
+            None,
         )
         .unwrap();
         let mut state = crate::graph::StateStore::new();
@@ -488,6 +580,7 @@ mod tests {
                 PlacementMode::Auto,
                 &[Device::Cpu, Device::Metal],
                 &device_supports_op,
+                None,
             )
             .unwrap();
             assert!(
@@ -531,7 +624,15 @@ mod tests {
             row("Linear", Device::Metal, 232),
             row("RmsNorm", Device::Metal, 5),
         ];
-        assert_eq!(placement_verdict(&gpu), Ok("100% Metal".to_string()));
+        assert_eq!(
+            placement_verdict(&gpu),
+            Ok("100% accelerated (Metal 237)".to_string())
+        );
+        let ane = [row("Linear", Device::Metal, 3), row("Conv2d", Device::Ane, 5)];
+        assert_eq!(
+            placement_verdict(&ane),
+            Ok("100% accelerated (Ane 5, Metal 3)".to_string())
+        );
         let table = placement_table(&gpu);
         assert!(table.starts_with("op       device  avenue "), "{table}");
         assert!(table.contains("Linear   Metal   kernel   "), "{table}");
@@ -549,6 +650,23 @@ mod tests {
         assert_eq!(
             placement_verdict(&one),
             Err("3 CPU nodes (of 7): Relu ×1, Gelu ×2".to_string())
+        );
+    }
+
+    #[test]
+    fn pin_unavailable_device_errors() {
+        let mut g = relu_graph();
+        let err = place_graph(
+            &mut g,
+            PlacementMode::Pin(Device::Cuda),
+            &[Device::Cpu, Device::Metal],
+            &|_, _, _| true,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "--backend cuda: not available on this host (available: cpu, metal)"
         );
     }
 }
