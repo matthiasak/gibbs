@@ -169,6 +169,20 @@ pub trait NativeLm: Send + Sync {
         None
     }
 
+    /// The one-row decode instance: its graph, weights and the index of its `logits` output
+    /// (a drafter's ANE step, [`crate::graph::ane::draft`]).
+    fn decode_instance(
+        &self,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights, usize), String> {
+        Err("this model runs no spec graph".into())
+    }
+
+    /// A copy of `state` at its length that shares its KV pages ([`crate::kv::KvView::fork`]);
+    /// `None` when it cannot fork.
+    fn fork_state(&self, _state: &SeqState) -> Option<SeqState> {
+        None
+    }
+
     /// Writes row `id` of the token-embedding table the model's first layer reads into `out` (the
     /// table's width); `false` when the model has none or `id` is out of range.
     fn embed_row(&self, _id: u32, _out: &mut [f32]) -> bool {

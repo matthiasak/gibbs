@@ -161,6 +161,7 @@ pub struct SpecLm {
 
 /// The weight of the decode graph's first `Embedding` node reading `token_ids`, `[vocab, cols]`.
 struct EmbedTable {
+    name: String,
     t: Tensor,
     cols: usize,
 }
@@ -178,6 +179,7 @@ impl EmbedTable {
                 && matches!(v.kind, crate::graph::ValueKind::Weight))
             .then(|| {
                 Some(Self {
+                    name: v.name.clone(),
                     t: w.get(&v.name)?.clone(),
                     cols: *v.shape.last()?,
                 })
@@ -1082,7 +1084,11 @@ impl NativeLm for SpecLm {
     fn drafter(&self) -> Option<Arc<dyn crate::scheduler::spec::Drafter>> {
         self.drafter
             .get_or_init(|| {
-                crate::runtime::draft::spec_drafter(&self.model, self.mode)
+                let embed = self.embed.clone();
+                let rows: crate::runtime::draft::EmbedRows = Arc::new(move |table, id, out| {
+                    embed.as_ref().is_some_and(|t| t.name == table && t.row(id, out))
+                });
+                crate::runtime::draft::spec_drafter(&self.model, self.mode, rows)
                     .map_err(|e| tracing::warn!("drafter: {e}"))
                     .ok()
                     .flatten()
@@ -1092,6 +1098,29 @@ impl NativeLm for SpecLm {
 
     fn embed_row(&self, id: u32, out: &mut [f32]) -> bool {
         self.embed.as_ref().is_some_and(|t| t.row(id, out))
+    }
+
+    fn decode_instance(
+        &self,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights, usize), String> {
+        let inst = self.instance(1, "last", &[], 0)?;
+        let logits = inst
+            .output_index("logits")
+            .ok_or("the text component has no `logits` output")?;
+        let w = self.model.store.materialize(&inst.weights)?;
+        Ok((inst.graph.clone(), w, logits))
+    }
+
+    fn fork_state(&self, state: &SeqState) -> Option<SeqState> {
+        let s = state.downcast_ref::<Seq>()?;
+        let plain = s.state.stream.0.is_none() && s.media.media_index.is_empty() && s.taps.is_empty();
+        if !plain || !self.recurrent.is_empty() || s.asked != s.len {
+            return None;
+        }
+        let mut f = Seq::new(s.prompt.clone(), Expanded::default(), Vec::new());
+        f.state = s.state.fork(s.len).ok()?;
+        (f.len, f.asked, f.ids) = (s.len, s.len, s.ids.clone());
+        Some(Box::new(f))
     }
 
     fn online_drafter(

@@ -1430,8 +1430,11 @@ impl ContinuousBatchScheduler {
                 // Draft no more than the sequence may still emit (the target adds one) or hold.
                 let knobs_snap = self.draft_knobs.snapshot();
                 let spec_k = seq.spec.as_ref().map(|sp| {
-                    self.k_tuner
-                        .lock()
+                    let mut tuner = self.k_tuner.lock();
+                    if let Some(msg) = tuner.place(sp.drafter()) {
+                        self.telemetry.log_info(&msg);
+                    }
+                    tuner
                         .choose_with_knobs(sp.max_k(), &knobs_snap)
                         .min(
                             seq.params

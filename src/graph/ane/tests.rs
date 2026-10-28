@@ -170,9 +170,21 @@ fn mlp_case(name: &'static str, format: Option<QuantFormat>, geglu: bool, post: 
     c.out(&[y])
 }
 
+/// A one-row Linear past the 65536 output channels one conv may have (an LM head), and a
+/// last-axis `Concat` (drafter steps).
+fn wide_case() -> Case {
+    let mut c = Case::new("linear 131072 outputs + concat");
+    let x = c.input("x", vec![1, 64], 1.0);
+    let w = c.quant("w", 131072, 64, QuantFormat::GGUF_Q8_0);
+    let y = c.op("y", Op::Linear, &[x, w]);
+    let z = c.op("z", Op::Concat { axis: -1 }, &[x, x]);
+    c.out(&[y, z])
+}
+
 fn cases() -> Vec<Case> {
     use QuantFormat as Q;
     let mut v = vec![
+        wide_case(),
         linear_case("linear fp16", None, 64),
         linear_case("linear int4 (Q4_0 blockwise)", Some(Q::GGUF_Q4_0), 64),
         linear_case("linear int8 (Q8_0 blockwise)", Some(Q::GGUF_Q8_0), 64),
@@ -752,8 +764,9 @@ fn lowering_matches_cpu_per_op() {
         }
     }
     for (c, _) in &cases {
+        // Concat lowers in drafter steps only; placement keeps it on Metal.
         for node in &c.g.nodes {
-            if !supports_op(&c.g, node) {
+            if !supports_op(&c.g, node) && !matches!(node.op, Op::Concat { .. }) {
                 failed.push(format!(
                     "{}: supports_op rejects '{}': {:?}",
                     c.name,
@@ -772,3 +785,98 @@ fn lowering_matches_cpu_per_op() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// A two-layer decode instance (full and 3-key windowed cached attention) run as a drafter step
+/// on the ANE ([`draft::lower_drafter_step`]) matches the CPU's cached decode position by
+/// position, and after a rewind ([`draft::Ring::truncate`]) continues like a fresh decode of
+/// the new tokens.
+#[test]
+#[ignore]
+fn drafter_step_matches_cached_decode() {
+    let info = probe().expect("ANE probe");
+    let (vocab, d, hd, heads, kvh) = (40, 64, 16, 4, 2);
+    let f = DType::F32;
+    let mut c = Case::new("drafter step");
+    let ids = c.g.input("token_ids", vec![1], DType::U32);
+    let pos = c.g.input("positions", vec![1], DType::U32);
+    let table = c.weight("embed", vec![vocab, d], 1.0);
+    let mut x = c.op("emb", Op::Embedding, &[table, ids]);
+    let inv = (0..hd / 2).map(|i| 1e4f32.powf(-2.0 * i as f32 / hd as f32)).collect();
+    let inv = c.weight_data("inv", vec![hd / 2], inv);
+    for (l, window) in [None, Some(3)].into_iter().enumerate() {
+        let lin = |c: &mut Case, n: &str, x: ValueId, o: usize| {
+            let w = c.weight(&format!("{n}{l}"), vec![o, d], 0.2);
+            c.op(&format!("{n}{l}.y"), Op::Linear, &[x, w])
+        };
+        let rope = Op::Rope {
+            head_dim: hd,
+            rotary_dim: hd,
+            variant: RopeVariant::HalfSplit,
+            mscale: 1.0,
+        };
+        let q = lin(&mut c, "q", x, heads * hd);
+        let k = lin(&mut c, "k", x, kvh * hd);
+        let v = lin(&mut c, "v", x, kvh * hd);
+        let q = c.op(&format!("qr{l}"), rope.clone(), &[q, pos, inv]);
+        let k = c.op(&format!("kr{l}"), rope, &[k, pos, inv]);
+        let ks = c.g.state(format!("k{l}"), vec![16, kvh * hd], f, false);
+        let vs = c.g.state(format!("v{l}"), vec![16, kvh * hd], f, false);
+        let att = Op::CachedAttention {
+            heads,
+            kv_heads: kvh,
+            head_dim: hd,
+            v_head_dim: hd,
+            scale: 0.25,
+            causal: true,
+            window,
+            soft_cap: None,
+            write: true,
+        };
+        let a = c.op(&format!("att{l}"), att, &[q, k, v, ks, vs, pos]);
+        let wo = c.weight(&format!("o{l}"), vec![d, heads * hd], 0.2);
+        let o = c.op(&format!("o{l}.y"), Op::Linear, &[a, wo]);
+        x = c.op(&format!("res{l}"), Op::Binary { kind: BinaryKind::Add }, &[x, o]);
+    }
+    let head = c.weight("head", vec![vocab, d], 0.2);
+    let logits = c.op("logits", Op::Linear, &[x, head]);
+    c.g.output(logits);
+
+    let sg = draft::lower_drafter_step(&c.g).unwrap();
+    assert_eq!(sg.embed, ("embed".to_string(), d));
+    let step = draft::DraftStep::compile(sg, &c.w, info).unwrap();
+    let mut lane = draft::AneDraft::new(vec![step]);
+    let mut ring = draft::Ring::new();
+    assert!(lane.claim(&mut ring));
+    let rows = c.w.get("embed").unwrap().to_f32();
+    let cpu = |toks: &[u32]| -> Vec<Vec<f32>> {
+        let _exact = crate::model::qdot::exact();
+        let mut st = StateStore::new();
+        (0..toks.len())
+            .map(|p| {
+                let ins = vec![Tensor::U32(vec![toks[p]]), Tensor::U32(vec![p as u32])];
+                crate::graph::cpu::run(&c.g, &c.w, &mut st, ins).unwrap()[0].to_f32()
+            })
+            .collect()
+    };
+    let check = |lane: &mut draft::AneDraft, ring: &mut draft::Ring, toks: &[u32], from: usize| {
+        let want = cpu(toks);
+        for p in from..toks.len() {
+            let t = toks[p] as usize;
+            let got = lane.run(0, ring, p, &[("embed", &rows[t * d..][..d])]).unwrap();
+            ring.ids.push(toks[p]);
+            let e = rel_rms(&got[0], &want[p]);
+            eprintln!("position {p}: relative RMS {e:.2e}");
+            assert!(e <= 2e-2, "position {p}: relative RMS {e:.2e}");
+        }
+    };
+    let a = [3u32, 17, 5, 9, 22, 1, 30, 8];
+    check(&mut lane, &mut ring, &a, 0);
+    ring.truncate(5);
+    check(&mut lane, &mut ring, &[&a[..5], &[11, 4, 2]].concat(), 5);
+    // A second sequence waits for the windows until the first lets go.
+    let mut other = draft::Ring::new();
+    assert!(!lane.claim(&mut other));
+    drop(ring);
+    assert!(lane.claim(&mut other) && other.ids.is_empty());
+}
+
