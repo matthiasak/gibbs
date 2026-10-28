@@ -902,6 +902,10 @@ impl NativeLm for SpecLm {
         self.ctx
     }
 
+    fn prefill_rows(&self) -> Option<usize> {
+        Some(self.rt.prefill_rows.max(1))
+    }
+
     fn max_positions(&self) -> usize {
         self.max_positions
     }

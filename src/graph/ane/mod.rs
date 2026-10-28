@@ -63,8 +63,9 @@ pub fn probed() -> Option<&'static AneInfo> {
 }
 
 /// Runs `graph` lowered into `prog` (by [`lower`] with layout `io`): packs `inputs` (bound to
-/// `graph.inputs` in order) and the host-computed Rope tables, evaluates, and unpacks the outputs
-/// in `graph.outputs` order.
+/// `graph.inputs` in order) and the host-computed Rope tables into the surfaces the host fills,
+/// evaluates, and unpacks the host-read outputs in `graph.outputs` order (the others, read on
+/// the GPU, return empty).
 pub fn run(
     prog: &mut AneProgram,
     io: &IoLayout,
@@ -80,7 +81,7 @@ pub fn run(
             .map(|i| &inputs[i])
             .ok_or_else(|| format!("'{}' is not a graph input", graph.value(v).name))
     };
-    for (i, b) in io.inputs.iter().enumerate() {
+    for (i, b) in io.inputs.iter().enumerate().filter(|(_, b)| b.host) {
         let data = match b.source {
             IoSource::Value(v) => input(v)?.to_f32(),
             IoSource::RopeTable(n) => {
@@ -99,7 +100,10 @@ pub fn run(
     io.outputs
         .iter()
         .enumerate()
-        .map(|(i, b)| Ok(Tensor::F32(prog.output(i).read(|s| b.unpack(s))?)))
+        .map(|(i, b)| match b.host {
+            true => Ok(Tensor::F32(prog.output(i).read(|s| b.unpack(s))?)),
+            false => Ok(Tensor::F32(Vec::new())),
+        })
         .collect()
 }
 

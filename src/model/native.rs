@@ -57,6 +57,11 @@ pub trait NativeLm: Send + Sync {
     fn max_positions(&self) -> usize {
         self.context_len()
     }
+    /// Rows of a full prefill pass (the instance shape ANE offload gates), if the model chunks
+    /// prefill.
+    fn prefill_rows(&self) -> Option<usize> {
+        None
+    }
     /// Output cap when the caller sets none (seq2seq: generation_config `max_length`).
     fn default_max_new_tokens(&self) -> Option<usize> {
         None

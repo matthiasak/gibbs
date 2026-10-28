@@ -203,7 +203,8 @@ unsafe fn describe(err: Id) -> String {
     string(d)
 }
 
-/// A shared-memory buffer the ANE reads or writes (`[1, C, 1, S]` tensors, channel-major).
+/// A shared-memory buffer the ANE reads or writes (`[1, C, 1, S]` tensors, channel-major); its
+/// size is a multiple of 16 KiB so Metal can wrap it without a copy.
 pub struct Surface {
     raw: *mut c_void,
 }
@@ -216,6 +217,7 @@ impl Surface {
         if bytes == 0 {
             return Err("IOSurface of 0 bytes".into());
         }
+        let bytes = bytes.next_multiple_of(16384);
         let raw = objc::rc::autoreleasepool(|| unsafe {
             let n = number(bytes as u64)?;
             let props = dict(&[

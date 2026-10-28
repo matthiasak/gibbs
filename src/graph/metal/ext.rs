@@ -28,6 +28,7 @@ pub(super) fn msl() -> String {
     s.push_str(attn::MSL);
     s.push_str(moe::MSL);
     s.push_str(deltanet::MSL);
+    s.push_str(include_str!("ext/ane.metal"));
     s
 }
 
@@ -42,6 +43,7 @@ pub(super) fn kernel_names() -> Vec<&'static str> {
     v.extend(attn::KERNELS);
     v.extend(moe::KERNELS);
     v.extend(deltanet::KERNELS);
+    v.extend(["ane_pack", "ane_unpack"]);
     v
 }
 

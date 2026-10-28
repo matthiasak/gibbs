@@ -1883,6 +1883,101 @@ impl Session {
             kv_paged: HashSet::new(),
         })
     }
+
+    /// Adds ANE boundary transfers to `plan`: each `unpack` (source buffer, layout, graph input)
+    /// fills that input on the GPU before the plan's steps, each `pack` (graph output,
+    /// destination buffer, layout) copies it out after them; `device_outputs` are not read back.
+    pub fn add_ane_boundaries(
+        plan: &mut PreparedPlan,
+        unpack: Vec<(Buffer, AneIo, ValueId)>,
+        pack: Vec<(ValueId, Buffer, AneIo)>,
+        device_outputs: HashSet<ValueId>,
+    ) {
+        let step = |name: &str, x: ValueId, op: Step| Planned {
+            name: format!("{name}.{}", x.0),
+            op,
+            out: x,
+            extra_outs: Vec::new(),
+            reads: vec![x],
+        };
+        plan.device_inputs.extend(unpack.iter().map(|u| u.2));
+        let pre = unpack.into_iter().map(|(surface, io, x)| {
+            step("ane_unpack", x, Step::AneUnpack { x, surface, io })
+        });
+        let mut steps: Vec<Planned> = pre.collect();
+        steps.append(&mut plan.steps);
+        steps.extend(pack.into_iter().map(|(x, surface, io)| {
+            step("ane_pack", x, Step::AnePack { x, surface, io })
+        }));
+        plan.steps = steps;
+        plan.device_outputs = device_outputs;
+    }
+
+    /// A GPU view of `len` bytes of host memory at `ptr` (both 16 KiB aligned; the caller keeps
+    /// the memory alive while the buffer is used).
+    pub fn wrap_host(&self, ptr: *mut u8, len: usize) -> Result<Buffer, String> {
+        if ptr as usize % 16384 != 0 || len % 16384 != 0 || len == 0 {
+            return Err(format!("cannot wrap {len} bytes at {ptr:p} without a copy"));
+        }
+        let buf = self.rt.device.new_buffer_with_bytes_no_copy(
+            ptr as *const c_void,
+            len as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        if buf.contents().is_null() {
+            return Err(format!("Metal could not wrap {len} bytes at {ptr:p}"));
+        }
+        Ok(buf)
+    }
+
+    /// A zeroed shared buffer of `bytes`.
+    pub fn shared_buffer(&self, bytes: usize) -> Result<Buffer, String> {
+        new_shared_buffer(&self.rt.device, bytes)
+    }
+
+    /// A host copy of weight `name` as the session stores it: floats as-is, quantized blocks
+    /// dequantized to f16. `None` when unbound or in a device-only layout (planar codecs).
+    pub fn host_weight(&self, name: &str) -> Option<Tensor> {
+        let (buf, off, n, fmt) = self.weights.get(name)?;
+        let (n, fmt) = (*n, *fmt);
+        // SAFETY: the weight occupies its stored bytes at `off` and weights are never written.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (buf.contents() as *const u8).add(*off),
+                weight_format_bytes(fmt, n),
+            )
+        };
+        let words = |b: &[u8]| -> Vec<u16> {
+            b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+        };
+        Some(match fmt {
+            WeightFormat::F32 | WeightFormat::U32 => {
+                let v = bytes.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]);
+                if fmt == WeightFormat::U32 {
+                    Tensor::U32(v.map(u32::from_le_bytes).collect())
+                } else {
+                    Tensor::F32(v.map(f32::from_le_bytes).collect())
+                }
+            }
+            WeightFormat::F16 => Tensor::F16(words(bytes)),
+            WeightFormat::BF16 => Tensor::BF16(words(bytes)),
+            WeightFormat::Gen(f) if codec::planar(f).is_some() => return None,
+            _ => {
+                let f = fmt.codec_format()?;
+                let mut v = crate::model::layers::dequantize_gguf_blocks(f, bytes).or_else(|| {
+                    let (n, bb, dequant) = crate::model::repack::block_codec(f)?;
+                    let mut out = vec![0.0f32; bytes.len() / bb * n];
+                    for (b, y) in bytes.chunks_exact(bb).zip(out.chunks_exact_mut(n)) {
+                        dequant(b, y);
+                    }
+                    Some(out)
+                })?;
+                v.truncate(n);
+                Tensor::F16(v.into_iter().map(crate::model::f32_to_f16).collect())
+            }
+        })
+    }
     /// GPU seconds of the last completed (non-profiled) [`Self::run`] command buffer.
     pub fn last_gpu_seconds(&self) -> f64 {
         f64::from_bits(self.last_gpu_s.load(std::sync::atomic::Ordering::Relaxed))
@@ -2315,6 +2410,8 @@ impl Session {
             state_vars,
             value_locs,
             f16_states,
+            device_inputs: HashSet::new(),
+            device_outputs: HashSet::new(),
         })
     }
 
@@ -2483,6 +2580,9 @@ impl Session {
             ));
         }
         for (&v, t) in graph.inputs.iter().zip(&inputs) {
+            if plan.device_inputs.contains(&v) {
+                continue;
+            }
             let val = graph.value(v);
             let ok_type = matches!(
                 (val.dtype, t),
@@ -2547,6 +2647,9 @@ impl Session {
         let arena = arena.as_ref().expect("allocated above");
         let base = arena.contents() as *mut u8;
         for (&v, t) in graph.inputs.iter().zip(&inputs) {
+            if plan.device_inputs.contains(&v) {
+                continue;
+            }
             let (_f32_buf, src, len) = match t {
                 Tensor::F32(x) => (None, x.as_ptr() as *const u8, x.len()),
                 Tensor::U32(x) => (None, x.as_ptr() as *const u8, x.len()),
@@ -2638,6 +2741,9 @@ impl Session {
             .outputs
             .iter()
             .map(|&v| {
+                if plan.device_outputs.contains(&v) {
+                    return Ok(Tensor::F32(Vec::new()));
+                }
                 let (buf, off) = loc(v);
                 let n = numel(graph, v)?;
                 // SAFETY: the value occupies n f32 at `off` and the command buffer has completed.
@@ -4226,6 +4332,18 @@ impl Session {
                     )?;
                 }
             }
+            Step::AnePack { x, ref surface, io } | Step::AneUnpack { x, ref surface, io } => {
+                let pack = matches!(s.op, Step::AnePack { .. });
+                enc.set_compute_pipeline_state(rt.pso(if pack { "ane_pack" } else { "ane_unpack" })?);
+                let (b, off) = loc(x);
+                enc.set_buffer(0, Some(b), off as u64);
+                enc.set_buffer(1, Some(surface), 0);
+                set_bytes(enc, 2, &io);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(io.c.div_ceil(32) as u64, io.s.div_ceil(32) as u64, 1),
+                    MTLSize::new(32, 8, 1),
+                );
+            }
         }
         Ok(())
     }
@@ -4432,6 +4550,31 @@ pub enum Step {
         eps: f32,
         is_geglu: bool,
     },
+    /// Copies graph value `x` into an ANE surface (or a boundary buffer) wrapped by `surface`
+    /// ([`AneIo`] layout); added by [`Session::add_ane_boundaries`] after a plan's steps.
+    AnePack {
+        x: ValueId,
+        surface: Buffer,
+        io: AneIo,
+    },
+    /// The reverse: fills graph input `x` from `surface` before a plan's steps.
+    AneUnpack {
+        x: ValueId,
+        surface: Buffer,
+        io: AneIo,
+    },
+}
+
+/// An ANE `[1, C, 1, S]` f32 surface layout: element `(c, s)` at float `c * row + s`; the graph
+/// value holds it at `s * C + c` (`transposed`, a row-major `[S, C]` activation) or `c * S + s`.
+/// Mirrors `AneIo` in `ext/ane.metal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct AneIo {
+    pub c: u32,
+    pub s: u32,
+    pub row: u32,
+    pub transposed: u32,
 }
 
 /// One dispatch: the step, the value it writes, and every value it reads.
@@ -4482,6 +4625,10 @@ pub struct PreparedPlan {
     pub(crate) value_locs: Vec<PlanValueLoc>,
     /// Names of the states stored as f16 (see [`assign_kv_dtypes`]).
     pub f16_states: HashSet<String>,
+    /// Graph inputs the plan's [`Step::AneUnpack`] steps fill (the host uploads nothing; callers
+    /// pass empty tensors) and graph outputs only [`Step::AnePack`] steps read (returned empty).
+    pub(crate) device_inputs: HashSet<ValueId>,
+    pub(crate) device_outputs: HashSet<ValueId>,
 }
 
 /// The one f16 KV cache policy (`Session::set_kv_f16`, `GIBBS_KV_DTYPE`): the paged KV states
@@ -5547,7 +5694,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             | Step::RopeBatch { .. }
             | Step::SplitGlu { .. }
             | Step::MoeWeightedSum { .. }
-            | Step::GemvPackedPair { .. } => {
+            | Step::GemvPackedPair { .. }
+            | Step::AnePack { .. }
+            | Step::AneUnpack { .. } => {
                 unreachable!("post-pass steps are created after node lowering")
             }
             Step::MegakernelMlp {
