@@ -226,6 +226,11 @@ impl ExecutableModel {
         Some(self.0.context_len().max(1))
     }
 
+    /// [`NativeLm::prefill_rows`].
+    pub fn prefill_rows(&self) -> Option<usize> {
+        self.0.prefill_rows()
+    }
+
     /// Positions one sequence may reach ([`NativeLm::max_positions`]).
     pub fn max_positions(&self) -> usize {
         self.0.max_positions()

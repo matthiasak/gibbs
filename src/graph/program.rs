@@ -89,15 +89,17 @@ impl CompiledSegment {
 }
 
 /// One segment of a heterogeneous program: its compiled fragment and the program values bound,
-/// in order, to the fragment's inputs and outputs.
+/// in order, to the fragment's inputs and outputs. Values crossing segments stay on the device
+/// ([`assemble`]); the host passes only graph inputs and outputs.
 pub struct SegmentExec {
     pub compiled: CompiledSegment,
     pub inputs: Vec<ValueId>,
     pub outputs: Vec<ValueId>,
 }
 
-/// Runs `segments` in order: `inputs` bind to `graph_inputs`, each segment reads the values
-/// earlier segments (or the inputs) produced, and `graph_outputs` are returned.
+/// Runs `segments` in order: `inputs` bind to `graph_inputs`, each segment reads the graph
+/// inputs it uses from the host (empty tensors stand for values its boundary steps receive on
+/// the device), and `graph_outputs` are returned.
 fn run_segments(
     segments: &mut [SegmentExec],
     state: &mut StateStore,
@@ -106,21 +108,23 @@ fn run_segments(
     inputs: Vec<Tensor>,
 ) -> Result<Vec<Tensor>, String> {
     let mut vals: HashMap<ValueId, Tensor> = graph_inputs.iter().copied().zip(inputs).collect();
-    let take = |vals: &HashMap<ValueId, Tensor>, v: &ValueId| {
-        vals.get(v)
-            .cloned()
-            .ok_or_else(|| format!("segment value {v:?} was never produced"))
-    };
     for seg in segments {
         let ins = seg
             .inputs
             .iter()
-            .map(|v| take(&vals, v))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|v| vals.get(v).cloned().unwrap_or(Tensor::F32(Vec::new())))
+            .collect();
         let outs = seg.compiled.run(state, ins)?;
         vals.extend(seg.outputs.iter().copied().zip(outs));
     }
-    graph_outputs.iter().map(|v| take(&vals, v)).collect()
+    graph_outputs
+        .iter()
+        .map(|v| {
+            vals.get(v)
+                .cloned()
+                .ok_or_else(|| format!("segment value {v:?} was never produced"))
+        })
+        .collect()
 }
 
 /// `nodes` of `graph` as a standalone graph: operands produced outside become inputs (first-use
@@ -254,11 +258,6 @@ pub struct GraphProgram {
     scalars: Weights,
     /// The device reshaped instances may offload regions to.
     secondary: Option<Secondary>,
-    /// Host copies of the weights the secondary lowers (it compiles them into its programs), for
-    /// reshaped instances; `None` for decode programs under `Auto`.
-    // ponytail: duplicates the offloadable weights in host memory for the program's lifetime;
-    // read them back from the Metal buffers if that RSS matters.
-    ane_weights: Option<Weights>,
     /// Reshaped instance keys whose gate kept every region on Metal: re-planned instances skip
     /// the gate (an evicted instance is rebuilt often).
     ane_metal_only: std::collections::HashSet<((usize, usize), Vec<Vec<usize>>)>,
@@ -418,23 +417,6 @@ impl GraphProgram {
         let offload = secondary.filter(|_| !is_decode(&graph));
         #[allow(unused_mut)]
         let mut plan = place_and_adapt(&mut graph, primary_mode, &available, offload)?;
-        let ane_weights = secondary
-            .filter(|s| keep_folded && (s.force || offload.is_some()))
-            .map(|s| {
-                let mut w = Weights::new();
-                for node in &graph.nodes {
-                    if !crate::graph::placement::secondary_supports(s.device, &graph, node) {
-                        continue;
-                    }
-                    for &v in &node.inputs {
-                        let val = graph.value(v);
-                        if let (ValueKind::Weight, Some(t)) = (&val.kind, weights.get(&val.name)) {
-                            w.insert(val.name.clone(), t.clone());
-                        }
-                    }
-                }
-                w
-            });
         if let Some(unfused) = &unfused {
             for (name, t) in unfused.iter() {
                 if weights.get(name).is_none() {
@@ -473,7 +455,8 @@ impl GraphProgram {
                 let session = std::sync::Arc::new(session);
                 let prepared_plan = session.prepare_plan(&graph)?;
                 if let Some(s) = offload {
-                    segments = gate(&mut graph, &mut plan, &session, &weights, s)?;
+                    let (w, pool) = (Some(&weights), kv_pool.as_ref());
+                    segments = gate(&mut graph, &mut plan, &session, w, s, pool)?;
                 }
                 CompiledSegment::Metal {
                     graph,
@@ -519,7 +502,6 @@ impl GraphProgram {
             reshaped_graphs: Vec::new(),
             scalars,
             secondary,
-            ane_weights,
             ane_metal_only: Default::default(),
         };
         if mode != PlacementMode::Pin(Device::Cpu) {
@@ -653,9 +635,9 @@ impl GraphProgram {
         false
     }
 
-    /// The ANE segments of a reshaped instance `g` (on `session`) when the program has a
-    /// secondary, `allow` (or `--backend ane`) admits it and the gate keeps regions; empty
-    /// otherwise.
+    /// The ANE segments of a reshaped instance `g` (on `session`, whose weight buffers the ANE
+    /// lowering reads) when the program has a secondary, `allow` (or `--backend ane`) admits it
+    /// and the gate keeps regions; empty otherwise.
     #[cfg(target_os = "macos")]
     fn instance_segments(
         &self,
@@ -663,7 +645,7 @@ impl GraphProgram {
         session: &std::sync::Arc<crate::graph::metal::Session>,
         allow: bool,
     ) -> Result<Vec<SegmentExec>, String> {
-        let (Some(sec), Some(weights)) = (self.secondary, &self.ane_weights) else {
+        let Some(sec) = self.secondary else {
             return Ok(Vec::new());
         };
         if !allow || is_decode(g) {
@@ -675,7 +657,7 @@ impl GraphProgram {
         else {
             return Ok(Vec::new());
         };
-        gate(g, &mut placed, session, weights, sec)
+        gate(g, &mut placed, session, None, sec, self.kv_pool.as_ref())
     }
 
     /// Runs `graph` with the program's weights inside the program's state: another instance shape of
@@ -1039,8 +1021,8 @@ const ANE_SPEEDUP: f64 = 0.95;
 /// A measured ANE offload decision for one region signature ([`gate`]).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AneDecision {
-    /// Median of 3 timed runs of the region on Metal and on the ANE (host boundary copies
-    /// included).
+    /// Median of the alternating timed runs ([`time_ms`]) of the region on Metal and on the ANE
+    /// between Metal segments (GPU-side boundary steps and the extra commit-and-wait included).
     pub metal_ms: f64,
     pub ane_ms: f64,
     /// Largest relative RMS error of an ANE output against Metal's (non-finite stored as
@@ -1121,11 +1103,12 @@ fn with_ane_decisions<R>(
     r
 }
 
-/// FNV-64 over the node ops, devices, operand shapes and dtypes and weight names of `graph`, and
-/// the ANE lowering source (an edited lowering re-measures).
-fn signature(graph: &Graph) -> u64 {
+/// FNV-64 over the node ops, devices, operand shapes and dtypes and weight names of `graph`, the
+/// weight source (`dequant`: f16 copies of the Metal buffers) and the sources of the ANE lowering,
+/// the boundary kernels and this gate (an edited one re-measures).
+fn signature(graph: &Graph, dequant: bool) -> u64 {
     use std::fmt::Write;
-    let mut s = String::new();
+    let mut s = format!("dequant {dequant}|");
     for n in &graph.nodes {
         let _ = write!(s, "{:?}|{:?}|", n.op, n.device);
         for &v in n.inputs.iter().chain(&n.outputs) {
@@ -1138,7 +1121,9 @@ fn signature(graph: &Graph) -> u64 {
         }
     }
     let lowering = include_bytes!("ane/mil.rs");
-    crate::graph::ane::fnv64(&[s.as_bytes(), lowering])
+    let boundary = include_bytes!("metal/ext/ane.metal");
+    let gate = include_bytes!("program.rs");
+    crate::graph::ane::fnv64(&[s.as_bytes(), lowering, boundary, gate])
 }
 
 /// Deterministic inputs for `graph`: standard-normal f32, and u32 `iota` clamped below the rows
@@ -1181,19 +1166,33 @@ fn synth_inputs(graph: &Graph) -> Vec<Tensor> {
         .collect()
 }
 
-/// One warm-up run of `f`, then the median of 3 timed runs (ms) and the warm-up's outputs.
-fn time_ms(
-    mut f: impl FnMut() -> Result<Vec<Tensor>, String>,
-) -> Result<(f64, Vec<Tensor>), String> {
-    let out = f()?;
-    let mut t = [0.0f64; 3];
-    for x in &mut t {
-        let start = std::time::Instant::now();
-        f()?;
-        *x = start.elapsed().as_secs_f64() * 1e3;
+/// Timed rounds of [`time_ms`]: identical regions measured with 3 showed ±2× Metal spread under
+/// the UI's GPU load.
+const TIMED_ROUNDS: usize = 7;
+
+/// One warm-up run of each of `f`, then [`TIMED_ROUNDS`] rounds running each once in turn: the
+/// median of each one's timed runs (ms) and its warm-up outputs. Alternating keeps GPU clock
+/// changes (idle after a compile, other load) from favoring either side.
+fn time_ms<const N: usize>(
+    mut f: [&mut dyn FnMut() -> Result<Vec<Tensor>, String>; N],
+) -> Result<[(f64, Vec<Tensor>); N], String> {
+    let mut outs = Vec::with_capacity(N);
+    for g in f.iter_mut() {
+        outs.push(g()?);
     }
-    t.sort_by(f64::total_cmp);
-    Ok((t[1], out))
+    let mut t = [[0.0f64; TIMED_ROUNDS]; N];
+    for round in 0..TIMED_ROUNDS {
+        for (g, t) in f.iter_mut().zip(&mut t) {
+            let start = std::time::Instant::now();
+            g()?;
+            t[round] = start.elapsed().as_secs_f64() * 1e3;
+        }
+    }
+    let mut outs = outs.into_iter();
+    Ok(t.map(|mut t| {
+        t.sort_by(f64::total_cmp);
+        (t[TIMED_ROUNDS / 2], outs.next().expect("one output per closure"))
+    }))
 }
 
 /// Puts every node of `graph` back on the primary device: one segment.
@@ -1205,9 +1204,10 @@ fn demote(graph: &mut Graph, placed: &mut PlacementPlan) {
 }
 
 /// Bytes of the weights the ANE regions of `graph` compile, in the encoding [`crate::graph::ane::lower`]
-/// picks: int4 `Q4_0`, int8 other quantized formats, fp16 floats.
+/// picks: int4 `Q4_0`, int8 other quantized formats, fp16 floats; everything fp16 when the
+/// weights come dequantized from the Metal buffers (`dequant`).
 #[cfg(target_os = "macos")]
-fn ane_weight_bytes(graph: &Graph, info: &crate::graph::ane::AneInfo) -> usize {
+fn ane_weight_bytes(graph: &Graph, info: &crate::graph::ane::AneInfo, dequant: bool) -> usize {
     let mut seen = std::collections::HashSet::new();
     let mut total = 0;
     for n in graph.nodes.iter().filter(|n| n.device == Device::Ane) {
@@ -1218,6 +1218,7 @@ fn ane_weight_bytes(graph: &Graph, info: &crate::graph::ane::AneInfo) -> usize {
             }
             let e: usize = val.shape.iter().product();
             total += match val.dtype {
+                _ if dequant => e * 2,
                 DType::Quant(crate::hardware::QuantFormat::GGUF_Q4_0) if info.int4.is_ok() => {
                     e * 9 / 16
                 }
@@ -1229,15 +1230,29 @@ fn ane_weight_bytes(graph: &Graph, info: &crate::graph::ane::AneInfo) -> usize {
     total
 }
 
-/// The ANE region `g` lowered over `weights` and compiled.
+/// The ANE region `g` lowered and compiled over its weights: from `host` (handles to the loaded
+/// tensors), else f16 copies of `session`'s buffers ([`crate::graph::metal::Session::host_weight`]),
+/// dropped once compiled.
 #[cfg(target_os = "macos")]
 fn compile_ane(
     g: Graph,
-    weights: &Weights,
+    host: Option<&Weights>,
+    session: &crate::graph::metal::Session,
     info: &crate::graph::ane::AneInfo,
 ) -> Result<CompiledSegment, String> {
     use crate::graph::ane;
-    let (mil, blob, io) = ane::lower(&g, weights, info)?;
+    let mut weights = Weights::new();
+    for val in g.values.iter().filter(|v| v.kind == ValueKind::Weight) {
+        if weights.get(&val.name).is_none() {
+            let t = match host {
+                Some(w) => w.get(&val.name).cloned(),
+                None => session.host_weight(&val.name),
+            };
+            let t = t.ok_or_else(|| format!("weight '{}' has no host copy to lower", val.name))?;
+            weights.insert(val.name.clone(), t);
+        }
+    }
+    let (mil, blob, io) = ane::lower(&g, &weights, info)?;
     let (n_in, n_out) = (io.inputs.len(), io.outputs.len());
     let program = ane::AneProgram::compile(&mil, &blob, n_in, io.in_bytes(), n_out, io.out_bytes())?;
     let mut tables = Weights::new();
@@ -1258,48 +1273,338 @@ fn compile_ane(
     })
 }
 
-/// Times region `g` as the Metal plan `metal` and as the ANE program `ane` on [`synth_inputs`]
-/// (1 warm-up, median of 3) and compares their outputs.
+/// Region `g` between identity Reshapes on Metal: measuring it crosses the GPU-side boundaries a
+/// program's region does (f32 inputs arrive from a Metal segment, outputs leave to one; u32
+/// inputs such as positions are graph inputs either way).
+#[cfg(target_os = "macos")]
+fn harness(g: &Graph) -> Graph {
+    let mut h = Graph::new();
+    let ident = |h: &mut Graph, name: String, v: ValueId| {
+        let (shape, dtype) = (h.value(v).shape.clone(), h.value(v).dtype);
+        let op = Op::Reshape {
+            shape: Some(shape.clone()),
+        };
+        let r = h.add(name, op, &[v], shape, dtype);
+        h.nodes.last_mut().expect("just added").device = Device::Metal;
+        r
+    };
+    let mut map: HashMap<ValueId, ValueId> = HashMap::new();
+    for &v in &g.inputs {
+        let val = g.value(v);
+        let x = h.input(&val.name, val.shape.clone(), val.dtype);
+        let x = match val.dtype {
+            DType::F32 => ident(&mut h, format!("{}.in", val.name), x),
+            _ => x,
+        };
+        map.insert(v, x);
+    }
+    for n in &g.nodes {
+        let mut inputs = Vec::with_capacity(n.inputs.len());
+        for &v in &n.inputs {
+            let id = match map.get(&v) {
+                Some(&id) => id,
+                None => {
+                    let id = ValueId(h.values.len() as u32);
+                    h.values.push(g.value(v).clone());
+                    map.insert(v, id);
+                    id
+                }
+            };
+            inputs.push(id);
+        }
+        let nid = NodeId(h.nodes.len() as u32);
+        let mut outputs = Vec::with_capacity(n.outputs.len());
+        for &v in &n.outputs {
+            let id = ValueId(h.values.len() as u32);
+            let mut val = g.value(v).clone();
+            val.kind = ValueKind::Node(nid);
+            h.values.push(val);
+            map.insert(v, id);
+            outputs.push(id);
+        }
+        h.nodes.push(crate::graph::Node {
+            name: n.name.clone(),
+            op: n.op.clone(),
+            inputs,
+            outputs,
+            device: Device::Ane,
+        });
+    }
+    for &o in &g.outputs {
+        let r = ident(&mut h, format!("{}.out", g.value(o).name), map[&o]);
+        h.output(r);
+    }
+    h
+}
+
+/// The segments of `graph` as placed (node devices final; ANE regions compiled in `ane`, keyed by
+/// their first node), wired so values crossing segments never touch the host: a Metal segment
+/// packs ([`crate::graph::metal::Step::AnePack`]) what a later ANE region reads into that
+/// region's input surface after its own steps, and unpacks
+/// ([`crate::graph::metal::Step::AneUnpack`]) what it reads from an earlier region's output
+/// surface before them. A value passed between two ANE regions goes through the Metal segment
+/// right before the reader; one passed between two Metal segments through a boundary buffer.
+/// Only graph inputs and outputs cross the host (around an ANE eval: packed and unpacked there).
+#[cfg(target_os = "macos")]
+fn assemble(
+    graph: &Graph,
+    primary: Device,
+    mut ane: HashMap<NodeId, CompiledSegment>,
+    session: &std::sync::Arc<crate::graph::metal::Session>,
+) -> Result<Vec<SegmentExec>, String> {
+    use crate::graph::ane::{IoBinding, IoSource};
+    use crate::graph::metal::{AneIo, Session};
+    type Pack = (ValueId, metal::Buffer, AneIo);
+    let parts = crate::graph::placement::segments_of(graph, primary).segments;
+    let n = parts.len();
+    let mut frags: Vec<(Graph, Vec<ValueId>, Vec<ValueId>)> =
+        parts.iter().map(|s| fragment(graph, &s.nodes)).collect();
+    let mut compiled = Vec::with_capacity(n);
+    // Per ANE part: its surfaces wrapped for Metal and their layouts (inputs, outputs).
+    let mut surfaces: Vec<(Vec<(metal::Buffer, AneIo)>, Vec<(metal::Buffer, AneIo)>)> =
+        Vec::with_capacity(n);
+    let layout = |b: &IoBinding| AneIo {
+        c: b.channels as u32,
+        s: b.spatial as u32,
+        row: (b.row_bytes() / 4) as u32,
+        transposed: b.transposed as u32,
+    };
+    for s in &parts {
+        let seg = match s.device {
+            Device::Ane => Some(
+                ane.remove(&s.nodes[0])
+                    .ok_or("an ANE segment lost its program")?,
+            ),
+            _ => None,
+        };
+        let mut wrapped = (Vec::new(), Vec::new());
+        if let Some(CompiledSegment::Ane { program, io, .. }) = &seg {
+            for (i, b) in io.inputs.iter().enumerate() {
+                let sf = program.input(i);
+                wrapped.0.push((session.wrap_host(sf.base(), sf.alloc_size())?, layout(b)));
+            }
+            for (i, b) in io.outputs.iter().enumerate() {
+                let sf = program.output(i);
+                wrapped.1.push((session.wrap_host(sf.base(), sf.alloc_size())?, layout(b)));
+            }
+        }
+        compiled.push(seg);
+        surfaces.push(wrapped);
+    }
+    let mut producer: HashMap<ValueId, usize> = HashMap::new();
+    for (i, f) in frags.iter().enumerate() {
+        producer.extend(f.2.iter().map(|&v| (v, i)));
+    }
+    let at = |vs: &[ValueId], v: ValueId| vs.iter().position(|&x| x == v).expect("bound value");
+    let mut pre: Vec<Vec<(metal::Buffer, AneIo, ValueId)>> = vec![Vec::new(); n];
+    let mut post: Vec<Vec<Pack>> = vec![Vec::new(); n];
+    // Values passed between Metal segments, in a row-major boundary buffer each.
+    let mut carried: HashMap<ValueId, (metal::Buffer, AneIo)> = HashMap::new();
+    for m in (0..n).filter(|&m| parts[m].device != Device::Ane) {
+        for v in frags[m].1.clone() {
+            if graph.inputs.contains(&v) {
+                continue;
+            }
+            let p = producer[&v];
+            if parts[p].device == Device::Ane {
+                let (buf, io) = surfaces[p].1[at(&frags[p].2, v)].clone();
+                pre[m].push((buf, io, v));
+                continue;
+            }
+            if !carried.contains_key(&v) {
+                let shape = &graph.value(v).shape;
+                let len = shape.iter().product::<usize>();
+                let cols = shape.last().copied().unwrap_or(1).max(1);
+                let (c, s) = ((len / cols) as u32, cols as u32);
+                let io = AneIo { c, s, row: s, transposed: 0 };
+                let buf = session.shared_buffer(len.max(1) * 4)?;
+                post[p].push((v, buf.clone(), io));
+                carried.insert(v, (buf, io));
+            }
+            let (buf, io) = carried[&v].clone();
+            pre[m].push((buf, io, v));
+        }
+    }
+    for k in (0..n).filter(|&k| parts[k].device == Device::Ane) {
+        let Some(CompiledSegment::Ane { graph: g, io, .. }) = &mut compiled[k] else {
+            unreachable!("ANE parts hold their programs")
+        };
+        for (i, b) in io.inputs.iter_mut().enumerate() {
+            let fv = match b.source {
+                IoSource::Value(fv) => fv,
+                IoSource::RopeTable(r) => g.nodes[r].inputs[1],
+            };
+            let v = frags[k].1[at(&g.inputs, fv)];
+            b.host = graph.inputs.contains(&v);
+            if b.host {
+                continue;
+            }
+            if matches!(b.source, IoSource::RopeTable(_)) || graph.value(v).dtype != DType::F32 {
+                return Err(format!(
+                    "ANE region input '{}' ({:?}) is neither an f32 activation nor a graph input",
+                    graph.value(v).name,
+                    graph.value(v).dtype
+                ));
+            }
+            let (buf, dst) = surfaces[k].0[i].clone();
+            let p = producer[&v];
+            if parts[p].device != Device::Ane {
+                post[p].push((v, buf, dst));
+                continue;
+            }
+            // Between two regions: through the Metal segment before the reader.
+            let m = k - 1;
+            if m <= p || parts[m].device == Device::Ane {
+                return Err("adjacent ANE segments".into());
+            }
+            if !frags[m].1.contains(&v) {
+                let (src, io) = surfaces[p].1[at(&frags[p].2, v)].clone();
+                let f = &mut frags[m];
+                let id = ValueId(f.0.values.len() as u32);
+                let mut val = graph.value(v).clone();
+                val.kind = ValueKind::Input;
+                f.0.values.push(val);
+                f.0.inputs.push(id);
+                f.1.push(v);
+                pre[m].push((src, io, v));
+            }
+            let f = &mut frags[m];
+            if !f.2.contains(&v) {
+                let id = f.0.inputs[at(&f.1, v)];
+                f.0.outputs.push(id);
+                f.2.push(v);
+            }
+            post[m].push((v, buf, dst));
+        }
+        for (j, b) in io.outputs.iter_mut().enumerate() {
+            b.host = graph.outputs.contains(&frags[k].2[j]);
+        }
+    }
+    let mut segments = Vec::with_capacity(n);
+    for (k, ((g, inputs, outputs), seg)) in frags.into_iter().zip(compiled).enumerate() {
+        let compiled = match seg {
+            Some(seg) => seg,
+            None => {
+                let mut plan = session.prepare_plan(&g)?;
+                let fin = |v: ValueId| g.inputs[at(&inputs, v)];
+                let fout = |v: ValueId| g.outputs[at(&outputs, v)];
+                let unpack = pre[k].drain(..).map(|(b, io, v)| (b, io, fin(v))).collect();
+                let pack = post[k].drain(..).map(|(v, b, io)| (fout(v), b, io)).collect();
+                let device = outputs
+                    .iter()
+                    .filter(|v| !graph.outputs.contains(v))
+                    .map(|&v| fout(v))
+                    .collect();
+                Session::add_ane_boundaries(&mut plan, unpack, pack, device);
+                CompiledSegment::Metal {
+                    graph: g,
+                    session: session.clone(),
+                    plan,
+                }
+            }
+        };
+        segments.push(SegmentExec {
+            compiled,
+            inputs,
+            outputs,
+        });
+    }
+    Ok(segments)
+}
+
+/// Times region `g` as the Metal plan `metal` and as the ANE program `ane` between Metal
+/// segments ([`harness`], the GPU-side boundary path) on [`synth_inputs`] ([`time_ms`]; both
+/// sides upload the inputs and read the outputs on the host) and compares their outputs.
+/// Returns the decision and the program.
 #[cfg(target_os = "macos")]
 fn measure_region(
     g: &Graph,
     metal: &crate::graph::metal::PreparedPlan,
-    ane: &mut CompiledSegment,
-    session: &crate::graph::metal::Session,
-) -> Result<AneDecision, String> {
+    ane: CompiledSegment,
+    session: &std::sync::Arc<crate::graph::metal::Session>,
+) -> Result<(AneDecision, CompiledSegment), String> {
     let inputs = synth_inputs(g);
     let mut st = StateStore::new();
-    let (metal_ms, want) = time_ms(|| session.run_prepared(g, metal, Some(&mut st), inputs.clone()))?;
-    let (ane_ms, got) = time_ms(|| ane.run(&mut st, inputs.clone()))?;
+    let (h, mut st_ane) = (harness(g), StateStore::new());
+    let first = h.nodes.iter().position(|n| n.device == Device::Ane).unwrap_or(0);
+    let ane = HashMap::from([(NodeId(first as u32), ane)]);
+    let mut segs = assemble(&h, Device::Metal, ane, session)?;
+    let (h_in, h_out) = (&h.inputs, &h.outputs);
+    let [(metal_ms, want), (ane_ms, got)] = time_ms([
+        &mut || session.run_prepared(g, metal, Some(&mut st), inputs.clone()),
+        &mut || run_segments(&mut segs, &mut st_ane, h_in, h_out, inputs.clone()),
+    ])?;
+    let decision = decide(metal_ms, ane_ms, &want, &got);
+    let ane = segs
+        .into_iter()
+        .map(|s| s.compiled)
+        .find(|c| c.device() == Device::Ane)
+        .expect("the harness holds the region");
+    Ok((decision, ane))
+}
+
+/// The decision for measured medians and the outputs of both sides.
+fn decide(metal_ms: f64, ane_ms: f64, want: &[Tensor], got: &[Tensor]) -> AneDecision {
     let rel = want
         .iter()
-        .zip(&got)
+        .zip(got)
         .map(|(w, o)| crate::graph::ane::rel_rms(&o.to_f32(), &w.to_f32()))
         .fold(0.0f32, f32::max);
     let rel_err = if rel.is_finite() { rel } else { f32::MAX };
-    Ok(AneDecision {
+    AneDecision {
         metal_ms,
         ane_ms,
         rel_err,
         chosen: rel_err <= ANE_REL_ERR && ane_ms <= ANE_SPEEDUP * metal_ms,
-    })
+    }
 }
 
-/// The measured gate for `graph` placed with ANE regions (`placed`). Each region is lowered and
-/// compiled, then measured against its own Metal plan ([`measure_region`]) unless the host cache
-/// holds its decision (keyed by the region's [`signature`]). A region stays on the ANE when its
-/// outputs are within [`ANE_REL_ERR`] and (`Auto`) its median is at most [`ANE_SPEEDUP`] of
-/// Metal's (`--backend ane` skips the speed test); one that cannot be built (budget, memory,
-/// lowering) or loses goes back to Metal. `--backend ane` fails when every measured region
-/// fails the error test. Returns the program's segments (empty: `graph` runs on Metal alone),
-/// with `graph` and `placed` updated to the final placement.
+/// Times all of `graph` as one Metal plan and as `segments` ([`time_ms`], [`synth_inputs`]),
+/// each on a scratch state (with a view of `pool` when the program pages KV), and compares
+/// their outputs.
+#[cfg(target_os = "macos")]
+fn measure_program(
+    graph: &Graph,
+    segments: &mut [SegmentExec],
+    session: &crate::graph::metal::Session,
+    pool: Option<&std::sync::Arc<crate::kv::KvPool>>,
+) -> Result<AneDecision, String> {
+    let plan = session.prepare_plan(graph)?;
+    let inputs = synth_inputs(graph);
+    let scratch = || {
+        let mut st = StateStore::new();
+        st.kv = pool.map(|p| crate::kv::KvView::new(p.clone()));
+        st
+    };
+    let (mut a, mut b) = (scratch(), scratch());
+    let (g_in, g_out) = (&graph.inputs, &graph.outputs);
+    let [(metal_ms, want), (ane_ms, got)] = time_ms([
+        &mut || session.run_prepared(graph, &plan, Some(&mut a), inputs.clone()),
+        &mut || run_segments(segments, &mut b, g_in, g_out, inputs.clone()),
+    ])?;
+    Ok(decide(metal_ms, ane_ms, &want, &got))
+}
+
+/// The measured gate for `graph` placed with ANE regions (`placed`). Each region is lowered over
+/// `host` weights (`None`: f16 copies of `session`'s buffers) and compiled, then measured
+/// against its own Metal plan ([`measure_region`]) unless the host cache holds its decision
+/// (keyed by the region's [`signature`]). A region stays on the ANE when its outputs are within
+/// [`ANE_REL_ERR`] and (`Auto`) its median is at most [`ANE_SPEEDUP`] of Metal's (`--backend
+/// ane` skips the speed test); one that cannot be built (budget, memory, lowering, an input
+/// that is neither an f32 activation nor a graph input) or loses goes back to Metal.
+/// `--backend ane` fails when every measured region fails the error test. Under `Auto` the
+/// program with its kept regions must then win whole ([`measure_program`], decision keyed by
+/// the placed graph's signature): a region timed alone pays launch and sync costs Metal
+/// pipelines away inside a program. Returns the program's segments ([`assemble`]; empty:
+/// `graph` runs on Metal alone), with `graph` and `placed` updated to the final placement.
 #[cfg(target_os = "macos")]
 fn gate(
     graph: &mut Graph,
     placed: &mut PlacementPlan,
     session: &std::sync::Arc<crate::graph::metal::Session>,
-    weights: &Weights,
+    host: Option<&Weights>,
     sec: Secondary,
+    pool: Option<&std::sync::Arc<crate::kv::KvPool>>,
 ) -> Result<Vec<SegmentExec>, String> {
     use crate::graph::ane;
     let regions: Vec<Vec<NodeId>> = placed
@@ -1313,7 +1618,8 @@ fn gate(
     }
     let info = ane::probe()?;
     let memsize = crate::hardware::sysctl::int(c"hw.memsize").unwrap_or(u64::MAX) as f64;
-    let need = ane_weight_bytes(graph, info) + crate::hardware::current_resident_memory_bytes();
+    let need = ane_weight_bytes(graph, info, host.is_none())
+        + crate::hardware::current_resident_memory_bytes();
     let refused = if ane::programs_compiled() + regions.len() > ane::ANE_MAX_PROGRAMS {
         Some("ANE program budget reached".to_string())
     } else if need as f64 > 0.75 * memsize {
@@ -1327,14 +1633,46 @@ fn gate(
         demote(graph, placed);
         return Ok(Vec::new());
     }
-    let mut kept: HashMap<NodeId, SegmentExec> = HashMap::new();
+    let label = |nodes: &[NodeId]| {
+        let name = |i: usize| graph.node(nodes[i]).name.as_str();
+        format!("{} nodes: {} … {}", nodes.len(), name(0), name(nodes.len() - 1))
+    };
+    let whole_label = |n: usize| format!("whole program, {n} ANE regions");
+    let cached = |sig: u64| with_ane_decisions(false, |m| m.get(&format!("{sig:016x}")).copied());
+    // Auto: every region and the whole program with the regions that win alone were decided
+    // before, and the program lost: build nothing.
+    let known: Option<Vec<(u64, AneDecision)>> = regions
+        .iter()
+        .map(|nodes| {
+            let sig = signature(&fragment(graph, nodes).0, host.is_none());
+            cached(sig).map(|d| (sig, d))
+        })
+        .collect();
+    if let (false, Some(known)) = (sec.force, known) {
+        let mut trial = graph.clone();
+        for (nodes, _) in regions.iter().zip(&known).filter(|(_, (_, d))| !d.chosen) {
+            for n in nodes {
+                trial.nodes[n.0 as usize].device = placed.primary;
+            }
+        }
+        let wins = known.iter().filter(|(_, d)| d.chosen).count();
+        let sig = signature(&trial, host.is_none());
+        if let Some(d) = cached(sig).filter(|d| wins > 0 && !d.chosen) {
+            for (nodes, &(s, rd)) in regions.iter().zip(&known) {
+                record(s, label(nodes), rd, false, false);
+            }
+            record(sig, whole_label(wins), d, false, false);
+            demote(graph, placed);
+            return Ok(Vec::new());
+        }
+    }
+    let mut kept: HashMap<NodeId, CompiledSegment> = HashMap::new();
     let mut best_err: Option<f32> = None;
     for nodes in &regions {
-        let (g, inputs, outputs) = fragment(graph, nodes);
-        let sig = signature(&g);
+        let (g, inputs, _) = fragment(graph, nodes);
+        let sig = signature(&g, host.is_none());
         let key = format!("{sig:016x}");
-        let name = |i: usize| graph.node(nodes[i]).name.as_str();
-        let label = format!("{} nodes: {} … {}", nodes.len(), name(0), name(nodes.len() - 1));
+        let label = label(nodes);
         let known = with_ane_decisions(false, |m| m.get(&key).copied());
         // A cached region that cannot run on the ANE (lost, failed the error test or failed to
         // build) is not rebuilt.
@@ -1343,15 +1681,20 @@ fn gate(
             record(sig, label, d, false, false);
             continue;
         }
-        let built = session
-            .prepare_plan(&g)
-            .and_then(|p| Ok((p, compile_ane(g.clone(), weights, info)?)));
-        let measured = built.and_then(|(plan, mut seg)| {
-            let d = match known {
-                Some(d) => (d, false),
-                None => (measure_region(&g, &plan, &mut seg, session)?, true),
-            };
-            Ok((d, seg))
+        let foreign = inputs.iter().find(|v| {
+            !graph.inputs.contains(v) && graph.value(**v).dtype != DType::F32
+        });
+        let built = match foreign {
+            Some(&v) => Err(format!(
+                "input '{}' is neither an f32 activation nor a graph input",
+                graph.value(v).name
+            )),
+            None => session.prepare_plan(&g),
+        }
+        .and_then(|p| Ok((p, compile_ane(g.clone(), host, session, info)?)));
+        let measured = built.and_then(|(plan, seg)| match known {
+            Some(d) => Ok(((d, false), seg)),
+            None => measure_region(&g, &plan, seg, session).map(|(d, seg)| ((d, true), seg)),
         });
         let ((d, fresh), seg) = match measured {
             Ok(x) => x,
@@ -1374,8 +1717,7 @@ fn gate(
         let offloaded = d.rel_err <= ANE_REL_ERR && (sec.force || d.chosen);
         record(sig, label, d, fresh, offloaded);
         if offloaded {
-            let compiled = seg;
-            kept.insert(nodes[0], SegmentExec { compiled, inputs, outputs });
+            kept.insert(nodes[0], seg);
         }
     }
     if kept.is_empty() {
@@ -1393,25 +1735,35 @@ fn gate(
         }
     }
     *placed = crate::graph::placement::segments_of(graph, placed.primary);
-    placed
-        .segments
-        .iter()
-        .map(|s| {
-            if s.device == Device::Ane {
-                return kept
-                    .remove(&s.nodes[0])
-                    .ok_or_else(|| "an ANE segment lost its program".to_string());
-            }
-            let (g, inputs, outputs) = fragment(graph, &s.nodes);
-            let plan = session.prepare_plan(&g)?;
-            let compiled = CompiledSegment::Metal {
-                graph: g,
-                session: session.clone(),
-                plan,
-            };
-            Ok(SegmentExec { compiled, inputs, outputs })
-        })
-        .collect()
+    let mut segments = assemble(graph, placed.primary, kept, session)?;
+    if sec.force {
+        return Ok(segments);
+    }
+    let sig = signature(graph, host.is_none());
+    let key = format!("{sig:016x}");
+    let label = whole_label(segments.iter().filter(|s| s.compiled.device() == Device::Ane).count());
+    let (d, fresh) = match with_ane_decisions(false, |m| m.get(&key).copied()) {
+        Some(d) => (d, false),
+        None => {
+            let d = measure_program(graph, &mut segments, session, pool).unwrap_or_else(|e| {
+                eprintln!("ANE: {label} stays on Metal: {e}");
+                AneDecision {
+                    metal_ms: 0.0,
+                    ane_ms: 0.0,
+                    rel_err: f32::MAX,
+                    chosen: false,
+                }
+            });
+            with_ane_decisions(true, |m| m.insert(key, d));
+            (d, true)
+        }
+    };
+    record(sig, label, d, fresh, d.chosen);
+    if !d.chosen {
+        demote(graph, placed);
+        return Ok(Vec::new());
+    }
+    Ok(segments)
 }
 
 /// Logs a region's gate decision and keeps it for [`ane_reports`].

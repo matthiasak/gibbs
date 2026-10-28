@@ -936,7 +936,9 @@ pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
 
 /// `--explain-placement`: loads `model_id` under `placement` and the effective re-encode policy
 /// and prints where its graph nodes run (op kind, device, avenue), whether that is 100% on
-/// accelerators, and every ANE region with its gate decision.
+/// accelerators, and every ANE region with its gate decision. Off pure Metal, a language model
+/// first runs one full prefill pass ([`crate::scheduler::ExecutableModel::prefill_rows`] prompt
+/// tokens), so its prefill instance is gated (or its persisted decisions read) too.
 /// Returns the process exit code: 0 only when nodes exist and none runs on the CPU
 /// ([`placement_exit_code`]).
 pub fn explain_placement(
@@ -955,9 +957,18 @@ pub fn explain_placement(
     println!("{}", placement_table(&rows));
     let code = placement_exit_code(&rows);
     println!("{}", placement_verdict(&rows).unwrap_or_else(|cpu| cpu));
+    let metal = crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal);
+    if let (true, Some(rows)) = (placement != metal, exec.prefill_rows()) {
+        let base = exec.tokenizer().encode(&default_prompt());
+        let n = rows.min(exec.context_len().unwrap_or(rows));
+        let ids: Vec<u32> = base.iter().copied().cycle().take(n).collect();
+        if !ids.is_empty() {
+            exec.prompt_logits(ids)?;
+        }
+    }
     let reports = crate::graph::program::ane_reports();
     if reports.is_empty() {
-        println!("ANE decisions ({placement}): none (no graph this load compiled has an ANE candidate region)");
+        println!("ANE decisions ({placement}): none (no graph this load ran has an ANE candidate region)");
     }
     for r in reports {
         println!("{r}");

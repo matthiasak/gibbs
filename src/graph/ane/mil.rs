@@ -38,6 +38,9 @@ pub struct IoBinding {
     /// The graph tensor is row-major `[S, C]` and is transposed on the way in or out; otherwise
     /// its row-major order already is `[C, S]`.
     pub transposed: bool,
+    /// The host packs (unpacks) this surface around each eval; `false`: Metal boundary steps
+    /// fill (read) it on the GPU. [`lower`] sets `true`.
+    pub host: bool,
 }
 
 /// What the host writes into an input surface (outputs are always [`IoSource::Value`]).
@@ -776,6 +779,7 @@ fn io(v: ValueId, channels: usize, spatial: usize, transposed: bool) -> IoBindin
         channels,
         spatial,
         transposed,
+        host: true,
     }
 }
 
@@ -1434,6 +1438,7 @@ impl<'a> Lower<'a> {
                     channels: r,
                     spatial: n,
                     transposed: false,
+                    host: true,
                 });
                 let h = r / 2;
                 let cos = self.slice(&t, [0; 4], [1, h, 1, n]);
