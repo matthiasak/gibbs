@@ -236,6 +236,8 @@ struct PagedBind {
     slot_row: Vec<i32>,
     write_slot: Vec<i32>,
     base: usize,
+    /// Ring classes: rows the ring holds (slot `j` holds every row `≡ j` mod it); 0 = full.
+    ring: usize,
 }
 
 pub struct XlaSession {
@@ -453,6 +455,7 @@ impl XlaSession {
                     names: vec![(kn, 0, Vec::new()), (vn, 0, Vec::new())],
                     slot_row: Vec::new(),
                     write_slot: Vec::new(),
+                    ring: 0,
                     base: 0,
                 }),
             }
@@ -461,21 +464,19 @@ impl XlaSession {
         for b in &mut binds {
             let ring = kv.ring(b.class);
             b.base = kv.stored(b.class, b.pos);
-            let last = kv.stored(b.class, b.pos + b.nq);
-            let held = if ring > 0 { ring * crate::kv::PAGE_TOKENS } else { kv.lens[b.class] };
-            let pages = held.div_ceil(crate::kv::PAGE_TOKENS);
+            // Every row of the class's pages, as the CPU and Metal executors address them:
+            // window slot `j` is page row `j` (zeros on a fresh page), so keys a query may see
+            // past the written rows (`visible_end`) read what the page holds.
+            let held = kv.tables[b.class].len() * crate::kv::PAGE_TOKENS;
+            b.ring = if ring > 0 { held } else { 0 };
+            let pages = held / crate::kv::PAGE_TOKENS;
             let mut bucket = 16;
             while bucket < pages {
                 bucket *= 4;
             }
             let win = bucket * crate::kv::PAGE_TOKENS;
             b.slot_row = (0..win)
-                .map(|j| match ring {
-                    _ if j >= held || j >= last => -1,
-                    0 => j as i32,
-                    // The newest stored row (below `last`) living in ring slot `j`.
-                    _ => (last - 1 - (last - 1 - j) % held) as i32,
-                })
+                .map(|j| if j < held { j as i32 } else { -1 })
                 .collect();
             b.write_slot = (0..b.nq)
                 .map(|i| match ring {
@@ -491,7 +492,7 @@ impl XlaSession {
                 let (c, i) = kv.pool().locate(name).expect("paged above");
                 *w = kv.pool().classes[c].names[i].row_width;
                 *data = vec![0f32; win * *w];
-                for (j, out) in data.chunks_exact_mut(*w).enumerate().take(held.min(last)) {
+                for (j, out) in data.chunks_exact_mut(*w).enumerate().take(held) {
                     rows.read(j, out);
                 }
             }
@@ -521,6 +522,7 @@ impl XlaSession {
                 names: b.names.iter().map(|(n, ..)| n.clone()).collect(),
                 rows: b.slot_row.len(),
                 nq: b.nq,
+                ring: b.ring,
             })
             .collect();
         for b in &paged {
