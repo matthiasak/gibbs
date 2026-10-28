@@ -642,7 +642,12 @@ impl NoiseBlockHead {
 
     /// `c = rmsnorm(W_c x)`.
     fn context(&self, x: &[f32]) -> Vec<f32> {
-        let mut c: Vec<f32> = self.w_c.w.chunks_exact(x.len()).map(|r| dot(r, x)).collect();
+        let mut c: Vec<f32> = self
+            .w_c
+            .w
+            .chunks_exact(x.len())
+            .map(|r| dot(r, x))
+            .collect();
         rms_norm(&mut c);
         c
     }
@@ -758,7 +763,10 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 fn argmax(z: &[f32]) -> usize {
     z.iter()
         .enumerate()
-        .fold((0, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b })
+        .fold(
+            (0, f32::NEG_INFINITY),
+            |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+        )
         .0
 }
 
@@ -849,7 +857,9 @@ impl Inner {
                     .iter()
                     .find(|e| e.0 == p + j)
                     .map(|e| {
-                        let y = e.1.iter().filter_map(|&(t, q)| Some((*head.slot_of.get(&t)?, q)));
+                        let y =
+                            e.1.iter()
+                                .filter_map(|&(t, q)| Some((*head.slot_of.get(&t)?, q)));
                         y.collect()
                     })
                     .unwrap_or_default();
@@ -1002,6 +1012,10 @@ impl Drafter for OnlineNoiseDrafter {
         true
     }
 
+    fn guesses(&self) -> bool {
+        true
+    }
+
     fn online_updates(&self) -> Option<u64> {
         Some(self.inner.lock().head.updates)
     }
@@ -1026,7 +1040,11 @@ impl Drafter for OnlineNoiseDrafter {
         }
         let ids = self.inner.lock().head.ids.clone();
         for (j, row) in logits.chunks_exact(width).take(accepted.len()).enumerate() {
-            let mut cand: Vec<u32> = ids.iter().copied().filter(|&t| (t as usize) < width).collect();
+            let mut cand: Vec<u32> = ids
+                .iter()
+                .copied()
+                .filter(|&t| (t as usize) < width)
+                .collect();
             for t in top_n(row, 8) {
                 if !cand.contains(&t) {
                     cand.push(t);
@@ -1119,15 +1137,16 @@ impl Drafter for OnlineNoiseDrafter {
                 cand.extend_from_slice(&ids);
                 cand_logits.extend_from_slice(z);
             }
-            let has_suffix = suf_slice.get(offset).map(|&t| {
-                match cand.iter().position(|&c| c == t) {
-                    Some(i) => cand_logits[i] = cand_logits[i].max(0.0) + 14.0,
-                    None => {
-                        cand.push(t);
-                        cand_logits.push(14.0);
-                    }
-                }
-            });
+            let has_suffix =
+                suf_slice
+                    .get(offset)
+                    .map(|&t| match cand.iter().position(|&c| c == t) {
+                        Some(i) => cand_logits[i] = cand_logits[i].max(0.0) + 14.0,
+                        None => {
+                            cand.push(t);
+                            cand_logits.push(14.0);
+                        }
+                    });
             if knobs.mode == DraftMode::Suffix && has_suffix.is_none() {
                 break;
             }

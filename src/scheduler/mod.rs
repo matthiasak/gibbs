@@ -1335,7 +1335,11 @@ impl ContinuousBatchScheduler {
                                 .map_or(0, |t| t.as_nanos() as u64);
                             let seed = nanos ^ seq.id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
                             match SpecSeq::start(m, d.clone(), &mut seq.kv_cache, seed) {
-                                Ok(s) => seq.spec = Some(s),
+                                Ok(s) => {
+                                    let model = self.model_id.read().clone();
+                                    self.k_tuner.lock().bind(&model, &d.label());
+                                    seq.spec = Some(s);
+                                }
                                 Err(e) => self.telemetry.log_warn(&format!(
                                     "sequence {}: no speculative decoding: {e}",
                                     seq.id
@@ -1461,6 +1465,9 @@ impl ContinuousBatchScheduler {
                     .max_new_tokens
                     .saturating_sub(seq.output_tokens.len())
                     .min(limit.saturating_sub(all.len()));
+                // The first decode step also starts the stream and the drafter's catch-up on the
+                // prompt: its time stands for no `k`.
+                let first_step = seq.output_tokens.len() <= 1;
                 let result = match (spec_k, seq.spec.as_mut()) {
                     (Some(k), Some(sp)) => {
                         let vocab = tokenizer.vocab_size();
@@ -1477,7 +1484,10 @@ impl ContinuousBatchScheduler {
                             logprobs,
                         )
                         .map(|s| {
-                            if s.synced {
+                            if let Some(hit) = s.shadow {
+                                self.k_tuner.lock().record_shadow(hit);
+                            }
+                            if s.synced && !first_step {
                                 let msg = self.k_tuner.lock().record_with_knobs(
                                     k,
                                     s.tokens.len(),
@@ -2105,10 +2115,12 @@ mod tests {
                 spec_sched.view().spec.is_some(),
                 "DraftMode::Auto should automatically prepare OnlineNoiseDrafter on load"
             );
+            // The lowest bar: the drafter's guesses open drafting after a hit or two.
             spec_sched.set_draft_knobs(DraftKnobs {
                 mode,
                 max_k: 3,
                 suffix_min_match: 2,
+                target_acceptance: 0.10,
                 ..DraftKnobs::default()
             });
             assert!(spec_sched.view().spec.is_some());

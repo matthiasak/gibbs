@@ -66,6 +66,11 @@ pub trait Drafter: Send + Sync {
     fn overlaps(&self) -> bool {
         false
     }
+    /// Proposing one token is host work only (no model forward), cheap enough to guess every
+    /// plain step's token: [`KTuner`] measures drafting only once those guesses hit often enough.
+    fn guesses(&self) -> bool {
+        false
+    }
     /// Online learning updates so far (online drafters).
     fn online_updates(&self) -> Option<u64> {
         None
@@ -144,6 +149,9 @@ pub(super) struct Step {
     /// The step's time is representative of its `k` (see [`KTuner::record`]): the drafter was in
     /// sync, or the step did not draft.
     pub synced: bool,
+    /// A plain step's drafter guess of the token it emitted: whether it was right
+    /// ([`KTuner::record_shadow`]).
+    pub shadow: Option<bool>,
     pub logprobs: Vec<super::TokenLogprobInfo>,
 }
 
@@ -200,6 +208,8 @@ pub(super) fn decode(
     let greedy = temp <= 1e-4;
     let mut qs = Vec::new();
     let prefetched = spec.prefetched.take().filter(|p| p.len == all.len());
+    // A plain step's drafter catch-up runs after the target's token is queued (below).
+    let catch_up = prefetched.is_none() && k == 0;
     let drafts = if let Some(p) = prefetched {
         spec.draft = p.state;
         let n = p.drafts.len().min(k);
@@ -207,10 +217,6 @@ pub(super) fn decode(
         qs.truncate(n);
         p.drafts[..n].to_vec()
     } else if k == 0 {
-        let _ = spec
-            .drafter
-            .propose(&mut spec.draft, all, &spec.pending, 0, &mut |_| 0);
-        spec.pending.clear();
         Vec::new()
     } else {
         let (rng, picked) = (&mut spec.rng, &mut qs);
@@ -231,8 +237,7 @@ pub(super) fn decode(
     };
     if drafts.is_empty() {
         // Plain decode (no checkpoints): the device stream, as without a drafter, unless a
-        // recurrent state could not take its in-flight token back before a later verify. The
-        // drafter catches up on these taps next time.
+        // recurrent state could not take its in-flight token back before a later verify.
         let streamed = if top_logprobs.is_none() && !m.0.recurrent() {
             m.stream_token(last, all.len(), stream_max, temp, top_p, kv)?
         } else {
@@ -242,6 +247,23 @@ pub(super) fn decode(
             Some(t) => (t, None),
             None => m.step_token_with_kv(all, last, all.len(), temp, top_p, top_logprobs, kv)?,
         };
+        // While the stream runs ahead, the drafter catches up on the committed tokens; one that
+        // [`Drafter::guesses`] also guesses this token (shadow acceptance).
+        let mut shadow = None;
+        if catch_up {
+            let guess = usize::from(spec.drafter.guesses());
+            let mut rng = Rng::new(0);
+            let mut argmax =
+                |l: DraftLogits<'_>| pick(l, 0.0, 1.0, vocab, &mut rng, &mut Vec::new());
+            let d = spec
+                .drafter
+                .propose(&mut spec.draft, all, &spec.pending, guess, &mut argmax);
+            shadow = d
+                .ok()
+                .filter(|_| guess > 0)
+                .and_then(|d| d.first().map(|&d| d == t));
+            spec.pending.clear();
+        }
         spec.pending.extend(m.take_taps(kv));
         spec.synced = false;
         return Ok(Step {
@@ -249,6 +271,7 @@ pub(super) fn decode(
             drafted: 0,
             accepted: 0,
             synced: k == 0,
+            shadow,
             logprobs: lp.into_iter().collect(),
         });
     }
@@ -328,6 +351,7 @@ pub(super) fn decode(
         drafted: drafts.len(),
         tokens: out,
         synced,
+        shadow: None,
         logprobs,
     })
 }
@@ -506,7 +530,31 @@ pub struct KTuner {
     placed: bool,
     trial: Option<Trial>,
     settle: Option<bool>,
+    /// A guessing drafter's ([`Drafter::guesses`]) hit rate on plain steps (a running mean, then
+    /// an EWMA) and its guesses: [`Self::may_pay`].
+    shadow: (f64, usize),
+    /// The model and drafter ([`Self::bind`]) and the plain tokens a step of each `k` (index
+    /// `k - 1`, 0 unknown) cost when this executable last measured them.
+    stored: (String, Vec<f64>),
 }
+
+/// Guesses before their hit rate may start a drafting measurement ([`KTuner::may_pay`]).
+const SHADOW_MIN: usize = 8;
+
+/// [`KTuner::stored`] costs by model and drafter in `<cache>/host/spec-costs.json`, each with the
+/// executable that measured it ([`EXE`]): another build measures afresh.
+type SpecCosts = std::collections::BTreeMap<String, (u64, Vec<f64>)>;
+static SPEC_COSTS: std::sync::Mutex<Option<SpecCosts>> = std::sync::Mutex::new(None);
+
+/// This executable's modification time.
+static EXE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+});
 
 /// Steps of the Metal-vs-ANE drafter trial ([`KTuner::place`]), and of each device's turn.
 const TRIAL_STEPS: usize = 64;
@@ -596,6 +644,7 @@ impl KTuner {
                 placed: self.placed,
                 trial: self.trial.take(),
                 settle: self.settle,
+                stored: std::mem::take(&mut self.stored),
                 ..Self::default()
             };
         }
@@ -604,8 +653,10 @@ impl KTuner {
             return max_k;
         }
         let Some(cur) = self.cur else {
-            // Measure plain decoding, then every drafting k.
-            return (0..=max_k).find(|&k| !self.swept(k, knobs)).unwrap_or(0);
+            // Measure plain decoding, then every drafting k (a guessing drafter's once
+            // [`SHADOW_MIN`] guesses tell whether it may pay).
+            let k = (0..=max_k).find(|&k| !self.swept(k, knobs)).unwrap_or(0);
+            return if self.guessing_undecided() { 0 } else { k };
         };
         let cur = cur.min(max_k);
         if let Some(p) = &mut self.probe {
@@ -621,13 +672,19 @@ impl KTuner {
         }
         self.since = 0;
         self.turn += 1;
-        let best_drafting =
-            (1..=max_k).max_by(|&a, &b| self.score(a, knobs).total_cmp(&self.score(b, knobs)));
+        // Unmeasured `k`s score 0: the smaller, cheaper one goes first.
+        let best_drafting = (1..=max_k)
+            .filter(|&k| self.may_pay(k, knobs))
+            .max_by(|&a, &b| {
+                self.score(a, knobs)
+                    .total_cmp(&self.score(b, knobs))
+                    .then(b.cmp(&a))
+            });
         let options = if cur == 0 {
             [best_drafting, None, None]
         } else {
             [
-                (cur < max_k).then_some(cur + 1),
+                (cur < max_k && self.may_pay(cur + 1, knobs)).then_some(cur + 1),
                 Some(cur - 1),
                 (cur > 1).then_some(0),
             ]
@@ -672,11 +729,13 @@ impl KTuner {
     ) -> Option<String> {
         let secs = took.as_secs_f64().max(1e-9);
         if let Some(t) = &mut self.trial {
-            return t.record(tokens, (accepted, drafted), secs).map(|(msg, ane)| {
-                self.trial = None;
-                self.settle = Some(ane);
-                msg
-            });
+            return t
+                .record(tokens, (accepted, drafted), secs)
+                .map(|(msg, ane)| {
+                    self.trial = None;
+                    self.settle = Some(ane);
+                    msg
+                });
         }
         let before = self.cur;
         match (self.cur, self.probe.as_mut()) {
@@ -689,6 +748,10 @@ impl KTuner {
                 a.secs += secs;
                 self.avg[k] = a.per_step();
                 self.avg_accept[k] = a.accept_per_step();
+                let steps = a.steps;
+                if k > 0 && steps >= PLAIN_STEPS && self.swept(k, knobs) {
+                    self.store_cost(k);
+                }
                 if (0..self.sweep.len()).all(|k| self.swept(k, knobs)) {
                     self.cur = self.fastest_for(knobs);
                 }
@@ -715,6 +778,7 @@ impl KTuner {
                     self.avg[k] = (t, s);
                     self.avg_accept[k] = (ac, dr);
                     self.probe = None;
+                    self.store_cost(k);
                     self.every = if won {
                         self.cur = Some(k);
                         MIN_EXPLORE
@@ -862,15 +926,86 @@ impl KTuner {
         (0..self.avg.len()).max_by(|&a, &b| self.score(a, knobs).total_cmp(&self.score(b, knobs)))
     }
 
-    /// Whether the sweep is done with `k`: decisive, or a drafting `k` that already loses to plain
-    /// decoding after [`PLAIN_STEPS`] steps (later probes may still try it).
+    /// Whether the sweep is done with `k`: decisive, a drafting `k` that already loses to plain
+    /// decoding after [`PLAIN_STEPS`] steps, or one that cannot pay yet (later probes may still
+    /// try them). Drafting `k`s wait while a guessing drafter's guesses are undecided.
     fn swept(&self, k: usize, knobs: &DraftKnobs) -> bool {
         let a = &self.sweep[k];
+        if k > 0 && self.guessing_undecided() {
+            return false;
+        }
         a.decisive(k)
+            || (k > 0 && !self.may_pay(k, knobs))
             || (k > 0
                 && a.steps >= PLAIN_STEPS
                 && self.sweep[0].decisive(0)
                 && self.score(k, knobs) < self.score(0, knobs))
+    }
+
+    /// A guessing drafter ([`Drafter::guesses`]) with fewer than [`SHADOW_MIN`] guesses.
+    fn guessing_undecided(&self) -> bool {
+        (1..SHADOW_MIN).contains(&self.shadow.1)
+    }
+
+    /// Whether drafting `k` may beat plain decoding. Always for a drafter that does not guess
+    /// ([`Drafter::guesses`]). For one that does, after [`SHADOW_MIN`] guesses: when every draft
+    /// accepted at the guesses' hit rate `a` makes `1 + a + … + a^k` tokens per step, more than a
+    /// step of `k` costs in plain tokens (measured here, else [`Self::stored`], else at least the
+    /// dearest known smaller `k`); a `k` with no such bound needs `a` ≥ `target_acceptance`.
+    fn may_pay(&self, k: usize, knobs: &DraftKnobs) -> bool {
+        let (a, n) = self.shadow;
+        if n == 0 || k == 0 {
+            return true;
+        }
+        let (t0, s0) = self.avg[0];
+        if n < SHADOW_MIN || t0 <= 0.0 || s0 <= 0.0 {
+            return false;
+        }
+        let cost = |j: usize| match self.avg[j].1 {
+            s if s > 0.0 => Some(s * t0 / s0),
+            _ => self.stored.1.get(j - 1).copied().filter(|&c| c > 0.0),
+        };
+        let tokens: f64 = (0..=k).map(|i| a.powi(i as i32)).sum();
+        match (1..=k).rev().find_map(cost) {
+            Some(c) => tokens > c,
+            None => a >= f64::from(knobs.target_acceptance),
+        }
+    }
+
+    /// Records whether a guessing drafter's guess of a plain step's token was right.
+    pub fn record_shadow(&mut self, hit: bool) {
+        let (rate, n) = &mut self.shadow;
+        *n += 1;
+        *rate += (f64::from(u8::from(hit)) - *rate) / (*n).min(10) as f64;
+    }
+
+    /// Starts from the drafting costs this executable last measured for `model` with `drafter`
+    /// on this host (none for an unnamed model).
+    pub fn bind(&mut self, model: &str, drafter: &str) {
+        let key = format!("{model} {drafter}");
+        if model.is_empty() || self.stored.0 == key {
+            return;
+        }
+        let stored = |m: &mut SpecCosts| m.get(&key).filter(|e| e.0 == *EXE).map(|e| e.1.clone());
+        let costs = crate::hardware::with_host_json(&SPEC_COSTS, "spec-costs.json", false, stored);
+        self.stored = (key, costs.unwrap_or_default());
+    }
+
+    /// Stores what a step of drafting `k` costs in plain tokens, as just measured.
+    fn store_cost(&mut self, k: usize) {
+        let ((t0, s0), s) = (self.avg[0], self.avg[k].1);
+        if self.stored.0.is_empty() || k == 0 || t0 <= 0.0 || s0 <= 0.0 || s <= 0.0 {
+            return;
+        }
+        let costs = &mut self.stored.1;
+        if costs.len() < k {
+            costs.resize(k, 0.0);
+        }
+        costs[k - 1] = s * t0 / s0;
+        let entry = (self.stored.0.clone(), (*EXE, costs.clone()));
+        crate::hardware::with_host_json(&SPEC_COSTS, "spec-costs.json", true, |m| {
+            m.insert(entry.0, entry.1)
+        });
     }
 
     /// The `k` being run; `None` until every `k` was measured.
@@ -1086,10 +1221,15 @@ mod tests {
             return;
         }
         let reg = crate::arch::registry().unwrap();
-        let lm = crate::runtime::lm::load(&a, &reg, None, PlacementMode::Pin(Device::Metal)).unwrap();
+        let lm =
+            crate::runtime::lm::load(&a, &reg, None, PlacementMode::Pin(Device::Metal)).unwrap();
         let m = ExecutableModel(lm);
         let plain = crate::runtime::draft::load_drafter(&a, &a, PlacementMode::Auto).unwrap();
-        assert!(matches!(plain.ane(), Some(Ok(_))), "{:?}", plain.ane().map(|r| r.map(|_| ())));
+        assert!(
+            matches!(plain.ane(), Some(Ok(_))),
+            "{:?}",
+            plain.ane().map(|r| r.map(|_| ()))
+        );
         assert!(!plain.overlaps(), "on Metal it does not overlap");
         plain.set_ane(true, true);
         assert!(plain.overlaps());
@@ -1125,11 +1265,17 @@ mod tests {
                 self.0.overlaps()
             }
         }
-        let d = Arc::new(Counted(plain, std::thread::current().id(), AtomicUsize::new(0)));
+        let d = Arc::new(Counted(
+            plain,
+            std::thread::current().id(),
+            AtomicUsize::new(0),
+        ));
         let tok = m.0.tokenizer();
         let prompt = tok.encode("The three primary colors are red, yellow and");
         let fresh = || {
-            let (ids, mut st) = m.prepare(prompt.clone(), &[], &PrepareCtx::default()).unwrap();
+            let (ids, mut st) = m
+                .prepare(prompt.clone(), &[], &PrepareCtx::default())
+                .unwrap();
             m.prefill_logits(&ids[..ids.len() - 1], 0, &mut st).unwrap();
             st
         };
@@ -1137,7 +1283,9 @@ mod tests {
         let (mut want, mut st) = (prompt.clone(), fresh());
         while want.len() < prompt.len() + n {
             let last = *want.last().unwrap();
-            let (t, _) = m.step_token_with_kv(&want, last, want.len(), 0.0, 1.0, None, &mut st).unwrap();
+            let (t, _) = m
+                .step_token_with_kv(&want, last, want.len(), 0.0, 1.0, None, &mut st)
+                .unwrap();
             want.push(t);
         }
         let mut kv = fresh();
@@ -1152,8 +1300,14 @@ mod tests {
         assert_eq!(tok.decode(&all), tok.decode(&want));
         assert_eq!(all, want, "greedy output changed");
         let proposed = d.2.load(Relaxed);
-        eprintln!("{steps} steps, {proposed} proposed on the decode thread, {} prefetched", steps - proposed);
-        assert!(proposed < steps, "no step used drafts proposed during a verify");
+        eprintln!(
+            "{steps} steps, {proposed} proposed on the decode thread, {} prefetched",
+            steps - proposed
+        );
+        assert!(
+            proposed < steps,
+            "no step used drafts proposed during a verify"
+        );
     }
 
     /// A sparse draft (candidate ids only, over a support that misses target tokens and adds one
@@ -1268,6 +1422,35 @@ mod tests {
         assert!(rate > 20.0, "{rate}");
     }
 
+    /// A guessing drafter drafts only once its guesses predict a win: never while they miss,
+    /// at the best `k` when they hit and drafting is cheap, and only a probe per `k` when a
+    /// drafting step costs more plain tokens than even full acceptance makes.
+    #[test]
+    fn k_tuner_drafts_a_guessing_drafter_only_when_its_guesses_pay() {
+        // (tokens, ms) of a drafting step at `k`; a plain step is 1 token in 100 ms.
+        let run = |hit: bool, step: fn(usize) -> (usize, f64)| {
+            let (mut t, mut drafted) = (KTuner::default(), 0);
+            for _ in 0..2000 {
+                let k = t.choose(4);
+                let (n, ms) = if k == 0 { (1, 100.0) } else { step(k) };
+                if k == 0 {
+                    t.record_shadow(hit);
+                } else {
+                    drafted += 1;
+                }
+                t.record(k, n, Duration::from_secs_f64(ms / 1000.0));
+            }
+            (drafted, t.best())
+        };
+        assert_eq!(run(false, |k| (1 + k, 100.0)), (0, Some(0)));
+        let (drafted, best) = run(true, |k| (1 + k, 100.0 + 10.0 * k as f64));
+        assert_eq!(best, Some(4));
+        assert!(drafted > 1900, "{drafted}");
+        let (drafted, best) = run(true, |k| (1 + k, 100.0 * (k as f64 + 1.5)));
+        assert_eq!(best, Some(0));
+        assert!(drafted <= 4 * PLAIN_STEPS, "{drafted}");
+    }
+
     /// A drafter compiled for Metal and the ANE drafts at the largest `k` on each device in turns
     /// of 8 recorded steps, then settles on the faster one (the first step of each turn untimed)
     /// before the `k` sweep starts.
@@ -1307,7 +1490,11 @@ mod tests {
                 self.settled.store(settled, Relaxed);
             }
         }
-        let (d, mut t, knobs) = (TwoDevices::default(), KTuner::default(), DraftKnobs::default());
+        let (d, mut t, knobs) = (
+            TwoDevices::default(),
+            KTuner::default(),
+            DraftKnobs::default(),
+        );
         assert!(t.place(&d).unwrap().contains("timing Metal and ANE"));
         let mut seen = Vec::new();
         let mut msg = None;
@@ -1324,7 +1511,10 @@ mod tests {
         let want: Vec<bool> = (0..TRIAL_STEPS).map(|s| s / TRIAL_TURN % 2 == 1).collect();
         assert_eq!(seen, want);
         let msg = msg.expect("the trial reports its choice");
-        assert!(msg.contains("keeps ANE") && msg.contains("Metal 200.0, ANE 300.0"), "{msg}");
+        assert!(
+            msg.contains("keeps ANE") && msg.contains("Metal 200.0, ANE 300.0"),
+            "{msg}"
+        );
         assert!(t.place(&d).is_none());
         assert!(d.on.load(Relaxed) && d.settled.load(Relaxed));
         // The k sweep follows (plain decoding first).

@@ -10,6 +10,37 @@ pub fn default_cache_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".cache").join("gibbs"))
 }
 
+/// Runs `f` over the JSON cache `<cache>/host/<file>`, loaded into `slot` on first use (a missing
+/// or unreadable file is the default); `store` writes it back.
+pub(crate) fn with_host_json<T, R>(
+    slot: &std::sync::Mutex<Option<T>>,
+    file: &str,
+    store: bool,
+    f: impl FnOnce(&mut T) -> R,
+) -> R
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Default,
+{
+    let path = default_cache_dir().ok().map(|d| d.join("host").join(file));
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let v = slot.get_or_insert_with(|| {
+        path.as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    });
+    let r = f(v);
+    if let (true, Some(path)) = (store, path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_vec_pretty(v) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+    r
+}
+
 /// Exclusive advisory lock (`<cache>/gpu.lock`, flock) serializing benchmarks on the GPU.
 /// Blocks (after saying so) while another benchmark holds it; released when the `File` drops.
 pub fn gpu_lock() -> Result<std::fs::File, String> {

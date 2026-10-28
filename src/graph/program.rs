@@ -1093,34 +1093,14 @@ pub fn ane_reports() -> Vec<AneReport> {
 static ANE_DECISIONS: std::sync::Mutex<Option<std::collections::BTreeMap<String, AneDecision>>> =
     std::sync::Mutex::new(None);
 
-fn ane_decisions_path() -> Option<std::path::PathBuf> {
-    let os = crate::hardware::sysctl::string(c"kern.osversion").unwrap_or_default();
-    let dir = crate::hardware::default_cache_dir().ok()?.join("host");
-    Some(dir.join(format!("ane-decisions-{os}.json")))
-}
-
 /// Runs `f` over the persisted decisions (loaded on first use); `store` writes them back.
 pub(crate) fn with_ane_decisions<R>(
     store: bool,
     f: impl FnOnce(&mut std::collections::BTreeMap<String, AneDecision>) -> R,
 ) -> R {
-    let mut slot = ANE_DECISIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = slot.get_or_insert_with(|| {
-        ane_decisions_path()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
-    });
-    let r = f(map);
-    if let (true, Some(path)) = (store, ane_decisions_path()) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(json) = serde_json::to_vec_pretty(map) {
-            let _ = std::fs::write(path, json);
-        }
-    }
-    r
+    let os = crate::hardware::sysctl::string(c"kern.osversion").unwrap_or_default();
+    let file = format!("ane-decisions-{os}.json");
+    crate::hardware::with_host_json(&ANE_DECISIONS, &file, store, f)
 }
 
 /// FNV-64 over the node ops, devices, operand shapes and dtypes and weight names of `graph`, the
