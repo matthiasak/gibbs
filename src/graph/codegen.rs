@@ -598,6 +598,166 @@ kernel void {name}(
     )
 }
 
+/// Most x rows one threadgroup of [`gemv_packed_mr`] applies each weight block to.
+pub const GEMV_MR: usize = 4;
+
+/// The x rows per threadgroup [`gemv_packed_mr`] takes for `codec`: [`GEMV_MR`], fewer when a lane's
+/// x registers (`8 * segs` floats per row for a [`wide`] decode) would exceed 96 floats and spill
+/// (measured: Q6_K at 4 rows ran 2.8x slower than at 3).
+pub fn gemv_mr_max(codec: &Codec) -> usize {
+    let x_floats = wide(codec.format).map_or(8, |w| 8 * w.segs as usize);
+    (96 / x_floats).clamp(2, GEMV_MR)
+}
+
+/// Name of the kernel [`gemv_packed_mr`] emits for `codec` with `p` and `mb` x rows per threadgroup.
+pub fn gemv_packed_mr_name(codec: &Codec, p: GemvParams, mb: usize) -> String {
+    format!("gemvgen_{:?}_r{}_mb{mb}", codec.format, p.rows_per_sg)
+}
+
+/// [`gemv_packed`] for a few x rows (`2 <= batch < 16`, the speculative verify and short prefill
+/// shapes): threadgroup `(i, j)` multiplies its weight rows by x rows `j * mb .. j * mb + mb`, so each
+/// weight block is read from memory once per `mb` x rows (not once per row). Same buffers and
+/// `PackedGemvParams`; grid `(ceil(rows / gemv_rows_per_tg(p)), ceil(batch / mb))` of
+/// `gemv_threads(p)` threads. Every codec, through `decode8` or its [`wide`] decode (no tile path).
+pub fn gemv_packed_mr(codec: &Codec, p: GemvParams, mb: usize) -> String {
+    let name = gemv_packed_mr_name(codec, p, mb);
+    let dec = format!("decode8_{:?}", codec.format);
+    let codec_msl = device_msl(codec).replace("decode8", &dec);
+    let (r, be) = (p.rows_per_sg, codec.block_elems);
+    let each = |f: &dyn Fn(usize, usize) -> String| -> String {
+        (0..r)
+            .flat_map(|i| (0..mb).map(move |j| (i, j)))
+            .map(|(i, j)| f(i, j))
+            .collect()
+    };
+    let xptr: String = (0..mb)
+        .map(|j| format!("    device const float* x{j} = x + (ulong)min(batch0 + {j}u, p.batch_size - 1) * p.cols;\n"))
+        .collect();
+    let acc_decl = each(&|i, j| format!("    float acc{i}_{j} = 0.0f;\n"));
+    let row = |i: usize, decode: &str, dots: &str, v_len: u32| {
+        let br = block_ref(codec, "w", &format!("(ulong)(row0 + {i}) * blocks_per_row + blk"));
+        let decode = decode.replace("{sub}", &br.sub).replace("{group}", &br.group);
+        format!(
+            "        if (row0 + {i} < p.rows) {{\n            {}\n            float v[{v_len}];\n            {decode}\n{dots}        }}\n",
+            br.decl
+        )
+    };
+    let loop_src = match wide(codec.format) {
+        None => {
+            let xs: String = (0..mb)
+                .map(|j| format!("        const float4 xa{j} = *(device const float4*)(x{j} + s * 8), xb{j} = *(device const float4*)(x{j} + s * 8 + 4);\n"))
+                .collect();
+            let rows: String = (0..r)
+                .map(|i| {
+                    let dots: String = (0..mb)
+                        .map(|j| format!("            acc{i}_{j} += dot(va, xa{j}) + dot(vb, xb{j});\n"))
+                        .collect();
+                    row(
+                        i,
+                        &format!("{dec}(b, {{sub}}sub, v);\n            const float4 va = float4(v[0], v[1], v[2], v[3]), vb = float4(v[4], v[5], v[6], v[7]);"),
+                        &dots,
+                        8,
+                    )
+                })
+                .collect();
+            format!(
+                "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n{xs}        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
+            )
+        }
+        Some(wd) => {
+            let (gdec, gseg, gdot) = (
+                dec.replace("decode8", "decode_group"),
+                dec.replace("decode8", "group_seg"),
+                dec.replace("decode8", "dot_group"),
+            );
+            let nseg = wd.segs as usize;
+            let xs: String = (0..mb)
+                .map(|j| {
+                    let loads: String = (0..nseg)
+                        .map(|k| format!("        {{ const uint e = blk * {be} + {gseg}(g, {k}); xs{j}[{}] = *(device const float4*)(x{j} + e); xs{j}[{}] = *(device const float4*)(x{j} + e + 4); }}\n", 2 * k, 2 * k + 1))
+                        .collect();
+                    format!("        float4 xs{j}[{}];\n{loads}", 2 * nseg)
+                })
+                .collect();
+            let rows: String = if wd.fused_dot {
+                (0..r)
+                    .map(|i| {
+                        let br = block_ref(codec, "w", &format!("(ulong)(row0 + {i}) * blocks_per_row + blk"));
+                        let dots: String = (0..mb)
+                            .map(|j| format!("            acc{i}_{j} += {gdot}(b, {}g, xs{j});\n", br.group))
+                            .collect();
+                        format!("        if (row0 + {i} < p.rows) {{\n            {}\n{dots}        }}\n", br.decl)
+                    })
+                    .collect()
+            } else {
+                let seg_dot = |j: usize, k: usize| {
+                    let o = 8 * k;
+                    format!(
+                        "dot(float4(v[{o}], v[{}], v[{}], v[{}]), xs{j}[{}]) + dot(float4(v[{}], v[{}], v[{}], v[{}]), xs{j}[{}])",
+                        o + 1, o + 2, o + 3, 2 * k, o + 4, o + 5, o + 6, o + 7, 2 * k + 1
+                    )
+                };
+                (0..r)
+                    .map(|i| {
+                        let mut dots = String::new();
+                        for j in 0..mb {
+                            if wd.uniform {
+                                let sum = (0..nseg).map(|k| format!("({})", seg_dot(j, k))).collect::<Vec<_>>().join(" + ");
+                                dots += &format!("            acc{i}_{j} += v[{}] * ({sum});\n", 8 * nseg);
+                            } else {
+                                for k in 0..nseg {
+                                    dots += &format!(
+                                        "            acc{i}_{j} += v[{}] * ({}) + v[{}] * (dot(xs{j}[{}], float4(1.0f)) + dot(xs{j}[{}], float4(1.0f)));\n",
+                                        8 * nseg + k, seg_dot(j, k), 9 * nseg + k, 2 * k, 2 * k + 1
+                                    );
+                                }
+                            }
+                        }
+                        let v_len = if wd.uniform { 8 * wd.segs + 1 } else { 10 * wd.segs };
+                        row(i, &format!("{gdec}(b, {{group}}g, v);"), &dots, v_len)
+                    })
+                    .collect()
+            };
+            format!(
+                "    const uint groups = blocks_per_row * {};\n    for (uint s = lane; s < groups; s += 32) {{\n        const uint blk = s / {};\n        const uint g = s % {};\n{xs}{rows}    }}\n",
+                wd.groups, wd.groups, wd.groups
+            )
+        }
+    };
+    let sums = each(&|i, j| format!("    acc{i}_{j} = simd_sum(acc{i}_{j});\n"));
+    let store = each(&|i, j| {
+        format!(
+            "        if (batch0 + {j} < p.batch_size && row0 + {i} < p.rows) {{\n            float a = acc{i}_{j};\n            if (p.has_bias != 0) a += bias[row0 + {i}];\n            ulong o = (ulong)(batch0 + {j}) * p.rows + row0 + {i};\n            y[o] = apply_gemv_epi(a, o, p, res);\n        }}\n"
+        )
+    });
+    format!(
+        r#"
+{codec_msl}
+{wide_msl}
+kernel void {name}(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant PackedGemvParams& p [[buffer(3)]],
+    device const float* bias [[buffer(4)]],
+    device const float* res [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {{
+    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
+    const uint batch0 = tg.y * {mb};
+    if (row0 >= p.rows || batch0 >= p.batch_size) return;
+    const uint blocks_per_row = p.cols / {be};
+{xptr}{acc_decl}{loop_src}{sums}    if (lane == 0) {{
+{store}    }}
+}}
+"#,
+        rows_per_tg = gemv_rows_per_tg(p),
+        wide_msl = wide_msl(codec, &dec, false),
+    )
+}
+
 fn wide_msl(codec: &Codec, dec: &str, allow_tile: bool) -> String {
     wide(codec.format)
         .map(|w| {
