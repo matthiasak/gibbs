@@ -461,7 +461,8 @@ impl PortableSession {
     }
 
     /// Runs another instance shape of the compiled network (same weight and state names); plans
-    /// are cached by node count, output count and input shapes (4 most recently used).
+    /// are cached by node count, output count and input shapes (the
+    /// [`crate::graph::program::INSTANCE_SHAPES`] most recently used).
     pub fn run_reshaped(
         &mut self,
         graph: &Graph,
@@ -481,8 +482,7 @@ impl PortableSession {
         {
             Some(i) => self.reshaped.remove(i),
             None => {
-                // ponytail: 4 shapes, like the Metal plan cache.
-                if self.reshaped.len() == 4 {
+                if self.reshaped.len() == crate::graph::program::INSTANCE_SHAPES {
                     let (_, _, old) = self.reshaped.remove(0);
                     self.drop_plan(old);
                 }
