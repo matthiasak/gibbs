@@ -5,7 +5,9 @@ use crate::graph::passes::fusion::FuseWeights;
 use crate::graph::placement::{
     device_supports_op, place_graph, placement_rows, PlacementPlan, PlacementRow, Secondary,
 };
-use crate::graph::{cpu, DType, Graph, NodeId, Op, StateStore, Tensor, ValueId, ValueKind, Weights};
+use crate::graph::{
+    cpu, DType, Graph, NodeId, Op, StateStore, Tensor, ValueId, ValueKind, Weights,
+};
 use crate::hardware::{available_devices, Device, PlacementMode};
 use std::collections::HashMap;
 
@@ -552,7 +554,10 @@ impl GraphProgram {
             .iter()
             .filter_map(|v| match &v.kind {
                 crate::graph::ValueKind::State { name, .. }
-                    if self.kv_pool.as_ref().is_none_or(|p| p.locate(name).is_none()) =>
+                    if self
+                        .kv_pool
+                        .as_ref()
+                        .is_none_or(|p| p.locate(name).is_none()) =>
                 {
                     Some(name.clone())
                 }
@@ -652,9 +657,11 @@ impl GraphProgram {
             return Ok(Vec::new());
         }
         // A secondary exists only on a host with Metal and the ANE: no device probing per instance.
-        let (mode, devices) = (PlacementMode::Pin(Device::Metal), [Device::Metal, sec.device]);
-        let Ok(mut placed) = place_graph(g, mode, &devices, &device_supports_op, Some(sec))
-        else {
+        let (mode, devices) = (
+            PlacementMode::Pin(Device::Metal),
+            [Device::Metal, sec.device],
+        );
+        let Ok(mut placed) = place_graph(g, mode, &devices, &device_supports_op, Some(sec)) else {
             return Ok(Vec::new());
         };
         gate(g, &mut placed, session, None, sec, self.kv_pool.as_ref())
@@ -702,7 +709,8 @@ impl GraphProgram {
                 let (plan, segments, metal_only) = match &self.segment {
                     CompiledSegment::Metal { session, .. } => {
                         let plan = session.prepare_plan(&g)?;
-                        let gated = allow_secondary && !self.ane_metal_only.contains(&(key, shapes.clone()));
+                        let gated = allow_secondary
+                            && !self.ane_metal_only.contains(&(key, shapes.clone()));
                         let segs = self.instance_segments(&mut g, session, gated)?;
                         let metal_only = gated && segs.is_empty();
                         (Some(plan), segs, metal_only)
@@ -730,7 +738,13 @@ impl GraphProgram {
         let r = &mut self.reshaped_graphs[last];
         if !r.segments.is_empty() {
             let g = &r.graph;
-            return run_segments(&mut r.segments, &mut self.state, &g.inputs, &g.outputs, inputs);
+            return run_segments(
+                &mut r.segments,
+                &mut self.state,
+                &g.inputs,
+                &g.outputs,
+                inputs,
+            );
         }
         let graph = &r.graph;
         match &mut self.segment {
@@ -1066,7 +1080,10 @@ static ANE_REPORTS: std::sync::Mutex<Vec<AneReport>> = std::sync::Mutex::new(Vec
 
 /// Every ANE gate decision this process made or reused, in order.
 pub fn ane_reports() -> Vec<AneReport> {
-    ANE_REPORTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    ANE_REPORTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Decisions by signature (hex) from `<cache>/host/ane-decisions-<os build>.json`.
@@ -1151,7 +1168,11 @@ fn synth_inputs(graph: &Graph) -> Vec<Tensor> {
                     .filter_map(|nd| graph.value(nd.inputs[0]).shape.first().copied())
                     .min()
                     .unwrap_or(usize::MAX);
-                Tensor::U32((0..n).map(|i| i.min(rows.saturating_sub(1)) as u32).collect())
+                Tensor::U32(
+                    (0..n)
+                        .map(|i| i.min(rows.saturating_sub(1)) as u32)
+                        .collect(),
+                )
             } else {
                 Tensor::F32(
                     (0..n)
@@ -1191,7 +1212,10 @@ fn time_ms<const N: usize>(
     let mut outs = outs.into_iter();
     Ok(t.map(|mut t| {
         t.sort_by(f64::total_cmp);
-        (t[TIMED_ROUNDS / 2], outs.next().expect("one output per closure"))
+        (
+            t[TIMED_ROUNDS / 2],
+            outs.next().expect("one output per closure"),
+        )
     }))
 }
 
@@ -1254,7 +1278,8 @@ fn compile_ane(
     }
     let (mil, blob, io) = ane::lower(&g, &weights, info)?;
     let (n_in, n_out) = (io.inputs.len(), io.outputs.len());
-    let program = ane::AneProgram::compile(&mil, &blob, n_in, io.in_bytes(), n_out, io.out_bytes())?;
+    let program =
+        ane::AneProgram::compile(&mil, &blob, n_in, io.in_bytes(), n_out, io.out_bytes())?;
     let mut tables = Weights::new();
     for b in &io.inputs {
         if let ane::IoSource::RopeTable(n) = b.source {
@@ -1381,11 +1406,15 @@ fn assemble(
         if let Some(CompiledSegment::Ane { program, io, .. }) = &seg {
             for (i, b) in io.inputs.iter().enumerate() {
                 let sf = program.input(i);
-                wrapped.0.push((session.wrap_host(sf.base(), sf.alloc_size())?, layout(b)));
+                wrapped
+                    .0
+                    .push((session.wrap_host(sf.base(), sf.alloc_size())?, layout(b)));
             }
             for (i, b) in io.outputs.iter().enumerate() {
                 let sf = program.output(i);
-                wrapped.1.push((session.wrap_host(sf.base(), sf.alloc_size())?, layout(b)));
+                wrapped
+                    .1
+                    .push((session.wrap_host(sf.base(), sf.alloc_size())?, layout(b)));
             }
         }
         compiled.push(seg);
@@ -1416,7 +1445,12 @@ fn assemble(
                 let len = shape.iter().product::<usize>();
                 let cols = shape.last().copied().unwrap_or(1).max(1);
                 let (c, s) = ((len / cols) as u32, cols as u32);
-                let io = AneIo { c, s, row: s, transposed: 0 };
+                let io = AneIo {
+                    c,
+                    s,
+                    row: s,
+                    transposed: 0,
+                };
                 let buf = session.shared_buffer(len.max(1) * 4)?;
                 post[p].push((v, buf.clone(), io));
                 carried.insert(v, (buf, io));
@@ -1489,7 +1523,10 @@ fn assemble(
                 let fin = |v: ValueId| g.inputs[at(&inputs, v)];
                 let fout = |v: ValueId| g.outputs[at(&outputs, v)];
                 let unpack = pre[k].drain(..).map(|(b, io, v)| (b, io, fin(v))).collect();
-                let pack = post[k].drain(..).map(|(v, b, io)| (fout(v), b, io)).collect();
+                let pack = post[k]
+                    .drain(..)
+                    .map(|(v, b, io)| (fout(v), b, io))
+                    .collect();
                 let device = outputs
                     .iter()
                     .filter(|v| !graph.outputs.contains(v))
@@ -1526,7 +1563,11 @@ fn measure_region(
     let inputs = synth_inputs(g);
     let mut st = StateStore::new();
     let (h, mut st_ane) = (harness(g), StateStore::new());
-    let first = h.nodes.iter().position(|n| n.device == Device::Ane).unwrap_or(0);
+    let first = h
+        .nodes
+        .iter()
+        .position(|n| n.device == Device::Ane)
+        .unwrap_or(0);
     let ane = HashMap::from([(NodeId(first as u32), ane)]);
     let mut segs = assemble(&h, Device::Metal, ane, session)?;
     let (h_in, h_out) = (&h.inputs, &h.outputs);
@@ -1623,7 +1664,9 @@ fn gate(
     let refused = if ane::programs_compiled() + regions.len() > ane::ANE_MAX_PROGRAMS {
         Some("ANE program budget reached".to_string())
     } else if need as f64 > 0.75 * memsize {
-        Some(format!("{need} B of ANE weights and RSS exceed 75% of memory"))
+        Some(format!(
+            "{need} B of ANE weights and RSS exceed 75% of memory"
+        ))
     } else {
         None
     };
@@ -1635,7 +1678,12 @@ fn gate(
     }
     let label = |nodes: &[NodeId]| {
         let name = |i: usize| graph.node(nodes[i]).name.as_str();
-        format!("{} nodes: {} … {}", nodes.len(), name(0), name(nodes.len() - 1))
+        format!(
+            "{} nodes: {} … {}",
+            nodes.len(),
+            name(0),
+            name(nodes.len() - 1)
+        )
     };
     let whole_label = |n: usize| format!("whole program, {n} ANE regions");
     let cached = |sig: u64| with_ane_decisions(false, |m| m.get(&format!("{sig:016x}")).copied());
@@ -1681,9 +1729,9 @@ fn gate(
             record(sig, label, d, false, false);
             continue;
         }
-        let foreign = inputs.iter().find(|v| {
-            !graph.inputs.contains(v) && graph.value(**v).dtype != DType::F32
-        });
+        let foreign = inputs
+            .iter()
+            .find(|v| !graph.inputs.contains(v) && graph.value(**v).dtype != DType::F32);
         let built = match foreign {
             Some(&v) => Err(format!(
                 "input '{}' is neither an f32 activation nor a graph input",
@@ -1741,7 +1789,12 @@ fn gate(
     }
     let sig = signature(graph, host.is_none());
     let key = format!("{sig:016x}");
-    let label = whole_label(segments.iter().filter(|s| s.compiled.device() == Device::Ane).count());
+    let label = whole_label(
+        segments
+            .iter()
+            .filter(|s| s.compiled.device() == Device::Ane)
+            .count(),
+    );
     let (d, fresh) = match with_ane_decisions(false, |m| m.get(&key).copied()) {
         Some(d) => (d, false),
         None => {
@@ -1777,7 +1830,10 @@ fn record(sig: u64, region: String, decision: AneDecision, measured: bool, offlo
         offloaded,
     };
     eprintln!("{r}");
-    ANE_REPORTS.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+    ANE_REPORTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(r);
 }
 
 #[cfg(test)]
@@ -1805,8 +1861,14 @@ mod tests {
         };
         let x = g.input("x", vec![rows, 128], f);
         let w = |g: &mut Graph, n: &str, o: usize, i: usize| g.weight(n, vec![o, i], f);
-        let (w1, w2) = (w(&mut g, "mlp0.up", 256, 128), w(&mut g, "mlp0.down", 128, 256));
-        let (w3, w4) = (w(&mut g, "mlp1.up", 128, 256), w(&mut g, "mlp1.down", 128, 128));
+        let (w1, w2) = (
+            w(&mut g, "mlp0.up", 256, 128),
+            w(&mut g, "mlp0.down", 128, 256),
+        );
+        let (w3, w4) = (
+            w(&mut g, "mlp1.up", 128, 256),
+            w(&mut g, "mlp1.down", 128, 128),
+        );
         let a = g.add("up0", Op::Linear, &[x, w1], vec![rows, 256], f);
         let a = g.add("act0", silu.clone(), &[a], vec![rows, 256], f);
         let a = g.add("down0", Op::Linear, &[a, w2], vec![rows, 128], f);
@@ -1836,31 +1898,46 @@ mod tests {
             (h >> 40) as f32 / (1u64 << 24) as f32 - 0.5
         };
         let mut weights = Weights::new();
-        let names = [("mlp0.up", 256 * 128), ("mlp0.down", 128 * 256), ("mlp1.up", 128 * 256), ("mlp1.down", 128 * 128)];
-        for (i, (name, n)) in names
-            .into_iter()
-            .enumerate()
-        {
+        let names = [
+            ("mlp0.up", 256 * 128),
+            ("mlp0.down", 128 * 256),
+            ("mlp1.up", 128 * 256),
+            ("mlp1.down", 128 * 128),
+        ];
+        for (i, (name, n)) in names.into_iter().enumerate() {
             let v = (0..n).map(|j| hashed(j + (i << 20)) * 0.1).collect();
             weights.insert(name, Tensor::F32(v));
         }
-        let x = |rows: usize| vec![Tensor::F32((0..rows * 128).map(|j| hashed(j + (9 << 20))).collect())];
+        let x = |rows: usize| {
+            vec![Tensor::F32(
+                (0..rows * 128).map(|j| hashed(j + (9 << 20))).collect(),
+            )]
+        };
         let ane = PlacementMode::Pin(Device::Ane);
         let mut mixed =
             GraphProgram::compile_reshapable(ane_sandwich(64), weights.clone(), ane).unwrap();
         let devices: Vec<Device> = mixed.segments.iter().map(|s| s.compiled.device()).collect();
         assert_eq!(devices, [Device::Ane, Device::Metal, Device::Ane]);
         let metal = PlacementMode::Pin(Device::Metal);
-        let mut single = GraphProgram::compile_reshapable(ane_sandwich(64), weights, metal).unwrap();
+        let mut single =
+            GraphProgram::compile_reshapable(ane_sandwich(64), weights, metal).unwrap();
         assert!(single.segments.is_empty());
         let rel = |a: &Tensor, b: &Tensor| crate::graph::ane::rel_rms(&a.to_f32(), &b.to_f32());
         let (got, want) = (mixed.run(x(64)).unwrap(), single.run(x(64)).unwrap());
-        assert!(rel(&got[0], &want[0]) <= ANE_REL_ERR, "{}", rel(&got[0], &want[0]));
+        assert!(
+            rel(&got[0], &want[0]) <= ANE_REL_ERR,
+            "{}",
+            rel(&got[0], &want[0])
+        );
         let g = ane_sandwich(40);
         let got = mixed.run_reshaped(&g, x(40), true).unwrap();
         let want = single.run_reshaped(&g, x(40), true).unwrap();
         assert_eq!(mixed.reshaped_graphs[0].segments.len(), 3);
-        assert!(rel(&got[0], &want[0]) <= ANE_REL_ERR, "{}", rel(&got[0], &want[0]));
+        assert!(
+            rel(&got[0], &want[0]) <= ANE_REL_ERR,
+            "{}",
+            rel(&got[0], &want[0])
+        );
     }
 
     /// GPU: `run_reshaped` plans a row count once and reuses it; another row count gets its own plan.
@@ -2983,19 +3060,37 @@ mod tests {
         ];
         let missing: Vec<_> = all.iter().filter(|n| !covered.contains(*n)).collect();
         assert!(missing.is_empty(), "ops without a case: {missing:?}");
+        // ANE regions run inside Metal programs and have their own tests (`graph::ane::`).
         let devices: Vec<Device> = available_devices()
             .into_iter()
-            .filter(|d| !matches!(d, Device::Cpu | Device::Metal))
+            .filter(|d| !matches!(d, Device::Cpu | Device::Metal | Device::Ane))
             .collect();
         assert!(
             !devices.is_empty(),
-            "no non-CPU, non-Metal device on this host"
+            "no portable (CUDA / ROCm / Intel XPU) or XLA device on this host"
         );
         for dev in devices {
             let tol = if dev == Device::Xla { 2e-2 } else { 1e-4 };
             let mut worst: std::collections::BTreeMap<String, f64> = Default::default();
-            let mut failures = Vec::new();
+            let (mut failures, mut skipped) = (Vec::new(), Vec::new());
             for case in &cases {
+                // Ops the device's own probe rejects (e.g. AvgPool2d on jax-metal's PJRT plugin)
+                // have no lowering there; such a graph cannot be pinned to it.
+                let g = &case.graph;
+                let mut rejected: Vec<&str> = g
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        let dt = crate::graph::placement::node_dtype(g, n);
+                        !crate::graph::placement::device_supports_op(dev, &n.op, dt)
+                    })
+                    .map(|n| n.op.name())
+                    .collect();
+                if !rejected.is_empty() {
+                    rejected.dedup();
+                    skipped.push(format!("{} ({})", case.name, rejected.join(", ")));
+                    continue;
+                }
                 let wants = cpu_reference(case);
                 let mut gpu = GraphProgram::compile(
                     case.graph.clone(),
@@ -3046,6 +3141,15 @@ mod tests {
             for (op, e) in &worst {
                 eprintln!("  {op:<20} {e:.3e}");
             }
+            eprintln!(
+                "{dev}: {} cases skipped (ops it rejects): {skipped:?}",
+                skipped.len()
+            );
+            // The portable kernels claim every op; only XLA plugins may reject some.
+            assert!(
+                dev == Device::Xla || skipped.is_empty(),
+                "{dev}: {skipped:#?}"
+            );
             assert!(failures.is_empty(), "{dev}: {failures:#?}");
         }
     }

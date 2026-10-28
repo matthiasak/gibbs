@@ -79,7 +79,7 @@ pub fn device_supports_op(device: Device, op: &Op, dtype: DType) -> bool {
 }
 
 /// The element type that decides whether a node's op is supported.
-fn node_dtype(graph: &Graph, node: &crate::graph::Node) -> DType {
+pub(crate) fn node_dtype(graph: &Graph, node: &crate::graph::Node) -> DType {
     let operand = |i: usize| node.inputs.get(i).map(|&v| graph.value(v).dtype);
     match &node.op {
         Op::Linear | Op::MoeLinear { .. } => operand(1),
@@ -628,7 +628,10 @@ mod tests {
             placement_verdict(&gpu),
             Ok("100% accelerated (Metal 237)".to_string())
         );
-        let ane = [row("Linear", Device::Metal, 3), row("Conv2d", Device::Ane, 5)];
+        let ane = [
+            row("Linear", Device::Metal, 3),
+            row("Conv2d", Device::Ane, 5),
+        ];
         assert_eq!(
             placement_verdict(&ane),
             Ok("100% accelerated (Ane 5, Metal 3)".to_string())
