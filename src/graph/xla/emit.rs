@@ -84,13 +84,15 @@ pub struct Module {
 }
 
 /// One page class of the graph's paged KV states, bound as page windows: each named state's
-/// parameter is `[rows, w]` (window slot `j` holds stored row `slot_row[j]`, `-1` = empty), and
-/// the class adds the parameters `slot_row [rows]`, `write_slot [nq]` (the slot each written
-/// query row lands in) and `base [1]` (`kv_base`: stored row of the run's first position).
+/// parameter is `[rows, w]`, window slot `j` holding page row `j` (`slot_row[j] = j`, `-1` past
+/// the class's pages), and the class adds the parameters `slot_row [rows]`, `write_slot [nq]`
+/// (the slot each written query row lands in) and `base [1]` (`kv_base`: stored row of the run's
+/// first position). `ring`: rows of a ring class (slot = stored row mod `ring`), 0 for full.
 pub struct PagedClass {
     pub names: Vec<String>,
     pub rows: usize,
     pub nq: usize,
+    pub ring: usize,
 }
 
 /// Emits `g`. `weight(name)` is the bound weight's element count and type (`None`: missing);
@@ -190,7 +192,7 @@ pub fn emit(
             vals.push(p);
         }
         let base = e.reshape(&vals[2], &[]);
-        e.classes.push((vals[0].clone(), vals[1].clone(), base));
+        e.classes.push((vals[0].clone(), vals[1].clone(), base, pc.ring));
         for name in &pc.names {
             e.paged.insert(name.clone(), c);
         }
@@ -290,8 +292,8 @@ struct Em<'g> {
     written: Vec<String>,
     /// Paged state name → its class in `classes`.
     paged: HashMap<String, usize>,
-    /// Per paged class: `slot_row`, `write_slot`, scalar `base`.
-    classes: Vec<(V, V, V)>,
+    /// Per paged class: `slot_row`, `write_slot`, scalar `base`, ring rows (0 = full).
+    classes: Vec<(V, V, V, usize)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1527,8 +1529,9 @@ impl<'g> Em<'g> {
                 };
                 if let Some(c) = class {
                     // Page windows in stored-row space (`crate::kv`): written rows scatter into
-                    // their slots, keys are masked by the stored row each slot holds.
-                    let (slot, wslot, base) = self.classes[c].clone();
+                    // their slots; every slot holds its page row, masked by the stored row it
+                    // stands for.
+                    let (slot, wslot, base, ring) = self.classes[c].clone();
                     let p = self.idx(ins[5])?;
                     let p = self.reshape(&p, &[numel(&p.shape)]);
                     let p0 = self.elem(&p, 0);
@@ -1545,10 +1548,34 @@ impl<'g> Em<'g> {
                         self.set_state(ins[4], vs.clone())?;
                     }
                     let rows = ks.shape[0];
-                    let t = self.bcast(&slot, &[nq, rows], &[1]);
+                    let slot_b = self.bcast(&slot, &[nq, rows], &[1]);
                     let qi = self.iota(&[nq, rows], 0);
                     let bb = self.bcast(&base, &[nq, rows], &[]);
                     let cur = self.add(&bb, &qi);
+                    // The stored row slot `j` stands for: `j` itself, or in a ring of `R` rows
+                    // (slot = row mod R, as the host addresses it) the one row `≡ j` in the
+                    // query's `[lo, lo + R)`, `lo` the window start.
+                    let t = if ring == 0 {
+                        slot_b.clone()
+                    } else {
+                        let lo = match window {
+                            Some(w) => {
+                                let l = self.addc(&cur, 1.0 - *w as f64);
+                                let z = self.k(0.0, &l);
+                                self.bin("maximum", &l, &z)
+                            }
+                            None => self.k(0.0, &cur),
+                        };
+                        let rk = self.k(ring as f64, &lo);
+                        let lq = self.div(&lo, &rk);
+                        let lq = self.mul(&lq, &rk);
+                        let lr = self.sub(&lo, &lq);
+                        let d = self.sub(&slot_b, &lr);
+                        let neg = self.cmpc("LT", &d, 0.0);
+                        let dr = self.add(&d, &rk);
+                        let d = self.sel(&neg, &dr, &d);
+                        self.add(&lo, &d)
+                    };
                     let shift = self.sub(&p0, &base);
                     let vis = match ins.get(6) {
                         Some(&vi) => {
@@ -1571,7 +1598,7 @@ impl<'g> Em<'g> {
                             self.bcast(&all, &[nq, rows], &[])
                         }
                     };
-                    let valid = self.cmpc("GE", &t, 0.0);
+                    let valid = self.cmpc("GE", &slot_b, 0.0);
                     let below = self.cmp("LT", &t, &hi);
                     let mut mask = self.and(&valid, &below);
                     if let Some(w) = window {
