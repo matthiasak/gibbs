@@ -1464,27 +1464,24 @@ struct KvAppendParams {
     uint paged;      // the state operands are `KvDesc` bindings
 };
 
-// A paged KV state's binding (`kv::KvView::metal_desc`): header, then the class page table (one
-// page id per logical 64-row page). `slabs[pg >> 8]` is the base of the name's slab holding page `pg`.
+// A paged KV state's binding (`kv::KvView::metal_desc`): header, then per logical 64-row page the
+// address of the name's page (the class page table resolved on the host: one dependent load).
 struct KvDesc {
     uint ring_pages; // host-read; kernels take it from their params
     uint evicted;    // host-read
     uint n_pages;    // host-read
     uint pad;
-    device uchar* device* slabs;
-    ulong pad2;
 };
 
 // Stored row `t` of a KV state with `stride` elements per row: the contiguous buffer `kv`, or,
-// when `paged`, the page `table[(t >> 6) % ring]` of the `KvDesc` bound at `kv` (`crate::kv`).
+// when `paged`, row `t & 63` of logical page `(t >> 6) % ring` of the `KvDesc` bound at `kv`.
 template <typename T>
 inline device T* kv_row(device T* kv, uint paged, uint ring, uint t, ulong stride) {
     if (paged == 0) return kv + (ulong)t * stride;
-    device const KvDesc* d = (device const KvDesc*)kv;
     uint lp = t >> 6;
     if (ring != 0) lp %= ring;
-    const uint pg = ((device const uint*)(d + 1))[lp];
-    return (device T*)(d->slabs[pg >> 8]) + (ulong)((pg & 255u) * 64u + (t & 63u)) * stride;
+    device T* const device* pages = (device T* const device*)((device const KvDesc*)kv + 1);
+    return pages[lp] + (ulong)(t & 63u) * stride;
 }
 
 // KV cache element type: float, or half (round-to-nearest-even; |x| > 65504 saturates instead of becoming inf,
@@ -1583,11 +1580,20 @@ inline void attn_cached_f32_impl(device const float* q,
     float l = 0.0f;
     const uint lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;
     const uint hi = len;
+    // Keys ascend per simdgroup: resolve the (paged) row base once per 64-row page, not per key.
+    uint cur_pg = ~0u;
+    device const T* kp = kc;
+    device const T* vp = vc;
     for (uint t = lo + sg; t < hi; t += nsg) {
         // The fused write's own row comes from k_in / v_in (other heads' threadgroups may not see the store).
         const bool cur_in = p.write_kv != 0 && t == p.kv_base;
-        device const T* k = kv_row(kc, p.paged, p.ring_pages, t, p.stride) + kv_off;
-        device const T* v = kv_row(vc, p.paged, p.ring_pages, t, p.stride) + kv_off;
+        if ((t >> 6) != cur_pg) {
+            cur_pg = t >> 6;
+            kp = kv_row(kc, p.paged, p.ring_pages, t & ~63u, p.stride) + kv_off;
+            vp = kv_row(vc, p.paged, p.ring_pages, t & ~63u, p.stride) + kv_off;
+        }
+        device const T* k = kp + (ulong)(t & 63u) * p.stride;
+        device const T* v = vp + (ulong)(t & 63u) * p.stride;
         device const float* ki = k_in + kv_off;
         device const float* vi = v_in + kv_off;
         float s = 0.0f;
@@ -1798,10 +1804,19 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
         l[h] = 0.0f;
         for (uint j = 0; j < NJ; ++j) acc[h][j] = 0.0f;
     }
+    // Keys ascend per simdgroup: resolve the (paged) row base once per 64-row page, not per key.
+    uint cur_pg = ~0u;
+    device const T* kp = kc;
+    device const T* vp = vc;
     for (uint t = lo + sg; t < hi; t += nsg) {
         const bool cur_in = p.write_kv != 0 && t == p.kv_base;
-        device const T* k = kv_row(kc, p.paged, p.ring_pages, t, p.stride) + kv_off;
-        device const T* v = kv_row(vc, p.paged, p.ring_pages, t, p.stride) + kv_off;
+        if ((t >> 6) != cur_pg) {
+            cur_pg = t >> 6;
+            kp = kv_row(kc, p.paged, p.ring_pages, t & ~63u, p.stride) + kv_off;
+            vp = kv_row(vc, p.paged, p.ring_pages, t & ~63u, p.stride) + kv_off;
+        }
+        device const T* k = kp + (ulong)(t & 63u) * p.stride;
+        device const T* v = vp + (ulong)(t & 63u) * p.stride;
         float kr[NJ];
         if (cur_in) {
             for (uint j = 0; j < NJ; ++j) {
