@@ -13,6 +13,7 @@
 // objc 0.2's `msg_send!` expands a `cfg(feature = "cargo-clippy")` check.
 #![allow(unexpected_cfgs)]
 
+pub mod draft;
 pub mod mil;
 pub mod runtime;
 

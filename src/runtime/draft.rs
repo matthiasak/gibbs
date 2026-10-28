@@ -24,9 +24,11 @@ use crate::arch::build::{build, Instance, ShapeCache};
 use crate::arch::expr::Val;
 use crate::arch::load::{load_with, Model};
 use crate::arch::{glob, registry, Lora, Pipeline, Registry, Signals, Source};
+use crate::graph::ane::draft::{lower_drafter_step, AneDraft, DraftStep, Ring};
+use crate::graph::ane::AneInfo;
 use crate::graph::program::GraphProgram;
 use crate::graph::{DType, StateStore, Tensor, Weights};
-use crate::hardware::PlacementMode;
+use crate::hardware::{Device, PlacementMode};
 use crate::model::hub::ModelArtifacts;
 use crate::model::native::{NativeLm, SeqState};
 use crate::model::weight_format::{ReencodeConfig, ReencodePolicy};
@@ -35,6 +37,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value as J;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// `runtime.drafter` of a spec.
@@ -197,7 +200,9 @@ impl Comp {
         std::mem::swap(&mut p.state, state);
         let out = match ShapeCache::key(vars) == self.key {
             true => p.run(ins),
-            false => p.run_reshaped(&inst.graph, ins, true),
+            // Drafter instances are decode-sized (`rows` up to `k + 1`): no ANE regions (plan
+            // 7.1.3); a drafter's own ANE steps are `AneSide`'s.
+            false => p.run_reshaped(&inst.graph, ins, false),
         };
         std::mem::swap(&mut p.state, state);
         Ok(inst.outputs.iter().cloned().zip(out?).collect())
@@ -236,10 +241,87 @@ fn mtp_vars(rows: usize, src: &str) -> Vec<(&'static str, Val)> {
     ]
 }
 
-/// The drafter `model` ships (`runtime.drafter` of kind `mtp`), compiled on `mode`.
+/// Host decoding of `Embedding` table rows: `(table, id, out)`; `false` when the host has no
+/// such table or row.
+pub type EmbedRows = Arc<dyn Fn(&str, u32, &mut [f32]) -> bool + Send + Sync>;
+
+/// Relative RMS error a drafter's ANE logits may show against Metal's. Looser than an offloaded
+/// region's: drafts only steer speed (the target verifies every token), fp16 error compounds
+/// over a whole model (a 135M causal LM: 1-6% with the same argmax), and the trial's tokens per
+/// second already price in what acceptance it costs; this only rejects broken lowerings.
+const DRAFT_REL_ERR: f32 = 0.1;
+
+/// A drafter's ANE side ([`crate::graph::ane::draft`]): its steps, sharing one set of K/V
+/// windows, and whether drafting runs there.
+#[derive(Default)]
+struct AneSide {
+    lane: Option<Mutex<AneDraft>>,
+    /// `Ok((id, rel_err))`: drafting may move to the ANE; `Err(why)`: it stays on Metal; `None`:
+    /// placement keeps it on one device.
+    status: Option<Result<(String, f32), String>>,
+    on: AtomicBool,
+    settled: AtomicBool,
+}
+
+impl AneSide {
+    /// The steps `build` compiles and checks (the relative RMS error of their logits against
+    /// Metal's) when placement may use the ANE: `Auto` on a Metal host (then [`KTuner::place`]
+    /// times both devices) or `Pin(Ane)` (drafting stays there).
+    ///
+    /// [`KTuner::place`]: crate::scheduler::spec::KTuner::place
+    fn build(
+        label: &str,
+        mode: PlacementMode,
+        build: impl FnOnce(&AneInfo) -> Result<(AneDraft, f32), String>,
+    ) -> Self {
+        let pinned = mode == PlacementMode::Pin(Device::Ane);
+        let auto = mode == PlacementMode::Auto
+            && crate::hardware::available_devices().contains(&Device::Metal);
+        if !pinned && !auto {
+            return Self::default();
+        }
+        let built = crate::graph::ane::probe()
+            .map_err(|e| format!("no ANE: {e}"))
+            .and_then(build)
+            .and_then(|(lane, err)| match err <= DRAFT_REL_ERR {
+                true => Ok((lane, err)),
+                false => Err(format!(
+                    "its ANE step's logits differ from Metal's by {err:.2e} relative RMS"
+                )),
+            });
+        match built {
+            Ok((lane, err)) => Self {
+                status: (!pinned).then(|| Ok((format!("{label} {:016x}", lane.sig()), err))),
+                lane: Some(Mutex::new(lane)),
+                on: AtomicBool::new(pinned),
+                settled: AtomicBool::new(pinned),
+            },
+            Err(e) => Self {
+                status: Some(Err(e)),
+                ..Self::default()
+            },
+        }
+    }
+
+    fn set(&self, on: bool, settled: bool) {
+        if self.lane.is_some() {
+            self.on.store(on, Ordering::Relaxed);
+            self.settled.store(settled, Ordering::Relaxed);
+        }
+    }
+
+    /// The windows, when drafting runs on the ANE.
+    fn active(&self) -> Option<&Mutex<AneDraft>> {
+        self.lane.as_ref().filter(|_| self.on.load(Ordering::Relaxed))
+    }
+}
+
+/// The drafter `model` ships (`runtime.drafter` of kind `mtp`), compiled on `mode`; `embed`
+/// decodes the target's embedding rows for its ANE steps.
 pub fn spec_drafter(
     model: &Arc<Model>,
     mode: PlacementMode,
+    embed: EmbedRows,
 ) -> Result<Option<Arc<dyn Drafter>>, String> {
     let Some(d) = drafter_spec(model)? else {
         return Ok(None);
@@ -269,15 +351,61 @@ pub fn spec_drafter(
         &[mtp_vars(1, "tap")],
         mode,
     )?;
+    let label = expr(&d.label, "label")?.to_string();
+    let hidden = env.var("hidden")?.usize()?;
+    // ANE steps: the one-row catch-up (`tap`) and draft instances, checked on a draft step.
+    let ane = AneSide::build(&label, mode, |info| {
+        let mut steps = Vec::new();
+        let mut table = (String::new(), 0);
+        for src in ["tap", "draft"] {
+            let inst = b.build(&d.component, &mtp_vars(1, src))?;
+            let sg = lower_drafter_step(&inst.graph)?;
+            table = sg.embed.clone();
+            let w = b.materialize(&inst.weights)?;
+            steps.push(DraftStep::compile(sg, &w, info)?);
+        }
+        let mut lane = AneDraft::new(steps);
+        let (tok, h) = (1u32, probe_row(hidden));
+        let mut e = vec![0.0; table.1];
+        if !embed(&table.0, tok, &mut e) {
+            return Err(format!("the host decodes no rows of {}", table.0));
+        }
+        let inputs = [("embed", &e[..]), ("hidden", &h[..])];
+        let got = lane.run(MTP_DRAFT, &mut Ring::new(), 0, &inputs)?;
+        let li = b.build(&d.component, &mtp_vars(1, "draft"))?.output_index("logits");
+        let got = li.and_then(|i| got.into_iter().nth(i)).ok_or("no logits output")?;
+        let want = comp.run(
+            &b,
+            &mtp_vars(1, "draft"),
+            &mut StateStore::new(),
+            HashMap::from([
+                ("token_ids", Tensor::U32(vec![tok])),
+                ("hidden", Tensor::F32(h)),
+                ("positions", positions(0, 1)),
+            ]),
+        )?;
+        Ok((lane, crate::graph::ane::rel_rms(&got, &f32_out(&want, "logits")?)))
+    });
     Ok(Some(Arc::new(Mtp {
-        label: expr(&d.label, "label")?.to_string(),
+        label,
         taps: usizes(expr(&d.taps, "taps")?)?,
-        hidden: env.var("hidden")?.usize()?,
+        hidden,
         ctx: env.var("ctx")?.usize()?,
         b,
         comp,
+        ane,
+        embed,
     })))
 }
+
+/// A deterministic unit-scale row of `n` values (load-time device checks).
+fn probe_row(n: usize) -> Vec<f32> {
+    (0..n).map(|i| ((i * 7 % 13) as f32 - 6.0) / 6.0).collect()
+}
+
+/// [`Mtp`]'s ANE steps: catch-up rows of target taps, then draft rows of its own `hidden`.
+const MTP_TAP: usize = 0;
+const MTP_DRAFT: usize = 1;
 
 /// A multi-token-prediction head drafting autoregressively from the target's last tap.
 struct Mtp {
@@ -287,12 +415,22 @@ struct Mtp {
     ctx: usize,
     b: Bound,
     comp: Comp,
+    ane: AneSide,
+    embed: EmbedRows,
 }
 
-/// The head's state and the target positions it holds (all committed).
+/// The head's state on each device and the target rows not yet run on both.
 struct MtpState {
+    /// Metal: the head's state and the positions it holds (all committed).
     state: StateStore,
     len: usize,
+    /// ANE: the windows' positions; `ring.ids` holds one id per committed position run.
+    ring: Ring,
+    /// Committed target positions whose tap rows arrived.
+    seen: usize,
+    /// Tap rows of positions `log_from..seen`, until both devices ran them.
+    log: Vec<f32>,
+    log_from: usize,
 }
 
 impl Mtp {
@@ -318,6 +456,33 @@ impl Mtp {
         )?;
         Ok((f32_out(&out, "logits")?, f32_out(&out, "hidden")?))
     }
+
+    /// One ANE row of step `i`: `tok` with `hidden` at `pos`; its logits and hidden.
+    fn ane_step(
+        &self,
+        lane: &mut AneDraft,
+        r: &mut Ring,
+        i: usize,
+        (tok, hidden, pos): (u32, &[f32], usize),
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let src = if i == MTP_TAP { "tap" } else { "draft" };
+        let inst = self.comp.shapes.get(&mtp_vars(1, src), || self.b.build(&self.comp.name, &mtp_vars(1, src)))?;
+        let table = inst
+            .graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, crate::graph::Op::Embedding))
+            .map(|n| inst.graph.value(n.inputs[0]))
+            .ok_or("the head has no Embedding")?;
+        let mut e = vec![0.0; *table.shape.last().unwrap_or(&0)];
+        if !(self.embed)(&table.name, tok, &mut e) {
+            return Err(format!("no row {tok} of {}", table.name));
+        }
+        let mut out = lane.run(i, r, pos, &[("embed", &e), ("hidden", hidden)])?;
+        let at = |n: &str| inst.output_index(n).ok_or_else(|| format!("no output `{n}`"));
+        let h = std::mem::take(&mut out[at("hidden")?]);
+        Ok((std::mem::take(&mut out[at("logits")?]), h))
+    }
 }
 
 impl Drafter for Mtp {
@@ -333,7 +498,19 @@ impl Drafter for Mtp {
         Box::new(MtpState {
             state: StateStore::new(),
             len: 0,
+            ring: Ring::new(),
+            seen: 0,
+            log: Vec::new(),
+            log_from: 0,
         })
+    }
+
+    fn ane(&self) -> Option<Result<(String, f32), String>> {
+        self.ane.status.clone()
+    }
+
+    fn set_ane(&self, on: bool, settled: bool) {
+        self.ane.set(on, settled);
     }
 
     fn propose(
@@ -349,39 +526,82 @@ impl Drafter for Mtp {
             .ok_or("draft state was not built by this drafter")?;
         let d = self.hidden;
         let rows = hidden.len() / d;
-        if rows == 0 || hidden.len() % d != 0 || s.len + rows + 1 != tokens.len() {
+        if rows == 0 || hidden.len() % d != 0 || s.seen + rows + 1 != tokens.len() {
             return Err(format!(
                 "{} drafter holds {} positions and got {} hidden values for a {}-token sequence",
                 self.label,
-                s.len,
+                s.seen,
                 hidden.len(),
                 tokens.len()
             ));
         }
-        if s.len + rows > self.ctx {
+        let seen = s.seen + rows;
+        if seen > self.ctx {
             return Err(format!(
-                "{} position {} is past the context length {}",
-                self.label,
-                s.len + rows,
-                self.ctx
+                "{} position {seen} is past the context length {}",
+                self.label, self.ctx
             ));
         }
-        // Row i is target position s.len + i; it pairs with the token after it.
-        let toks = &tokens[s.len + 1..];
-        let (mut logits, mut normed) = self.step(&mut s.state, "tap", toks, hidden, s.len)?;
-        s.len += rows;
-        let k = k.min(self.ctx - s.len + 1);
+        // Row i of the log is target position log_from + i; it pairs with the token after it.
+        s.log.extend_from_slice(hidden);
+        s.seen = seen;
+        let mut guard = self.ane.active().map(|l| l.lock());
+        let mut lane = guard.as_deref_mut();
+        if lane.as_mut().is_some_and(|l| !l.claim(&mut s.ring)) {
+            lane = None;
+        }
+        // Catch up from the positions this device holds; ones the log no longer holds (only
+        // after the device settled elsewhere) stay masked (ANE) or unwritten (Metal).
+        let (mut logits, mut normed) = match lane.as_deref_mut() {
+            Some(lane) => {
+                let from = s.ring.ids.len().max(s.log_from);
+                s.ring.ids.extend_from_slice(&tokens[s.ring.ids.len() + 1..from + 1]);
+                let mut out = (Vec::new(), Vec::new());
+                for p in from..seen {
+                    let h = &s.log[(p - s.log_from) * d..][..d];
+                    out = self.ane_step(lane, &mut s.ring, MTP_TAP, (tokens[p + 1], h, p))?;
+                    s.ring.ids.push(tokens[p + 1]);
+                }
+                out
+            }
+            None => {
+                let from = s.len.max(s.log_from);
+                let h = &s.log[(from - s.log_from) * d..];
+                let out = self.step(&mut s.state, "tap", &tokens[from + 1..seen + 1], h, from)?;
+                s.len = seen;
+                out
+            }
+        };
+        s.trim(self.ane.settled.load(Ordering::Relaxed), d);
+        let k = k.min(self.ctx - seen + 1);
         let mut drafts = Vec::with_capacity(k);
         while drafts.len() < k {
             let tok = pick(DraftLogits::Dense(&logits));
             drafts.push(tok);
             if drafts.len() < k {
-                let pos = s.len + drafts.len() - 1;
-                (logits, normed) = self.step(&mut s.state, "draft", &[tok], &normed, pos)?;
+                let pos = seen + drafts.len() - 1;
+                (logits, normed) = match lane.as_deref_mut() {
+                    Some(l) => self.ane_step(l, &mut s.ring, MTP_DRAFT, (tok, &normed, pos))?,
+                    None => self.step(&mut s.state, "draft", &[tok], &normed, pos)?,
+                };
             }
         }
-        // Draft rows stay in the cache; the next call overwrites them with the target's.
+        // Draft rows stay in the cache (windows); the next call overwrites them with the target's.
         Ok(drafts)
+    }
+}
+
+impl MtpState {
+    /// Drops the log rows both devices ran (all of them once the device is `settled`).
+    fn trim(&mut self, settled: bool, d: usize) {
+        let done = match settled {
+            true => self.seen,
+            false => self.len.min(self.ring.ids.len()),
+        };
+        if done > self.log_from {
+            self.log.drain(..(done - self.log_from) * d);
+            self.log_from = done;
+        }
     }
 }
 
@@ -844,22 +1064,93 @@ fn load_plain(
             return Err(format!("draft vocab {d} != target vocab {t}"));
         }
     }
+    let label = format!("draft {}", draft.model_id);
+    // The ANE step's `embed` width and `logits` output.
+    let mut io = (0, 0);
+    let ane = AneSide::build(&label, mode, |info| {
+        let (g, w, logits) = lm.decode_instance()?;
+        let sg = lower_drafter_step(&g)?;
+        io = (sg.embed.1, logits);
+        let mut lane = AneDraft::new(vec![DraftStep::compile(sg, &w, info)?]);
+        drop(w);
+        let mut e = vec![0.0; io.0];
+        if !lm.embed_row(1, &mut e) {
+            return Err("the draft model's embedding rows do not decode on the host".into());
+        }
+        let got = lane.run(0, &mut Ring::new(), 0, &[("embed", &e)])?;
+        let got = got.get(logits).ok_or("no logits output")?;
+        let want = lm.forward(&[1], 0, &mut lm.prepare(Vec::new(), &[])?.1)?;
+        Ok((lane, crate::graph::ane::rel_rms(got, &want)))
+    });
     Ok(Arc::new(Plain {
-        label: format!("draft {}", draft.model_id),
+        label,
         lm,
+        ane,
+        io,
     }))
 }
+
+/// Most rows a [`Plain`] drafter on the ANE catches up on before drafting: more than a trial
+/// turn's gap ([`crate::scheduler::spec::KTuner::place`]); ~12 ms each for a 135M model.
+// ponytail: a cut gap drafts from partial context until the windows refill; batch the catch-up
+// in a multi-row ANE step if long gaps matter.
+const ANE_CATCH_UP: usize = 64;
 
 /// A small causal LM with the target's tokenizer, proposing tokens autoregressively.
 struct Plain {
     label: String,
     lm: Arc<dyn NativeLm>,
+    ane: AneSide,
+    /// The ANE step's `embed` width and `logits` output.
+    io: (usize, usize),
 }
 
-/// The draft's sequence (built at the first propose) and the ids it has run.
+/// The draft's sequence (built at the first propose) and the ids it has run; its view of the ANE
+/// windows.
 struct PlainState {
     seq: Option<SeqState>,
     ids: Vec<u32>,
+    ring: Ring,
+}
+
+impl Plain {
+    /// [`Drafter::propose`] on the ANE windows `r` (claimed).
+    fn propose_ane(
+        &self,
+        lane: &mut AneDraft,
+        r: &mut Ring,
+        tokens: &[u32],
+        k: usize,
+        pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
+    ) -> Result<Vec<u32>, String> {
+        let n = tokens.len();
+        let keep = r.ids.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(n - 1);
+        r.truncate(keep);
+        // A step catches up one row at a time, so a long gap (the prompt, a run of plain decoding)
+        // is cut to its last ANE_CATCH_UP rows; earlier ones stay masked.
+        let from = keep.max((n - 1).saturating_sub(ANE_CATCH_UP));
+        r.ids.extend_from_slice(&tokens[keep..from]);
+        let mut e = vec![0.0; self.io.0];
+        let mut step = |r: &mut Ring, tok: u32, pos: usize| -> Result<Vec<f32>, String> {
+            if !self.lm.embed_row(tok, &mut e) {
+                return Err(format!("no embedding row for token {tok}"));
+            }
+            let mut out = lane.run(0, r, pos, &[("embed", &e)])?;
+            r.ids.push(tok);
+            Ok(std::mem::take(&mut out[self.io.1]))
+        };
+        for p in from..n - 1 {
+            step(r, tokens[p], p)?;
+        }
+        let mut out = Vec::with_capacity(k);
+        let mut last = tokens[n - 1];
+        for i in 0..k {
+            let logits = step(r, last, n - 1 + i)?;
+            last = pick(DraftLogits::Dense(&logits));
+            out.push(last);
+        }
+        Ok(out)
+    }
 }
 
 impl Drafter for Plain {
@@ -875,7 +1166,35 @@ impl Drafter for Plain {
         Box::new(PlainState {
             seq: None,
             ids: Vec::new(),
+            ring: Ring::new(),
         })
+    }
+
+    fn ane(&self) -> Option<Result<(String, f32), String>> {
+        self.ane.status.clone()
+    }
+
+    fn set_ane(&self, on: bool, settled: bool) {
+        self.ane.set(on, settled);
+    }
+
+    /// Forks share the draft's KV pages ([`crate::kv::KvView::fork`]) and ANE windows.
+    fn fork_state(&self, st: &DraftState) -> Option<DraftState> {
+        let s = st.downcast_ref::<PlainState>()?;
+        let seq = match &s.seq {
+            Some(q) => Some(self.lm.fork_state(q)?),
+            None => None,
+        };
+        Some(Box::new(PlainState {
+            seq,
+            ids: s.ids.clone(),
+            ring: s.ring.clone(),
+        }))
+    }
+
+    /// On the ANE, drafting runs beside the target's verify on Metal.
+    fn overlaps(&self) -> bool {
+        self.ane.active().is_some()
     }
 
     fn propose(
@@ -894,6 +1213,12 @@ impl Drafter for Plain {
         let k = k.min(m.context_len().saturating_sub(n));
         if k == 0 || n == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(lane) = self.ane.active() {
+            let mut lane = lane.lock();
+            if lane.claim(&mut st.ring) {
+                return self.propose_ane(&mut lane, &mut st.ring, tokens, k, pick);
+            }
         }
         // Rewind to the longest prefix the draft shares with the sequence (its last drafts were
         // rejected or its last call drafted past them), then catch up on committed tokens.
@@ -1219,6 +1544,8 @@ mod tests {
         let d = Plain {
             label: "self".into(),
             lm: lm.clone(),
+            ane: AneSide::default(),
+            io: (0, 0),
         };
         let mut st = d.new_state();
         let mut toks = vec![5u32, 9, 14, 3];

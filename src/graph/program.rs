@@ -1032,7 +1032,10 @@ const ANE_REL_ERR: f32 = 2e-2;
 /// A region's ANE median must be at most this fraction of Metal's to be kept (`Auto`).
 const ANE_SPEEDUP: f64 = 0.95;
 
-/// A measured ANE offload decision for one region signature ([`gate`]).
+/// A measured ANE offload decision for one region signature ([`gate`]), or, under key
+/// `drafter <id>`, a drafter's Metal-vs-ANE trial ([`crate::scheduler::spec::KTuner::place`]:
+/// milliseconds per output token on each device, the error of its ANE logits, and whether it
+/// drafts on the ANE).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AneDecision {
     /// Median of the alternating timed runs ([`time_ms`]) of the region on Metal and on the ANE
@@ -1097,7 +1100,7 @@ fn ane_decisions_path() -> Option<std::path::PathBuf> {
 }
 
 /// Runs `f` over the persisted decisions (loaded on first use); `store` writes them back.
-fn with_ane_decisions<R>(
+pub(crate) fn with_ane_decisions<R>(
     store: bool,
     f: impl FnOnce(&mut std::collections::BTreeMap<String, AneDecision>) -> R,
 ) -> R {

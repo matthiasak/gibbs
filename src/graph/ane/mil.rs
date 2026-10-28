@@ -22,6 +22,8 @@ use std::fmt::Write;
 const HEADER: &str = "program(1.3)\n[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]\n{\n";
 const BLOB_PATH: &str = "@model_path/weights/weight.bin";
 const FP16_MAX: f32 = 65504.0;
+/// Output channels one conv may have: the compiler service dies on 65537 (`h17`).
+const MAX_CONV_OUT: usize = 65536;
 /// MILBlob storage dtypes.
 const BLOB_FP16: u32 = 1;
 const BLOB_INT8: u32 = 4;
@@ -91,6 +93,16 @@ impl IoBinding {
             }
         }
         Ok(())
+    }
+
+    /// Byte offset in a surface of element `i` of the graph's row-major data.
+    pub fn offset(&self, i: usize) -> usize {
+        let (ci, si) = if self.transposed {
+            (i % self.channels, i / self.channels)
+        } else {
+            (i / self.spatial, i % self.spatial)
+        };
+        ci * self.row_bytes() + si * 4
     }
 
     /// Reads a surface's bytes back in graph row-major order.
@@ -175,11 +187,12 @@ pub fn rope_table(
     Ok(t)
 }
 
-/// Whether [`lower`] lowers `node` of `graph`: [`check`] passes. State ops, gathers, scatters,
-/// `TopK`, `MoeLinear`, `Conv3d`, `Concat`, `Ln`, `RoundEven`, `Sign` and bicubic or 3-D
-/// upsampling stay on Metal.
+/// Whether placement may put `node` of `graph` on the ANE: [`check`] passes. State ops, gathers,
+/// scatters, `TopK`, `MoeLinear`, `Conv3d`, `Ln`, `RoundEven`, `Sign` and bicubic or 3-D
+/// upsampling stay on Metal; so does `Concat`, which [`lower`] takes only in drafter steps
+/// ([`super::draft`]).
 pub fn supports_op(graph: &Graph, node: &Node) -> bool {
-    check(graph, node).is_ok()
+    !matches!(node.op, Op::Concat { .. }) && check(graph, node).is_ok()
 }
 
 /// How a `Binary` combines its operands, mirroring the CPU executor's order of attempts.
@@ -338,6 +351,10 @@ pub fn check(graph: &Graph, node: &Node) -> Result<(), String> {
                     format!("bias {:?} is not [{o}]", shape(2))
                 })?;
             }
+            need(
+                o <= MAX_CONV_OUT || (s == 1 && ins.len() == 2 && wide_split(o).is_some()),
+                &|| format!("{o} outputs exceed {MAX_CONV_OUT} channels (split only for one unbiased row)"),
+            )?;
             out_is(&[s, o])
         }
         Op::MatMul {
@@ -640,6 +657,18 @@ pub fn check(graph: &Graph, node: &Node) -> Result<(), String> {
             })?;
             out_is(&[d])
         }
+        Op::Concat { axis } => {
+            need(ins.len() >= 2, &|| "Concat of one operand".into())?;
+            need(norm_axis(*axis, os.len())? + 1 == os.len(), &|| {
+                "Concat lowers along the last axis only".into()
+            })?;
+            let s = flat2(shape(0)).0;
+            let c: usize = (0..ins.len()).map(|k| flat2(shape(k)).1).sum();
+            need((0..ins.len()).all(|k| flat2(shape(k)).0 == s), &|| {
+                "Concat operands differ in rows".into()
+            })?;
+            out_is(&[s, c])
+        }
         Op::L2Normalize => {
             arity(1, 1)?;
             out_is(shape(0))
@@ -707,6 +736,7 @@ pub fn lower(
         views: HashMap::new(),
         shapes: HashMap::new(),
         ins: Vec::new(),
+        ropes: HashMap::new(),
         n: 0,
     };
     for (i, node) in graph.nodes.iter().enumerate() {
@@ -724,7 +754,10 @@ pub fn lower(
         let (b, var) = if m.tok && s > 1 && c > 1 {
             (io(v, c, s, true), m.var)
         } else {
-            let (ch, sp) = row_cs(&shape);
+            let (mut ch, mut sp) = row_cs(&shape);
+            if let Some(c) = (sp > MAX_CONV_OUT).then(|| wide_split(ch * sp)).flatten() {
+                (ch, sp) = (c, ch * sp / c);
+            }
             (
                 io(v, ch, sp, false),
                 l.operand(v, Want::Row([1, ch, 1, sp]))?,
@@ -781,6 +814,12 @@ fn io(v: ValueId, channels: usize, spatial: usize, transposed: bool) -> IoBindin
         transposed,
         host: true,
     }
+}
+
+/// Parts a row of `o > MAX_CONV_OUT` elements splits into, each at most [`MAX_CONV_OUT`] long:
+/// the fewest that divide `o` (at most 64).
+fn wide_split(o: usize) -> Option<usize> {
+    (2..=64).find(|c| o % c == 0 && o / c <= MAX_CONV_OUT)
 }
 
 /// `(S, C)` of a value viewed as `[S, C]` (C the last dim).
@@ -864,6 +903,8 @@ struct Lower<'a> {
     views: HashMap<(ValueId, Want), String>,
     shapes: HashMap<String, [usize; 4]>,
     ins: Vec<IoBinding>,
+    /// Rope table inputs by (op, positions, `inv_freq`): equal Ropes share one surface.
+    ropes: HashMap<String, String>,
     n: usize,
 }
 
@@ -1197,35 +1238,66 @@ impl<'a> Lower<'a> {
     /// `x · Wᵀ` for a token-form `x` (`[1, in, 1, S]`) and Linear weight `w` (`[out, in]`).
     fn linear(&mut self, x: &str, w: ValueId) -> Result<String, String> {
         let (o, s) = (self.shape(w)[0], self.sh(x)[3]);
-        let wv = self.linear_weight(w)?;
+        let wv = self.linear_weight(w, 0..o)?;
         Ok(self.conv(x, &wv, [1, o, 1, s], [1, 1], [0; 4], [1, 1], 1))
     }
 
-    /// A Linear weight `[out, in]` as an fp16 `[out, in, 1, 1]` conv weight in the most compact
-    /// form the probe passed.
-    fn linear_weight(&mut self, v: ValueId) -> Result<String, String> {
+    /// [`Self::linear`] of one row `x` with more than [`MAX_CONV_OUT`] outputs: `c` convs of
+    /// `o / c` outputs ([`wide_split`]), stacked in row form as `[1, 1, c, o / c]`.
+    fn wide_linear(&mut self, x: &str, w: ValueId) -> Result<String, String> {
+        let o = self.shape(w)[0];
+        let c = wide_split(o).ok_or_else(|| format!("{o} outputs do not split for the ANE"))?;
+        let n = o / c;
+        let mut parts = Vec::with_capacity(c);
+        for i in 0..c {
+            let wv = self.linear_weight(w, i * n..(i + 1) * n)?;
+            let y = self.conv(x, &wv, [1, n, 1, 1], [1, 1], [0; 4], [1, 1], 1);
+            parts.push(self.reshape(&y, [1, 1, 1, n]));
+        }
+        Ok(self.concat(2, false, &parts))
+    }
+
+    /// Rows `rows` of a Linear weight `[out, in]` as an fp16 `[rows, in, 1, 1]` conv weight in
+    /// the most compact form the probe passed.
+    fn linear_weight(&mut self, v: ValueId, rows: std::ops::Range<usize>) -> Result<String, String> {
         let t = self.weight(v)?;
-        let [o, k] = self.shape(v)[..] else {
+        let [_, k] = self.shape(v)[..] else {
             return Err(format!(
                 "Linear weight {:?} is not [out, in]",
                 self.shape(v)
             ));
         };
+        let o = rows.len();
         let packed = match t {
             Tensor::Mat(m) => m.packed().map(|p| (p.format, &p.map[p.off..])),
             _ => None,
         };
+        let f32_rows = || match t {
+            Tensor::Mat(m) => {
+                let mut out = vec![0.0; o * k];
+                for (r, row) in rows.clone().zip(out.chunks_exact_mut(k)) {
+                    m.decode_row_f32(r, row);
+                }
+                out
+            }
+            _ => t.to_f32()[rows.start * k..rows.end * k].to_vec(),
+        };
         let blockwise = self.info.int4.is_ok() && k % 32 == 0;
+        let nb = k / 32;
         Ok(match packed {
-            Some((QuantFormat::GGUF_Q4_0, raw)) if blockwise => self.blockwise(raw, o, k, 4)?,
-            Some((QuantFormat::GGUF_Q8_0, raw)) if blockwise => self.blockwise(raw, o, k, 8)?,
+            Some((QuantFormat::GGUF_Q4_0, raw)) if blockwise => {
+                self.blockwise(&raw[rows.start * nb * 18..], o, k, 4)?
+            }
+            Some((QuantFormat::GGUF_Q8_0, raw)) if blockwise => {
+                self.blockwise(&raw[rows.start * nb * 34..], o, k, 8)?
+            }
             Some((f, _))
                 if self.info.int8.is_ok()
                     && !matches!(f, QuantFormat::FP32 | QuantFormat::FP16 | QuantFormat::BF16) =>
             {
-                self.affine_int8(&t.to_f32(), o, k)
+                self.affine_int8(&f32_rows(), o, k)
             }
-            _ => self.const_f16(&[o, k, 1, 1], &t.to_f32()),
+            _ => self.const_f16(&[o, k, 1, 1], &f32_rows()),
         })
     }
 
@@ -1341,6 +1413,11 @@ impl<'a> Lower<'a> {
         let out = node.outputs[0];
         let in_shape = ins.first().map(|&v| self.shape(v)).unwrap_or_default();
         match &node.op {
+            Op::Linear if self.shape(ins[1])[0] > MAX_CONV_OUT => {
+                let x = self.tok(ins[0])?;
+                let y = self.wide_linear(&x, ins[1])?;
+                self.set(out, y, false);
+            }
             Op::Linear => {
                 let x = self.tok(ins[0])?;
                 let mut y = self.linear(&x, ins[1])?;
@@ -1433,13 +1510,21 @@ impl<'a> Lower<'a> {
                 self.weight(ins[2])?;
                 let x = self.tok(ins[0])?;
                 let x4 = self.reshape(&x, [heads, d, 1, n]);
-                let t = self.input(IoBinding {
-                    source: IoSource::RopeTable(i),
-                    channels: r,
-                    spatial: n,
-                    transposed: false,
-                    host: true,
-                });
+                let key = format!("{:?}|{:?}|{:?}", node.op, ins[1], ins[2]);
+                let t = match self.ropes.get(&key) {
+                    Some(t) => t.clone(),
+                    None => {
+                        let t = self.input(IoBinding {
+                            source: IoSource::RopeTable(i),
+                            channels: r,
+                            spatial: n,
+                            transposed: false,
+                            host: true,
+                        });
+                        self.ropes.insert(key, t.clone());
+                        t
+                    }
+                };
                 let h = r / 2;
                 let cos = self.slice(&t, [0; 4], [1, h, 1, n]);
                 let sin = self.slice(&t, [0, h, 0, 0], [1, r, 1, n]);
@@ -1761,6 +1846,11 @@ impl<'a> Lower<'a> {
                     let y = self.slice(&x, b, e);
                     self.set(out, y, false);
                 }
+            }
+            Op::Concat { .. } => {
+                let parts = ins.iter().map(|&v| self.tok(v)).collect::<Result<Vec<_>, _>>()?;
+                let y = self.concat(1, false, &parts);
+                self.set(out, y, true);
             }
             Op::Tile { reps } => {
                 let (x, p) = self.row(ins[0])?;

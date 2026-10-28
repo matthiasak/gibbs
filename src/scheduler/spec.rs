@@ -70,6 +70,16 @@ pub trait Drafter: Send + Sync {
     fn online_updates(&self) -> Option<u64> {
         None
     }
+    /// Whether the drafter also drafts on the ANE ([`KTuner::place`] times both devices):
+    /// `Some(Ok((id, rel_err)))` with its key in the host's decisions and the relative RMS error
+    /// of its ANE logits against Metal's, `Some(Err(why))` when it stays on Metal, `None` when
+    /// placement keeps it on one device.
+    fn ane(&self) -> Option<Result<(String, f32), String>> {
+        None
+    }
+    /// Drafts on the ANE (`on`) or on Metal from the next propose; `settled`: for good, so
+    /// sequence states stop keeping the other device's catch-up.
+    fn set_ane(&self, _on: bool, _settled: bool) {}
 }
 
 /// One sequence's speculative state, tied to the drafter it started with.
@@ -118,6 +128,10 @@ impl SpecSeq {
 
     pub(super) fn max_k(&self) -> usize {
         self.drafter.max_k()
+    }
+
+    pub(super) fn drafter(&self) -> &dyn Drafter {
+        &*self.drafter
     }
 }
 
@@ -487,6 +501,25 @@ pub struct KTuner {
     every: usize,
     turn: usize,
     probe: Option<Probe>,
+    /// The drafter's device was placed ([`Self::place`]); the Metal-vs-ANE trial while it runs,
+    /// and its outcome until the next [`Self::place`] applies it.
+    placed: bool,
+    trial: Option<Trial>,
+    settle: Option<bool>,
+}
+
+/// Steps of the Metal-vs-ANE drafter trial ([`KTuner::place`]), and of each device's turn.
+const TRIAL_STEPS: usize = 64;
+const TRIAL_TURN: usize = 8;
+
+/// A running Metal-vs-ANE trial: the drafter's label and key, its recorded steps, and each
+/// turn's measurement (`true`: ANE).
+struct Trial {
+    label: String,
+    id: String,
+    rel_err: f32,
+    step: usize,
+    turns: Vec<(bool, Acc)>,
 }
 
 /// Steps, tokens and seconds summed over a measurement.
@@ -560,8 +593,15 @@ impl KTuner {
                 avg_accept: vec![(0.0, 0.0); max_k + 1],
                 sweep: vec![Acc::default(); max_k + 1],
                 every: MIN_EXPLORE,
+                placed: self.placed,
+                trial: self.trial.take(),
+                settle: self.settle,
                 ..Self::default()
             };
+        }
+        // Both devices draft at one `k` while the trial times them.
+        if self.trial.is_some() {
+            return max_k;
         }
         let Some(cur) = self.cur else {
             // Measure plain decoding, then every drafting k.
@@ -631,6 +671,13 @@ impl KTuner {
         knobs: &DraftKnobs,
     ) -> Option<String> {
         let secs = took.as_secs_f64().max(1e-9);
+        if let Some(t) = &mut self.trial {
+            return t.record(tokens, (accepted, drafted), secs).map(|(msg, ane)| {
+                self.trial = None;
+                self.settle = Some(ane);
+                msg
+            });
+        }
         let before = self.cur;
         match (self.cur, self.probe.as_mut()) {
             (None, _) => {
@@ -699,6 +746,52 @@ impl KTuner {
             )),
             _ => None,
         }
+    }
+
+    /// Places drafter `d` before a step: a drafter that also drafts on the ANE ([`Drafter::ane`])
+    /// takes the device stored in the host's decisions under its id, else alternates Metal and
+    /// ANE every [`TRIAL_TURN`] recorded steps over the first [`TRIAL_STEPS`] (at the largest
+    /// `k`, the first step of each turn untimed: it catches the device's state up) and keeps the
+    /// one with more output tokens per second, storing that choice. Returns a line to log.
+    pub fn place(&mut self, d: &dyn Drafter) -> Option<String> {
+        if let Some(t) = &self.trial {
+            d.set_ane(t.step / TRIAL_TURN % 2 == 1, false);
+            return None;
+        }
+        if let Some(ane) = self.settle.take() {
+            d.set_ane(ane, true);
+            return None;
+        }
+        if std::mem::replace(&mut self.placed, true) {
+            return None;
+        }
+        let label = d.label();
+        let (id, rel_err) = match d.ane()? {
+            Ok(a) => a,
+            Err(why) => return Some(format!("drafter {label}: drafts on Metal: {why}")),
+        };
+        let key = format!("drafter {id}");
+        let stored = crate::graph::program::with_ane_decisions(false, |m| m.get(&key).copied());
+        if let Some(s) = stored {
+            d.set_ane(s.chosen, true);
+            return Some(format!(
+                "drafter {label}: drafts on {} (stored: Metal {:.3} ms/token, ANE {:.3} ms/token)",
+                if s.chosen { "ANE" } else { "Metal" },
+                s.metal_ms,
+                s.ane_ms
+            ));
+        }
+        d.set_ane(false, false);
+        self.trial = Some(Trial {
+            label: label.clone(),
+            id,
+            rel_err,
+            step: 0,
+            turns: Vec::new(),
+        });
+        Some(format!(
+            "drafter {label}: timing Metal and ANE in turns of {TRIAL_TURN} steps over {TRIAL_STEPS} steps"
+        ))
     }
 
     /// Tokens per second of `k`: EWMA tokens per step over EWMA seconds per step.
@@ -795,6 +888,78 @@ impl KTuner {
                 tokens_per_forward: self.avg[k].0,
             })
             .collect()
+    }
+}
+
+impl Trial {
+    /// Records a step of `tokens` (`accepted` of `drafted` drafts) in `secs`; at the end, the log
+    /// line and whether the ANE won (stored under `drafter <id>` in the host's ANE decisions, ms
+    /// per output token).
+    fn record(
+        &mut self,
+        tokens: usize,
+        (accepted, drafted): (usize, usize),
+        secs: f64,
+    ) -> Option<(String, bool)> {
+        let ane = self.step / TRIAL_TURN % 2 == 1;
+        if self.step % TRIAL_TURN == 0 {
+            self.turns.push((ane, Acc::default()));
+        } else if let Some((_, a)) = self.turns.last_mut() {
+            a.steps += 1;
+            a.tokens += tokens;
+            a.accepted += accepted;
+            a.drafted += drafted;
+            a.secs += secs;
+        }
+        self.step += 1;
+        if self.step < TRIAL_STEPS {
+            return None;
+        }
+        let rate = |a: &Acc| a.tokens as f64 / a.secs.max(1e-9);
+        let total = |dev: bool| {
+            let mut t = Acc::default();
+            for (_, a) in self.turns.iter().filter(|(d, _)| *d == dev) {
+                t.steps += a.steps;
+                t.tokens += a.tokens;
+                t.accepted += a.accepted;
+                t.drafted += a.drafted;
+                t.secs += a.secs;
+            }
+            t
+        };
+        let (metal, on_ane) = (total(false), total(true));
+        let won = rate(&on_ane) > rate(&metal);
+        let ms = |a: &Acc| 1e3 * a.secs / a.tokens.max(1) as f64;
+        let decision = crate::graph::program::AneDecision {
+            metal_ms: ms(&metal),
+            ane_ms: ms(&on_ane),
+            rel_err: self.rel_err,
+            chosen: won,
+        };
+        if !cfg!(test) {
+            let key = format!("drafter {}", self.id);
+            crate::graph::program::with_ane_decisions(true, |m| m.insert(key, decision));
+        }
+        let turns: Vec<String> = self
+            .turns
+            .iter()
+            .map(|(d, a)| format!("{} {:.1}", if *d { "ANE" } else { "Metal" }, rate(a)))
+            .collect();
+        Some((
+            format!(
+                "drafter {}: keeps {} (tok/s Metal {:.1}, ANE {:.1}; ms/step Metal {:.2}, ANE {:.2}; acceptance Metal {:.2}, ANE {:.2}; turns {})",
+                self.label,
+                if won { "ANE" } else { "Metal" },
+                rate(&metal),
+                rate(&on_ane),
+                1e3 * metal.secs / metal.steps.max(1) as f64,
+                1e3 * on_ane.secs / on_ane.steps.max(1) as f64,
+                metal.accepted as f64 / metal.drafted.max(1) as f64,
+                on_ane.accepted as f64 / on_ane.drafted.max(1) as f64,
+                turns.join(", ")
+            ),
+            won,
+        ))
     }
 }
 
@@ -903,6 +1068,92 @@ mod tests {
         // wrong draft at 8 drops the next one. 3: propose + run ahead; the bonus at 11 is not the
         // one assumed. 4: propose again.
         assert_eq!(calls, [2, 3, 5, 7]);
+    }
+
+    /// A `Plain` drafter placed on the ANE overlaps: drafts proposed on a fork during the target's
+    /// verify on Metal replace later proposes, and greedy output equals plain decoding. Needs the
+    /// ANE and SmolLM2-135M-Instruct under `disk/` (drafting for itself).
+    #[test]
+    #[ignore]
+    fn plain_drafter_on_ane_overlaps_and_matches_plain_decoding() {
+        use crate::hardware::{Device, PlacementMode};
+        use crate::model::native::PrepareCtx;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let hub = crate::model::hub::HuggingFaceHub::with_cache_dir("disk".into());
+        let a = hub.locate_model("HuggingFaceTB/SmolLM2-135M-Instruct");
+        if a.weights_path.is_none() {
+            eprintln!("SKIP: SmolLM2-135M-Instruct is not under disk/");
+            return;
+        }
+        let reg = crate::arch::registry().unwrap();
+        let lm = crate::runtime::lm::load(&a, &reg, None, PlacementMode::Pin(Device::Metal)).unwrap();
+        let m = ExecutableModel(lm);
+        let plain = crate::runtime::draft::load_drafter(&a, &a, PlacementMode::Auto).unwrap();
+        assert!(matches!(plain.ane(), Some(Ok(_))), "{:?}", plain.ane().map(|r| r.map(|_| ())));
+        assert!(!plain.overlaps(), "on Metal it does not overlap");
+        plain.set_ane(true, true);
+        assert!(plain.overlaps());
+        /// Counts proposes on the decode thread (the overlapped ones run on another).
+        struct Counted(Arc<dyn Drafter>, std::thread::ThreadId, AtomicUsize);
+        impl Drafter for Counted {
+            fn label(&self) -> String {
+                self.0.label()
+            }
+            fn tap_layers(&self) -> Vec<usize> {
+                self.0.tap_layers()
+            }
+            fn new_state(&self) -> DraftState {
+                self.0.new_state()
+            }
+            fn propose(
+                &self,
+                st: &mut DraftState,
+                tokens: &[u32],
+                hidden: &[f32],
+                k: usize,
+                pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
+            ) -> Result<Vec<u32>, String> {
+                if k > 0 && std::thread::current().id() == self.1 {
+                    self.2.fetch_add(1, Relaxed);
+                }
+                self.0.propose(st, tokens, hidden, k, pick)
+            }
+            fn fork_state(&self, st: &DraftState) -> Option<DraftState> {
+                self.0.fork_state(st)
+            }
+            fn overlaps(&self) -> bool {
+                self.0.overlaps()
+            }
+        }
+        let d = Arc::new(Counted(plain, std::thread::current().id(), AtomicUsize::new(0)));
+        let tok = m.0.tokenizer();
+        let prompt = tok.encode("The three primary colors are red, yellow and");
+        let fresh = || {
+            let (ids, mut st) = m.prepare(prompt.clone(), &[], &PrepareCtx::default()).unwrap();
+            m.prefill_logits(&ids[..ids.len() - 1], 0, &mut st).unwrap();
+            st
+        };
+        let n = 48;
+        let (mut want, mut st) = (prompt.clone(), fresh());
+        while want.len() < prompt.len() + n {
+            let last = *want.last().unwrap();
+            let (t, _) = m.step_token_with_kv(&want, last, want.len(), 0.0, 1.0, None, &mut st).unwrap();
+            want.push(t);
+        }
+        let mut kv = fresh();
+        let mut spec = SpecSeq::start(&m, d.clone(), &mut kv, 7).unwrap();
+        let (mut all, mut steps) = (prompt.clone(), 0);
+        while all.len() < prompt.len() + n {
+            let s = decode(&m, &mut spec, &all, &mut kv, 0.0, 1.0, 0, 4, 0, None).unwrap();
+            all.extend(s.tokens);
+            steps += 1;
+        }
+        all.truncate(want.len());
+        assert_eq!(tok.decode(&all), tok.decode(&want));
+        assert_eq!(all, want, "greedy output changed");
+        let proposed = d.2.load(Relaxed);
+        eprintln!("{steps} steps, {proposed} proposed on the decode thread, {} prefetched", steps - proposed);
+        assert!(proposed < steps, "no step used drafts proposed during a verify");
     }
 
     /// A sparse draft (candidate ids only, over a support that misses target tokens and adds one
@@ -1015,5 +1266,68 @@ mod tests {
         let (rate, best, _) = run(|k, _| (1 + k * 7 / 10, 100.0 + 10.0 * k as f64));
         assert_eq!(best, Some(3));
         assert!(rate > 20.0, "{rate}");
+    }
+
+    /// A drafter compiled for Metal and the ANE drafts at the largest `k` on each device in turns
+    /// of 8 recorded steps, then settles on the faster one (the first step of each turn untimed)
+    /// before the `k` sweep starts.
+    #[test]
+    fn trial_alternates_devices_then_keeps_the_faster() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        #[derive(Default)]
+        struct TwoDevices {
+            on: AtomicBool,
+            settled: AtomicBool,
+        }
+        impl Drafter for TwoDevices {
+            fn label(&self) -> String {
+                "two".into()
+            }
+            fn tap_layers(&self) -> Vec<usize> {
+                Vec::new()
+            }
+            fn new_state(&self) -> DraftState {
+                Box::new(())
+            }
+            fn propose(
+                &self,
+                _: &mut DraftState,
+                _: &[u32],
+                _: &[f32],
+                _: usize,
+                _: &mut dyn FnMut(DraftLogits<'_>) -> u32,
+            ) -> Result<Vec<u32>, String> {
+                Ok(Vec::new())
+            }
+            fn ane(&self) -> Option<Result<(String, f32), String>> {
+                Some(Ok(("unit-test two-device drafter".into(), 0.0)))
+            }
+            fn set_ane(&self, on: bool, settled: bool) {
+                self.on.store(on, Relaxed);
+                self.settled.store(settled, Relaxed);
+            }
+        }
+        let (d, mut t, knobs) = (TwoDevices::default(), KTuner::default(), DraftKnobs::default());
+        assert!(t.place(&d).unwrap().contains("timing Metal and ANE"));
+        let mut seen = Vec::new();
+        let mut msg = None;
+        for step in 0..TRIAL_STEPS {
+            assert!(t.place(&d).is_none());
+            let ane = d.on.load(Relaxed);
+            seen.push(ane);
+            assert_eq!(t.choose_with_knobs(4, &knobs), 4, "step {step}");
+            // The ANE turns run 3 tokens a step, Metal 2, in equal time; turn starts are slow.
+            let ms = if step % TRIAL_TURN == 0 { 500 } else { 10 };
+            let tokens = if ane { 3 } else { 2 };
+            msg = t.record_with_knobs(4, tokens, 4, tokens - 1, Duration::from_millis(ms), &knobs);
+        }
+        let want: Vec<bool> = (0..TRIAL_STEPS).map(|s| s / TRIAL_TURN % 2 == 1).collect();
+        assert_eq!(seen, want);
+        let msg = msg.expect("the trial reports its choice");
+        assert!(msg.contains("keeps ANE") && msg.contains("Metal 200.0, ANE 300.0"), "{msg}");
+        assert!(t.place(&d).is_none());
+        assert!(d.on.load(Relaxed) && d.settled.load(Relaxed));
+        // The k sweep follows (plain decoding first).
+        assert_eq!(t.choose_with_knobs(4, &knobs), 0);
     }
 }
