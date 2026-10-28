@@ -1279,6 +1279,25 @@ impl Runtime {
         Ok(pso)
     }
 
+    /// The generated multi-row packed GEMV (`codegen::gemv_packed_mr`) for `f` at `mb` x rows per
+    /// threadgroup, compiled on first use (cached under `(0x80 | mb, rows_per_sg)`, a key the m = 1
+    /// GEMVs never use).
+    fn gen_mr_pso(&self, f: QuantFormat, mb: usize) -> Result<ComputePipelineState, String> {
+        let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
+        let p = crate::graph::codegen::GemvParams::default();
+        let key = (c.format, 0x80 | mb as u8, p.rows_per_sg as u8);
+        if let Some(pso) = self.gen_psos.lock().get(&key) {
+            return Ok(pso.clone());
+        }
+        let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+        src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
+        src.push_str(&crate::graph::codegen::gemv_packed_mr(c, p, mb));
+        let name = crate::graph::codegen::gemv_packed_mr_name(c, p, mb);
+        let pso = self.compile_generated(&src, &name)?;
+        self.gen_psos.lock().insert(key, pso.clone());
+        Ok(pso)
+    }
+
     /// Compiles one generated kernel `name` from `src` (fast-math off, as for the hand kernels).
     fn compile_generated(&self, src: &str, name: &str) -> Result<ComputePipelineState, String> {
         let opts = CompileOptions::new();
@@ -3339,7 +3358,32 @@ impl Session {
                 format,
                 variant,
             } => {
-                let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
+                // A few x rows (verify, short prefill) share each weight read: up to `GEMV_MR` rows per
+                // threadgroup through the generated multi-row kernel, for every codec format.
+                // `m` split evenly into the fewest groups of at most `gemv_mr_max` rows.
+                let mr = match format.codec_format().and_then(|q| Some((q, codec::codec(q)?))) {
+                    Some((q, c)) if m >= 2 => {
+                        let mb = m.div_ceil(m.div_ceil(crate::graph::codegen::gemv_mr_max(c)));
+                        Some((rt.gen_mr_pso(q, mb)?, mb))
+                    }
+                    _ => None,
+                };
+                let (pso, rows_per_tg, threads, groups_y) = match mr {
+                    Some((pso, mb)) => {
+                        use crate::graph::codegen::{gemv_rows_per_tg, gemv_threads};
+                        let p = crate::graph::codegen::GemvParams::default();
+                        (
+                            pso,
+                            gemv_rows_per_tg(p) as u64,
+                            gemv_threads(p) as u64,
+                            m.div_ceil(mb) as u64,
+                        )
+                    }
+                    None => {
+                        let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
+                        (pso, rows_per_tg, threads, m as u64)
+                    }
+                };
                 enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
                 bind(1, x);
@@ -3366,7 +3410,7 @@ impl Session {
                     bind(5, s.out);
                 }
                 enc.dispatch_thread_groups(
-                    MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
+                    MTLSize::new((rows as u64).div_ceil(rows_per_tg), groups_y, 1),
                     MTLSize::new(threads, 1, 1),
                 );
             }

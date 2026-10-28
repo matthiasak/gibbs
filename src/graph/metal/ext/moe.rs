@@ -781,7 +781,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::super::testutil::{both, rand, rel_err, rt};
     use super::super::super::Session;
     use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, Weights};
@@ -861,7 +861,7 @@ mod tests {
 
     /// Random blocks of `f` that decode to finite, moderate values on the CPU (formats with unknown
     /// scale fields, like the repacked ones, get bad blocks redrawn).
-    fn sane_blocks(f: Q, n_blocks: usize, seed: u64) -> Vec<u8> {
+    pub(crate) fn sane_blocks(f: Q, n_blocks: usize, seed: u64) -> Vec<u8> {
         let (_, _, dequant) = crate::model::layers::gguf_block_codec(f).expect("CPU dequantizer");
         let be = crate::graph::codec::codec(f).expect("codec").block_elems as usize;
         let mut out = Vec::new();

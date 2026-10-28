@@ -1223,8 +1223,15 @@ fn gemv_matches_cpu_for_every_packed_format() {
         let exp = 9 + (next() % 8) as u16;
         (((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16).to_le_bytes()
     };
-    // m = 3 runs the GEMV kernels; m = 20 (>= 16) the batched GEMM (hand kernels, or codec expansion + f32 GEMM).
-    for (f, m) in formats.into_iter().flat_map(|f| [(f, 3usize), (f, 20)]) {
+    // 2 <= m < 16 runs the multi-row GEMV (`GEMV_MR` x rows per threadgroup: whole, partial and
+    // several groups); m = 20 (>= 16) the batched GEMM (hand kernels, or codec expansion + f32 GEMM).
+    let ms = [2usize, 3, 4, 5, 8, 9, 15, 20];
+    // Every other codec format with random blocks that decode finite.
+    let all: Vec<QuantFormat> = formats
+        .into_iter()
+        .chain(crate::graph::codec::formats().into_iter().filter(|f| !formats.contains(f)))
+        .collect();
+    for (f, m) in all.into_iter().flat_map(|f| ms.map(|m| (f, m))) {
         let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
         let scale_at: &[usize] = match f {
             QuantFormat::GGUF_Q4_1
@@ -1242,10 +1249,14 @@ fn gemv_matches_cpu_for_every_packed_format() {
         let mut raw: Vec<u8> = (0..n * (k / be) * bb)
             .map(|_| (next() >> 4) as u8)
             .collect();
-        for blk in raw.chunks_exact_mut(bb) {
-            for &o in scale_at {
-                blk[o..o + 2].copy_from_slice(&f16(&mut next));
+        if formats.contains(&f) {
+            for blk in raw.chunks_exact_mut(bb) {
+                for &o in scale_at {
+                    blk[o..o + 2].copy_from_slice(&f16(&mut next));
+                }
             }
+        } else {
+            raw = ext::moe::tests::sane_blocks(f, n * k / be, m as u64);
         }
         let mut g = Graph::new();
         let x = g.input("x", vec![m, k], DType::F32);
@@ -1279,7 +1290,7 @@ fn gemv_matches_cpu_for_every_packed_format() {
         // Every variant of the format (hand and generated at each rows/simdgroup); formats with
         // no variant choice (NVFP4) run their one kernel.
         let variants = WeightFormat::of_quant(f).gemv_variants();
-        let variants: Vec<Option<GemvVariant>> = if variants.is_empty() {
+        let variants: Vec<Option<GemvVariant>> = if variants.is_empty() || !matches!(m, 3 | 20) {
             vec![None]
         } else {
             variants.into_iter().map(Some).collect()
