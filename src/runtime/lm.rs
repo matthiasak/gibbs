@@ -334,10 +334,7 @@ pub fn load_with_ctx(
     mode: PlacementMode,
     ctx: Option<usize>,
 ) -> Result<Arc<dyn NativeLm>, String> {
-    let on_metal = match mode {
-        PlacementMode::Pin(d) => d == Device::Metal,
-        PlacementMode::Auto => crate::hardware::default_device() == Device::Metal,
-    };
+    let on_metal = crate::graph::avenues::resolved_backend(mode) == Device::Metal;
     crate::arch::load::gated(
         on_metal,
         || {
@@ -744,7 +741,11 @@ impl SpecLm {
             let mut out = if rows == 1 && head == "last" && seq.taps.is_empty() && nm == 0 {
                 p.run(inputs)?
             } else {
-                p.run_reshaped(&inst.graph, inputs)?
+                // Prefill passes may offload regions to the ANE: every one under `--backend
+                // ane`, full chunks under `auto`; verify passes (all rows' logits) never do.
+                let ane = self.mode == PlacementMode::Pin(Device::Ane);
+                let offload = mode == Mode::Last && (ane || rows == self.rt.prefill_rows);
+                p.run_reshaped(&inst.graph, inputs, offload)?
             };
             // Moved out, not copied: a vocabulary row per decode token.
             match out
@@ -836,7 +837,9 @@ impl SpecLm {
                         ),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let res = p.run_reshaped(&inst.graph, inputs)?;
+                let ane = self.mode == PlacementMode::Pin(Device::Ane);
+                let offload = ane || e - at == self.rt.prefill_rows;
+                let res = p.run_reshaped(&inst.graph, inputs, offload)?;
                 if e == ids.len() {
                     let i = inst
                         .output_index(out)

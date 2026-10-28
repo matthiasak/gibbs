@@ -3788,7 +3788,7 @@ mod tests {
         let last = app.history.last().unwrap();
         if sched.model().unwrap().llm_backend() == crate::hardware::Device::Metal {
             assert_eq!(last.kind, Kind::Text);
-            assert!(last.output.ends_with("100% Metal"), "{}", last.output);
+            assert!(last.output.contains("100% accelerated (Metal "), "{}", last.output);
         } else {
             assert_eq!(last.kind, Kind::Error);
             assert!(last.output.contains("CPU node"), "{}", last.output);

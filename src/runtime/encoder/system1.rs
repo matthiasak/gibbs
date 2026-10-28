@@ -4,6 +4,7 @@
 //! between embeddings, in a single forward pass.
 
 use super::SpecEncoder;
+#[cfg(test)]
 use crate::hardware::Device;
 use crate::model::hub::HuggingFaceHub;
 use serde::{Deserialize, Serialize};
@@ -188,8 +189,12 @@ pub struct JevSystem1Model {
 }
 impl JevSystem1Model {
     /// Fetches config.json, tokenizer.json and model.safetensors from `repo_id` and builds the
-    /// encoder spec on `device`.
-    pub fn load(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
+    /// encoder spec under `mode` (a device pins it).
+    pub fn load(
+        hub: &HuggingFaceHub,
+        repo_id: &str,
+        mode: impl Into<crate::hardware::PlacementMode>,
+    ) -> Result<Self, String> {
         let config_path = hub.fetch_file(repo_id, "config.json")?;
         let tok_path = hub.fetch_file(repo_id, "tokenizer.json")?;
         let st_path = hub.fetch_file(repo_id, "model.safetensors")?;
@@ -205,7 +210,7 @@ impl JevSystem1Model {
             is_cached: true,
             ..Default::default()
         };
-        let encoder = SpecEncoder::load(&artifacts, Some(&family), device, &head)
+        let encoder = SpecEncoder::load(&artifacts, Some(&family), mode, &head)
             .map_err(|e| format!("{repo_id}: {e}"))?;
         let mut tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| format!("load {}: {e}", tok_path.display()))?;

@@ -598,7 +598,8 @@ fn fasttext() {
     write_fasttext(&path);
     golden(case, TOL, |_| {
         // runner: host-only (no device argument); the same model is checked once per device.
-        let c = SequenceClassifier::from_fasttext("gibbs-golden/fasttext", &path)
+        let dev = gibbs_engine::hardware::Device::Cpu;
+        let c = SequenceClassifier::from_fasttext("gibbs-golden/fasttext", &path, dev)
             .unwrap_or_else(|e| panic!("{case}: {e}"));
         let mut out = Out::default();
         for (i, text) in ["the cat sat", "a dog sat on the mat"].iter().enumerate() {

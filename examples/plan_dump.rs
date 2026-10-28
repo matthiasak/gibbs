@@ -101,7 +101,8 @@ fn main() -> Result<(), String> {
             .map_or("?".into(), |p| p.display().to_string())
     );
     std::env::set_var("GIBBS_PLAN_DUMP_CPU", ctx.to_string());
-    let err = match load_for_bench(&artifacts, &reencode) {
+    let metal = gibbs_engine::hardware::PlacementMode::Pin(gibbs_engine::hardware::Device::Metal);
+    let err = match load_for_bench(&artifacts, &reencode, metal) {
         Ok(_) => return Err("the model loaded without a Metal compile: nothing to dump".into()),
         Err(e) => e,
     };

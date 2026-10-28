@@ -15,10 +15,10 @@ pub fn run(g: &mut Graph) {
     }
 }
 
-/// Whether `op` at the reduced-precision `dtype` runs on the GPU after [`run`]: its F32 form lowers.
-pub fn can_cast(op: &Op, dtype: DType) -> bool {
+/// Whether `op` at the reduced-precision `dtype` runs on `device` after [`run`]: its F32 form lowers.
+pub fn can_cast(op: &Op, dtype: DType, device: Device) -> bool {
     matches!(dtype, DType::F16 | DType::BF16)
-        && crate::graph::placement::device_supports_op(Device::Metal, op, DType::F32)
+        && crate::graph::placement::device_supports_op(device, op, DType::F32)
 }
 
 /// Retypes weights whose quant format has no GPU kernel to F32. The Metal weight upload dequantizes
@@ -63,6 +63,6 @@ mod tests {
         assert_eq!(g.value(x).dtype, DType::F32);
         assert_eq!(g.value(y).dtype, DType::F32);
         assert_eq!(g.value(w).dtype, DType::BF16);
-        assert!(can_cast(&Op::RmsNorm { eps: 1e-6 }, DType::F16));
+        assert!(can_cast(&Op::RmsNorm { eps: 1e-6 }, DType::F16, Device::Metal));
     }
 }

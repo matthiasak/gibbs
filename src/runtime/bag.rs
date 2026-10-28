@@ -246,8 +246,10 @@ fn vars(rows: usize) -> [(&'static str, Val); 1] {
 }
 
 impl BagClassifier {
-    /// Compiles family `family`'s `classify` component over `m`'s tables on `dev`.
-    pub fn new(family: &str, m: BagModel, dev: Device) -> Result<Self, String> {
+    /// Compiles family `family`'s `classify` component over `m`'s tables under `mode`.
+    pub fn new(family: &str, m: BagModel, mode: impl Into<PlacementMode>) -> Result<Self, String> {
+        let mode = mode.into();
+        let dev = crate::graph::avenues::resolved_backend(mode);
         let spec = crate::arch::registry()?.spec(family, &Signals::default())?;
         let BagModel {
             vocab,
@@ -277,8 +279,7 @@ impl BagClassifier {
         let shapes = ShapeCache::new(COMPONENT);
         let v = vars(1);
         let first = shapes.get(&v, || build(&spec, COMPONENT, &cfg, &src, &v))?;
-        let program =
-            GraphProgram::compile_reshapable(first.graph.clone(), w, PlacementMode::Pin(dev))?;
+        let program = GraphProgram::compile_reshapable(first.graph.clone(), w, mode)?;
         if dev == Device::Metal
             && (program.primary_device() != dev || program.cpu_node_count() > 0)
         {
@@ -335,8 +336,7 @@ impl BagClassifier {
         };
         let scores = self
             .program
-            .lock()
-            .run_reshaped(&inst.graph, vec![input])?
+            .lock().run_reshaped(&inst.graph, vec![input], true)?
             .into_iter()
             .nth(inst.output_index("scores").ok_or("no `scores` output")?)
             .ok_or("missing `scores` output")?

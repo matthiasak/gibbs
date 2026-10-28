@@ -8,16 +8,16 @@ use crate::hardware::Device;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Avenue {
-    MetalKernel,
+    DeviceKernel,
     DtypeAdapt,
 }
 
 impl Avenue {
-    pub const ALL: [Avenue; 2] = [Avenue::MetalKernel, Avenue::DtypeAdapt];
+    pub const ALL: [Avenue; 2] = [Avenue::DeviceKernel, Avenue::DtypeAdapt];
 
     pub fn name(self) -> &'static str {
         match self {
-            Avenue::MetalKernel => "metal-kernel",
+            Avenue::DeviceKernel => "device-kernel",
             Avenue::DtypeAdapt => "dtype-adapt",
         }
     }
@@ -53,8 +53,10 @@ impl NodeReport {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct GpuReport {
+    /// The device the nodes were placed on.
+    pub device: Device,
     pub total_nodes: usize,
     pub unlowered: Vec<NodeReport>,
 }
@@ -62,9 +64,10 @@ pub struct GpuReport {
 impl GpuReport {
     pub fn error(&self) -> String {
         let mut s = format!(
-            "gpu-only: {} of {} graph nodes have no Metal lowering\n",
+            "gpu-only: {} of {} graph nodes have no {:?} lowering\n",
             self.unlowered.len(),
-            self.total_nodes
+            self.total_nodes,
+            self.device
         );
         for n in &self.unlowered {
             s.push_str(&format!("  {} [{} {:?}]\n", n.node, n.op, n.dtype));
@@ -79,11 +82,11 @@ impl GpuReport {
     }
 }
 
-fn metal_kernel(op: &Op, dtype: DType) -> Verdict {
-    if crate::graph::placement::device_supports_op(Device::Metal, op, dtype) {
-        Verdict::Lowered("hand-written Metal kernel")
+fn device_kernel(op: &Op, dtype: DType, device: Device) -> Verdict {
+    if crate::graph::placement::device_supports_op(device, op, dtype) {
+        Verdict::Lowered("hand-written device kernel")
     } else {
-        Verdict::Rejected(format!("no Metal kernel for {} at {:?}", op.name(), dtype))
+        Verdict::Rejected(format!("no {device:?} kernel for {} at {:?}", op.name(), dtype))
     }
 }
 
@@ -92,12 +95,12 @@ fn load_time_dequant(op: &Op, dtype: DType) -> bool {
     matches!(op, Op::Linear | Op::Embedding | Op::Megakernel(_)) && matches!(dtype, DType::Quant(_))
 }
 
-fn dtype_adapt(op: &Op, dtype: DType) -> Verdict {
+fn dtype_adapt(op: &Op, dtype: DType, device: Device) -> Verdict {
     if load_time_dequant(op, dtype) {
         return Verdict::Lowered("load-time dequantize/re-encode per policy");
     }
     if matches!(dtype, DType::F16 | DType::BF16)
-        && crate::graph::passes::dtype_adapt::can_cast(op, dtype)
+        && crate::graph::passes::dtype_adapt::can_cast(op, dtype, device)
     {
         return Verdict::Lowered("GPU Cast around the F32 kernel");
     }
@@ -106,13 +109,13 @@ fn dtype_adapt(op: &Op, dtype: DType) -> Verdict {
     ))
 }
 
-/// Tries the avenues in order and stops at the first `Lowered`.
-pub fn explore_node(name: &str, op: &Op, dtype: DType) -> NodeReport {
+/// Tries the avenues for `device` in order and stops at the first `Lowered`.
+pub fn explore_node(name: &str, op: &Op, dtype: DType, device: Device) -> NodeReport {
     let mut attempts = Vec::with_capacity(Avenue::ALL.len());
     for avenue in Avenue::ALL {
         let verdict = match avenue {
-            Avenue::MetalKernel => metal_kernel(op, dtype),
-            Avenue::DtypeAdapt => dtype_adapt(op, dtype),
+            Avenue::DeviceKernel => device_kernel(op, dtype, device),
+            Avenue::DtypeAdapt => dtype_adapt(op, dtype, device),
         };
         let done = matches!(verdict, Verdict::Lowered(_));
         attempts.push(Attempt { avenue, verdict });
@@ -128,9 +131,11 @@ pub fn explore_node(name: &str, op: &Op, dtype: DType) -> NodeReport {
     }
 }
 
-/// The device a placement mode runs on: the pinned one, or the default GPU when `Auto`.
+/// The primary device a placement mode runs on: the pinned one (Metal for `ane`, which offloads
+/// regions from it), or the default GPU when `Auto`.
 pub fn resolved_backend(mode: crate::hardware::PlacementMode) -> Device {
     match mode {
+        crate::hardware::PlacementMode::Pin(Device::Ane) => Device::Metal,
         crate::hardware::PlacementMode::Pin(d) => d,
         crate::hardware::PlacementMode::Auto => crate::hardware::default_device(),
     }

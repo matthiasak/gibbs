@@ -39,8 +39,10 @@ struct Cli {
     #[arg(long)]
     quant: Option<String>,
 
-    /// Compute backend: auto (Metal on Apple Silicon, CPU only where no GPU exists), metal, or
-    /// cpu. `cpu` is the explicit opt-in to the CPU executor.
+    /// Compute backend: auto (Metal on Apple Silicon with ANE regions where measured faster, CPU
+    /// only where no GPU exists), metal (never the ANE), ane (every ANE-lowerable region of every
+    /// non-decode graph on the ANE, the rest on Metal), cuda, rocm, xla, intel-xpu, or cpu. `cpu`
+    /// is the explicit opt-in to the CPU executor.
     #[arg(long, default_value = "auto")]
     backend: String,
 
@@ -350,7 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.explain_placement {
         let hub = HuggingFaceHub::new().with_storage(StorageBackend::from_uri(&cli.storage)?);
-        let code = gibbs_engine::bench::explain_placement(&hub, &cli.model)?;
+        let code = gibbs_engine::bench::explain_placement(&hub, &cli.model, cli.backend.parse()?)?;
         std::process::exit(code);
     }
     if cli.arch_dump {
@@ -399,18 +401,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Probe Hardware
     let hw = HardwareCapability::probe_system();
-    let mut placement: gibbs_engine::hardware::PlacementMode = cli.backend.parse()?;
-    // GPU-only by default: `auto` resolves to Metal wherever it exists; the CPU is an explicit `--backend cpu`.
-    if placement == gibbs_engine::hardware::PlacementMode::Auto
-        && gibbs_engine::hardware::default_device() == Device::Metal
-    {
-        placement = gibbs_engine::hardware::PlacementMode::Pin(Device::Metal);
-    }
-    let backend = match placement {
-        gibbs_engine::hardware::PlacementMode::Pin(d) => d,
-        gibbs_engine::hardware::PlacementMode::Auto => Device::Cpu,
-    };
+    // `auto` stays `Auto`: Metal wherever it exists, with ANE regions where measured faster; the
+    // CPU is an explicit `--backend cpu`.
+    let placement: gibbs_engine::hardware::PlacementMode = cli.backend.parse()?;
+    let backend = gibbs_engine::graph::avenues::resolved_backend(placement);
     let backend_label = match placement {
+        gibbs_engine::hardware::PlacementMode::Auto if backend == Device::Metal => {
+            "auto (Metal + ANE where faster)".to_string()
+        }
         gibbs_engine::hardware::PlacementMode::Auto => "auto (cost-modeled placement)".to_string(),
         gibbs_engine::hardware::PlacementMode::Pin(d) => match d {
             Device::Cpu => cpu_backend_label(),
@@ -421,6 +419,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             #[cfg(not(target_os = "macos"))]
             Device::Metal => return Err("--backend metal requires macOS".into()),
+            #[cfg(target_os = "macos")]
+            Device::Ane
+                if gibbs_engine::hardware::available_devices().contains(&Device::Ane) =>
+            {
+                let info = gibbs_engine::graph::ane::probe()?;
+                format!(
+                    "ANE ({} cores, {}) + Metal ({})",
+                    info.cores,
+                    info.arch,
+                    gibbs_engine::backend::metal::system_device_name()?
+                )
+            }
             Device::Ane => {
                 let available: Vec<&str> = gibbs_engine::hardware::available_devices()
                     .into_iter()
@@ -439,7 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     // GPU-only tripwire: from here on, any CPU compute outside `--backend cpu` panics.
-    if backend == Device::Metal {
+    if backend != Device::Cpu {
         gibbs_engine::hardware::cpu_compute::ban(true);
     }
     println!("═══════════════════════════════════════════════════════════════");

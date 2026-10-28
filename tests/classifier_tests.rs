@@ -674,7 +674,7 @@ fn fasttext_cached(repo: &str, file: &str) -> Option<SequenceClassifier> {
         eprintln!("SKIP: {repo} not cached in disk/");
         return None;
     }
-    Some(SequenceClassifier::from_fasttext(repo, &path).unwrap())
+    Some(SequenceClassifier::from_fasttext(repo, &path, Device::Cpu).unwrap())
 }
 
 /// lid218e (softmax, 1.2 GB dense): the card's `model.predict("Hello, world!")` and k=5 lists.
@@ -739,7 +739,7 @@ fn fasttext_leaf_surgery_export_matches_cards() {
             eprintln!("SKIP: {repo} not cached in disk/");
             continue;
         }
-        let c = SequenceClassifier::from_fasttext(repo, &dir).unwrap();
+        let c = SequenceClassifier::from_fasttext(repo, &dir, Device::Cpu).unwrap();
         let (out, _) = c.classify(text, None).unwrap();
         eprintln!("{repo}: {} {}", out[0].label, out[0].score);
         assert_eq!(out[0].label, "pi");

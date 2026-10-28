@@ -167,7 +167,7 @@ fn every_op_is_lowered_or_known_unlowered() {
     let mut actual_unlowered = Vec::new();
     for op in &ops {
         for (dtype, dname) in DTYPES {
-            let report = explore_node("sample", op, dtype);
+            let report = explore_node("sample", op, dtype, gibbs_engine::hardware::Device::Metal);
             let k = key(op);
             let listed = KNOWN_UNLOWERED.iter().any(|(o, d, _)| *o == k && *d == dname);
             match report.lowered_by() {
