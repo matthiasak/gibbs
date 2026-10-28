@@ -429,9 +429,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(not(target_os = "macos"))]
             Device::Metal => return Err("--backend metal requires macOS".into()),
             #[cfg(target_os = "macos")]
-            Device::Ane
-                if gibbs_engine::hardware::available_devices().contains(&Device::Ane) =>
-            {
+            Device::Ane if gibbs_engine::hardware::available_devices().contains(&Device::Ane) => {
                 let info = gibbs_engine::graph::ane::probe()?;
                 format!(
                     "ANE ({} cores, {}) + Metal ({})",
@@ -718,6 +716,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let applied = gibbs_engine::bench::applied_policy();
             if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, &applied) {
                 telemetry.set_model_size_bytes(b);
+            }
+            let resident = artifacts
+                .weights_path
+                .as_ref()
+                .and_then(|p| gibbs_engine::model::variant::read_local_header(p).ok())
+                .map(|h| h.resident_bytes(applied.policy));
+            if let (Some(resident), Some(ws), Some(0)) = (
+                resident,
+                hw.gpu_max_working_set_bytes,
+                hw.iogpu_wired_limit_mb,
+            ) {
+                if resident > ws * 85 / 100 {
+                    let rec_mb = hw
+                        .total_memory_bytes
+                        .map_or(resident * 5 / 4, |m| (resident * 5 / 4).min(m * 9 / 10))
+                        >> 20;
+                    telemetry.log_info(&format!(
+                        "Resident weights ({:.2} GB) are over 85% of the GPU working set ({:.2} GB); \
+                         raise the limit with: sudo sysctl iogpu.wired_limit_mb={rec_mb}",
+                        resident as f64 / 1e9,
+                        ws as f64 / 1e9
+                    ));
+                }
             }
             telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
             if let Some(d) = cli.draft.as_ref().filter(|d| !is_online_draft(d)) {

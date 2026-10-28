@@ -2,6 +2,6 @@
 pub mod metal {
     pub use crate::graph::metal::{
         commit_and_wait, new_shared_buffer, system_device, system_device_name,
-        system_has_unified_memory,
+        system_has_unified_memory, system_max_buffer_bytes, system_max_working_set_bytes,
     };
 }

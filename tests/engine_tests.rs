@@ -10,6 +10,14 @@ fn test_hardware_probe_reports_detected_facts() {
             hw.total_memory_bytes.is_some_and(|b| b >= 1 << 30),
             "hw.memsize not read"
         );
+        assert!(
+            hw.gpu_max_working_set_bytes.is_some_and(|b| b >= 1 << 28),
+            "recommendedMaxWorkingSetSize not read"
+        );
+        assert!(
+            hw.gpu_max_buffer_bytes.is_some_and(|b| b >= 1 << 28),
+            "maxBufferLength not read"
+        );
     }
 }
 
@@ -114,7 +122,12 @@ fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
     use gibbs_engine::model::hub::HuggingFaceHub;
     let load_native = |a: &gibbs_engine::model::hub::ModelArtifacts, d: Device| {
         let reg = gibbs_engine::arch::registry().expect("registry");
-        Some(gibbs_engine::runtime::lm::load(a, reg, None, gibbs_engine::hardware::PlacementMode::Pin(d)))
+        Some(gibbs_engine::runtime::lm::load(
+            a,
+            reg,
+            None,
+            gibbs_engine::hardware::PlacementMode::Pin(d),
+        ))
     };
     use std::time::Instant;
 

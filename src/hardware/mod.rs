@@ -448,6 +448,12 @@ pub struct HardwareCapability {
     pub gpu_name: Option<String>,
     /// The Metal GPU shares memory with the CPU.
     pub has_unified_memory: bool,
+    /// `MTLDevice.recommendedMaxWorkingSetSize` (macOS).
+    pub gpu_max_working_set_bytes: Option<u64>,
+    /// `MTLDevice.maxBufferLength` (macOS).
+    pub gpu_max_buffer_bytes: Option<u64>,
+    /// `iogpu.wired_limit_mb` (macOS); 0 means the system default.
+    pub iogpu_wired_limit_mb: Option<u64>,
     /// Advanced SIMD is architecturally mandatory on AArch64.
     pub cpu_has_arm_neon: bool,
     /// `hw.optional.arm.FEAT_*` runtime flags (macOS).
@@ -489,6 +495,10 @@ impl HardwareCapability {
             hw.gpu_name = crate::backend::metal::system_device_name().ok();
             hw.has_unified_memory =
                 crate::backend::metal::system_has_unified_memory().unwrap_or(false);
+            hw.gpu_max_working_set_bytes =
+                crate::backend::metal::system_max_working_set_bytes().ok();
+            hw.gpu_max_buffer_bytes = crate::backend::metal::system_max_buffer_bytes().ok();
+            hw.iogpu_wired_limit_mb = sysctl::int(c"iogpu.wired_limit_mb");
         }
         hw
     }
@@ -500,11 +510,17 @@ impl HardwareCapability {
             (Some(p), Some(e)) => format!(" ({p} performance + {e} efficiency cores)"),
             _ => String::new(),
         };
-        let gpu = match &self.gpu_name {
+        let mut gpu = match &self.gpu_name {
             Some(n) if self.has_unified_memory => format!("{n} (unified memory)"),
             Some(n) => n.clone(),
             None => ND.into(),
         };
+        if let Some(ws) = self.gpu_max_working_set_bytes {
+            gpu += &format!(", {:.1} GB working set", ws as f64 / 1e9);
+        }
+        if let Some(mb) = self.iogpu_wired_limit_mb.filter(|&mb| mb > 0) {
+            gpu += &format!(", wired_limit={mb} MB");
+        }
         let features: Vec<&str> = [
             (self.cpu_has_arm_neon, "NEON"),
             (self.cpu_has_arm_sme, "SME"),
