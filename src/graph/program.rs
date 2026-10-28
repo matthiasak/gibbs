@@ -448,7 +448,8 @@ impl GraphProgram {
                 let session = std::sync::Arc::new(session);
                 let prepared_plan = session.prepare_plan(&graph)?;
                 if let Some(s) = offload {
-                    segments = gate(&mut graph, &mut plan, &session, Some(&weights), s)?;
+                    let (w, pool) = (Some(&weights), kv_pool.as_ref());
+                    segments = gate(&mut graph, &mut plan, &session, w, s, pool)?;
                 }
                 CompiledSegment::Metal {
                     graph,
@@ -649,7 +650,7 @@ impl GraphProgram {
         else {
             return Ok(Vec::new());
         };
-        gate(g, &mut placed, session, None, sec)
+        gate(g, &mut placed, session, None, sec, self.kv_pool.as_ref())
     }
 
     /// Runs `graph` with the program's weights inside the program's state: another instance shape of
@@ -1528,24 +1529,55 @@ fn measure_region(
         &mut || session.run_prepared(g, metal, Some(&mut st), inputs.clone()),
         &mut || run_segments(&mut segs, &mut st_ane, h_in, h_out, inputs.clone()),
     ])?;
-    let rel = want
-        .iter()
-        .zip(&got)
-        .map(|(w, o)| crate::graph::ane::rel_rms(&o.to_f32(), &w.to_f32()))
-        .fold(0.0f32, f32::max);
-    let rel_err = if rel.is_finite() { rel } else { f32::MAX };
-    let decision = AneDecision {
-        metal_ms,
-        ane_ms,
-        rel_err,
-        chosen: rel_err <= ANE_REL_ERR && ane_ms <= ANE_SPEEDUP * metal_ms,
-    };
+    let decision = decide(metal_ms, ane_ms, &want, &got);
     let ane = segs
         .into_iter()
         .map(|s| s.compiled)
         .find(|c| c.device() == Device::Ane)
         .expect("the harness holds the region");
     Ok((decision, ane))
+}
+
+/// The decision for measured medians and the outputs of both sides.
+fn decide(metal_ms: f64, ane_ms: f64, want: &[Tensor], got: &[Tensor]) -> AneDecision {
+    let rel = want
+        .iter()
+        .zip(got)
+        .map(|(w, o)| crate::graph::ane::rel_rms(&o.to_f32(), &w.to_f32()))
+        .fold(0.0f32, f32::max);
+    let rel_err = if rel.is_finite() { rel } else { f32::MAX };
+    AneDecision {
+        metal_ms,
+        ane_ms,
+        rel_err,
+        chosen: rel_err <= ANE_REL_ERR && ane_ms <= ANE_SPEEDUP * metal_ms,
+    }
+}
+
+/// Times all of `graph` as one Metal plan and as `segments` ([`time_ms`], [`synth_inputs`]),
+/// each on a scratch state (with a view of `pool` when the program pages KV), and compares
+/// their outputs.
+#[cfg(target_os = "macos")]
+fn measure_program(
+    graph: &Graph,
+    segments: &mut [SegmentExec],
+    session: &crate::graph::metal::Session,
+    pool: Option<&std::sync::Arc<crate::kv::KvPool>>,
+) -> Result<AneDecision, String> {
+    let plan = session.prepare_plan(graph)?;
+    let inputs = synth_inputs(graph);
+    let scratch = || {
+        let mut st = StateStore::new();
+        st.kv = pool.map(|p| crate::kv::KvView::new(p.clone()));
+        st
+    };
+    let (mut a, mut b) = (scratch(), scratch());
+    let (g_in, g_out) = (&graph.inputs, &graph.outputs);
+    let [(metal_ms, want), (ane_ms, got)] = time_ms([
+        &mut || session.run_prepared(graph, &plan, Some(&mut a), inputs.clone()),
+        &mut || run_segments(segments, &mut b, g_in, g_out, inputs.clone()),
+    ])?;
+    Ok(decide(metal_ms, ane_ms, &want, &got))
 }
 
 /// The measured gate for `graph` placed with ANE regions (`placed`). Each region is lowered over
@@ -1555,9 +1587,11 @@ fn measure_region(
 /// [`ANE_REL_ERR`] and (`Auto`) its median is at most [`ANE_SPEEDUP`] of Metal's (`--backend
 /// ane` skips the speed test); one that cannot be built (budget, memory, lowering, an input
 /// that is neither an f32 activation nor a graph input) or loses goes back to Metal.
-/// `--backend ane` fails when every measured region fails the error test. Returns the program's
-/// segments ([`assemble`]; empty: `graph` runs on Metal alone), with `graph` and `placed`
-/// updated to the final placement.
+/// `--backend ane` fails when every measured region fails the error test. Under `Auto` the
+/// program with its kept regions must then win whole ([`measure_program`], decision keyed by
+/// the placed graph's signature): a region timed alone pays launch and sync costs Metal
+/// pipelines away inside a program. Returns the program's segments ([`assemble`]; empty:
+/// `graph` runs on Metal alone), with `graph` and `placed` updated to the final placement.
 #[cfg(target_os = "macos")]
 fn gate(
     graph: &mut Graph,
@@ -1565,6 +1599,7 @@ fn gate(
     session: &std::sync::Arc<crate::graph::metal::Session>,
     host: Option<&Weights>,
     sec: Secondary,
+    pool: Option<&std::sync::Arc<crate::kv::KvPool>>,
 ) -> Result<Vec<SegmentExec>, String> {
     use crate::graph::ane;
     let regions: Vec<Vec<NodeId>> = placed
@@ -1593,14 +1628,46 @@ fn gate(
         demote(graph, placed);
         return Ok(Vec::new());
     }
+    let label = |nodes: &[NodeId]| {
+        let name = |i: usize| graph.node(nodes[i]).name.as_str();
+        format!("{} nodes: {} … {}", nodes.len(), name(0), name(nodes.len() - 1))
+    };
+    let whole_label = |n: usize| format!("whole program, {n} ANE regions");
+    let cached = |sig: u64| with_ane_decisions(false, |m| m.get(&format!("{sig:016x}")).copied());
+    // Auto: every region and the whole program with the regions that win alone were decided
+    // before, and the program lost: build nothing.
+    let known: Option<Vec<(u64, AneDecision)>> = regions
+        .iter()
+        .map(|nodes| {
+            let sig = signature(&fragment(graph, nodes).0, host.is_none());
+            cached(sig).map(|d| (sig, d))
+        })
+        .collect();
+    if let (false, Some(known)) = (sec.force, known) {
+        let mut trial = graph.clone();
+        for (nodes, _) in regions.iter().zip(&known).filter(|(_, (_, d))| !d.chosen) {
+            for n in nodes {
+                trial.nodes[n.0 as usize].device = placed.primary;
+            }
+        }
+        let wins = known.iter().filter(|(_, d)| d.chosen).count();
+        let sig = signature(&trial, host.is_none());
+        if let Some(d) = cached(sig).filter(|d| wins > 0 && !d.chosen) {
+            for (nodes, &(s, rd)) in regions.iter().zip(&known) {
+                record(s, label(nodes), rd, false, false);
+            }
+            record(sig, whole_label(wins), d, false, false);
+            demote(graph, placed);
+            return Ok(Vec::new());
+        }
+    }
     let mut kept: HashMap<NodeId, CompiledSegment> = HashMap::new();
     let mut best_err: Option<f32> = None;
     for nodes in &regions {
         let (g, inputs, _) = fragment(graph, nodes);
         let sig = signature(&g, host.is_none());
         let key = format!("{sig:016x}");
-        let name = |i: usize| graph.node(nodes[i]).name.as_str();
-        let label = format!("{} nodes: {} … {}", nodes.len(), name(0), name(nodes.len() - 1));
+        let label = label(nodes);
         let known = with_ane_decisions(false, |m| m.get(&key).copied());
         // A cached region that cannot run on the ANE (lost, failed the error test or failed to
         // build) is not rebuilt.
@@ -1663,7 +1730,35 @@ fn gate(
         }
     }
     *placed = crate::graph::placement::segments_of(graph, placed.primary);
-    assemble(graph, placed.primary, kept, session)
+    let mut segments = assemble(graph, placed.primary, kept, session)?;
+    if sec.force {
+        return Ok(segments);
+    }
+    let sig = signature(graph, host.is_none());
+    let key = format!("{sig:016x}");
+    let label = whole_label(segments.iter().filter(|s| s.compiled.device() == Device::Ane).count());
+    let (d, fresh) = match with_ane_decisions(false, |m| m.get(&key).copied()) {
+        Some(d) => (d, false),
+        None => {
+            let d = measure_program(graph, &mut segments, session, pool).unwrap_or_else(|e| {
+                eprintln!("ANE: {label} stays on Metal: {e}");
+                AneDecision {
+                    metal_ms: 0.0,
+                    ane_ms: 0.0,
+                    rel_err: f32::MAX,
+                    chosen: false,
+                }
+            });
+            with_ane_decisions(true, |m| m.insert(key, d));
+            (d, true)
+        }
+    };
+    record(sig, label, d, fresh, d.chosen);
+    if !d.chosen {
+        demote(graph, placed);
+        return Ok(Vec::new());
+    }
+    Ok(segments)
 }
 
 /// Logs a region's gate decision and keeps it for [`ane_reports`].
