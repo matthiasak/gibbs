@@ -14,7 +14,8 @@
 //!   (f16 on Metal with `GIBBS_KV_DTYPE=f16`).
 //! - **Row address**: stored row `t` of a name with row width `stride` lives at `kv_row(t)`:
 //!   `lp = t >> 6; if ring { lp %= ring }; pg = table[lp];
-//!   addr = slabs[pg >> 8] + ((pg & 255) * 64 + (t & 63)) * stride`.
+//!   addr = slabs[pg >> 8] + ((pg & 255) * 64 + (t & 63)) * stride` (Metal binds each name's
+//!   table already resolved to page addresses, so a lookup is one dependent load).
 //! - **Stored rows**: rows are stored in position order; `kv_base` (rows stored before a step)
 //!   equals the step's start position except in the full class after Tier-4 page eviction, where
 //!   `kv_base = start_pos - `[`KvView::evicted`]. Query row `i` writes row `kv_base + i` and sees
@@ -49,7 +50,7 @@ use std::sync::Arc;
 pub const PAGE_TOKENS: usize = 64;
 /// Pages per slab.
 pub const SLAB_PAGES: usize = 256;
-/// Slabs a name can grow to (16.7M rows); sizes the Metal slab-address arrays.
+/// Slabs a name can grow to (16.7M rows).
 pub const MAX_SLABS: usize = 1024;
 
 static KV_BUDGET: AtomicUsize = AtomicUsize::new(0);
@@ -109,7 +110,7 @@ struct Slab {
 enum SlabMem {
     Host(#[allow(dead_code)] Vec<u32>),
     #[cfg(target_os = "macos")]
-    Metal(#[allow(dead_code)] metal::Buffer),
+    Metal(metal::Buffer),
 }
 
 /// Allocation state of one class.
@@ -118,9 +119,6 @@ struct ClassMem {
     free: Vec<u32>,
     /// `[name][slab]`.
     slabs: Vec<Vec<Slab>>,
-    /// Per name: [`MAX_SLABS`] slab GPU addresses (u64), bound to kernels through [`KvView`].
-    #[cfg(target_os = "macos")]
-    addrs: Vec<metal::Buffer>,
 }
 
 #[cfg(target_os = "macos")]
@@ -215,22 +213,6 @@ impl KvPool {
     ) -> Result<Arc<Self>, String> {
         let mut pool = Self::build(states, |n| if f16.contains(n) { 2 } else { 4 });
         let residency = residency_set(device, queue);
-        let mut mem = pool.mem.lock();
-        for (c, cm) in mem.iter_mut().enumerate() {
-            for _ in &pool.classes[c].names {
-                let buf = device.new_buffer(
-                    (MAX_SLABS * 8) as u64,
-                    metal::MTLResourceOptions::StorageModeShared,
-                );
-                track(residency, &pool, &buf);
-                cm.addrs.push(buf);
-            }
-        }
-        drop(mem);
-        if let Some(set) = residency {
-            // SAFETY: a live MTLResidencySet.
-            let () = unsafe { msg_send![set, commit] };
-        }
         pool.metal = Some(MetalMem {
             device: device.to_owned(),
             queue: queue.to_owned(),
@@ -266,8 +248,6 @@ impl KvPool {
                 refcount: Vec::new(),
                 free: Vec::new(),
                 slabs: c.names.iter().map(|_| Vec::new()).collect(),
-                #[cfg(target_os = "macos")]
-                addrs: Vec::new(),
             })
             .collect();
         Self {
@@ -483,8 +463,6 @@ impl KvPool {
                 let buf = m
                     .device
                     .new_buffer(len as u64, metal::MTLResourceOptions::StorageModeShared);
-                // SAFETY: the address array holds MAX_SLABS u64 and `slab < MAX_SLABS`.
-                unsafe { *(cm.addrs[i].contents() as *mut u64).add(slab) = buf.gpu_address() };
                 track(m.residency, self, &buf);
                 cm.slabs[i].push(Slab {
                     ptr: buf.contents() as *mut u8,
@@ -666,7 +644,8 @@ pub struct KvView {
     descs: HashMap<String, MetalDesc>,
 }
 
-/// One name's kernel binding: [`KvDesc`](metal_kernels.metal) header, then the class table.
+/// One name's kernel binding: [`KvDesc`](metal_kernels.metal) header, then the class table
+/// resolved to the name's page addresses.
 #[cfg(target_os = "macos")]
 struct MetalDesc {
     buf: Arc<metal::Buffer>,
@@ -674,9 +653,9 @@ struct MetalDesc {
     gen: u64,
 }
 
-/// Bytes of the `KvDesc` header in front of the table.
+/// Bytes of the `KvDesc` header in front of the page-address table.
 #[cfg(target_os = "macos")]
-pub const KV_DESC_HEADER: usize = 32;
+pub const KV_DESC_HEADER: usize = 16;
 
 impl std::fmt::Debug for KvView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -959,8 +938,8 @@ impl KvView {
     }
 
     /// The kernel binding of paged state `name` (`KvDesc` in `metal_kernels.metal`): header
-    /// `{ring_pages, evicted, n_pages, _, slabs}` then the class table, re-written when the table
-    /// changed since the last call.
+    /// `{ring_pages, evicted, n_pages, _}` then, per logical page, the GPU address (u64) of the
+    /// name's page, re-written when the table changed since the last call.
     #[cfg(target_os = "macos")]
     pub fn metal_desc(&mut self, name: &str) -> Result<Arc<metal::Buffer>, String> {
         let (c, i) = self
@@ -979,7 +958,7 @@ impl KvView {
             _ => {
                 let cap = n.next_power_of_two().max(64);
                 let buf = m.device.new_buffer(
-                    (KV_DESC_HEADER + 4 * cap) as u64,
+                    (KV_DESC_HEADER + 8 * cap) as u64,
                     metal::MTLResourceOptions::StorageModeShared,
                 );
                 Some(MetalDesc {
@@ -994,11 +973,14 @@ impl KvView {
         }
         let ring = self.ring(c) as u32;
         let evicted = (Some(c) == self.pool.full) as u32 * self.evicted as u32;
-        let slabs = self.pool.mem.lock()[c].addrs[i].gpu_address();
         let d = self.descs.get_mut(name).expect("inserted above");
         if d.gen != gen {
+            let mem = self.pool.mem.lock();
+            let page_bytes = (PAGE_TOKENS
+                * self.pool.classes[c].names[i].row_width
+                * self.pool.classes[c].names[i].elem) as u64;
             let p = d.buf.contents() as *mut u8;
-            // SAFETY: the buffer holds the 32-byte header plus `cap >= n` u32 entries; no GPU work
+            // SAFETY: the buffer holds the 16-byte header plus `cap >= n` u64 entries; no GPU work
             // reads it while the host updates it (runs are synchronous, streams reserve up front).
             unsafe {
                 let h = p as *mut u32;
@@ -1006,12 +988,15 @@ impl KvView {
                 *h.add(1) = evicted;
                 *h.add(2) = n as u32;
                 *h.add(3) = 0;
-                *(p.add(16) as *mut u64) = slabs;
-                std::ptr::copy_nonoverlapping(
-                    self.tables[c].as_ptr(),
-                    p.add(KV_DESC_HEADER) as *mut u32,
-                    n,
-                );
+                let pages = p.add(KV_DESC_HEADER) as *mut u64;
+                for (j, &pg) in self.tables[c].iter().enumerate() {
+                    let SlabMem::Metal(slab) = &mem[c].slabs[i][pg as usize / SLAB_PAGES]._mem
+                    else {
+                        unreachable!("a Metal pool's slabs are Metal buffers")
+                    };
+                    *pages.add(j) =
+                        slab.gpu_address() + (pg as usize % SLAB_PAGES) as u64 * page_bytes;
+                }
             }
             d.gen = gen;
         }
