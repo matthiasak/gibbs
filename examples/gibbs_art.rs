@@ -848,6 +848,15 @@ struct SameRow {
     pp_tok_s: Option<f64>,
 }
 
+#[derive(Clone)]
+struct PubRow {
+    fmt: String,
+    gb: f64,
+    tok_s: f64,
+    /// Optional Gibbs run on the same Llama 2 7B variant: (streamed GB/token, decode tok/s, prefill tok/s).
+    gibbs: Option<(f64, f64, Option<f64>)>,
+}
+
 /// Reference numbers from other engines (`autoresearch/bench-reference.json`).
 struct Reference {
     /// Same machine reference rows matched to suite rows.
@@ -857,8 +866,8 @@ struct Reference {
     same_date: String,
     same_source: String,
     same_source_note: String,
-    /// Published rows: (format, bytes per token in GB, tok/s).
-    published: Vec<(String, f64, f64)>,
+    /// Published rows (`ggml-org/llama.cpp#4167`) with optional Gibbs counterpart on the same variant.
+    published: Vec<PubRow>,
     pub_source: String,
     pub_source_name: String,
     pub_device: String,
@@ -916,12 +925,19 @@ fn reference(b: &Bench) -> Reference {
             .as_array()
             .expect("published.rows")
             .iter()
-            .map(|r| {
-                (
-                    s(r, "format"),
-                    f(r, "gib") * 1_073_741_824.0 / 1e9,
-                    f(r, "tok_s"),
-                )
+            .map(|r| PubRow {
+                fmt: s(r, "format"),
+                gb: f(r, "gib") * 1_073_741_824.0 / 1e9,
+                tok_s: f(r, "tok_s"),
+                gibbs: match (
+                    r.get("gibbs_bytes").and_then(Value::as_f64),
+                    r.get("gibbs_tok_s").and_then(Value::as_f64),
+                ) {
+                    (Some(b), Some(t)) => {
+                        Some((b / 1e9, t, r.get("gibbs_pp_tok_s").and_then(Value::as_f64)))
+                    }
+                    _ => None,
+                },
             })
             .collect(),
         pub_source: s(pb, "source"),
@@ -966,7 +982,12 @@ fn compare_svg(b: &Bench, r: &Reference) -> String {
     let ya_end = ya + 44 * pairs.len();
     let yb_head = ya_end + 36;
     let yb = yb_head + 12;
-    let yb_end = yb + 28 * (r.published.len() + gibbs.len());
+    let pub_bars = r
+        .published
+        .iter()
+        .map(|p| 1 + usize::from(p.gibbs.is_some()))
+        .sum::<usize>();
+    let yb_end = yb + 28 * (pub_bars + gibbs.len());
     let fy = yb_end + 16;
     let ly = fy + 30;
     let h = ly + 44;
@@ -1019,13 +1040,21 @@ fn compare_svg(b: &Bench, r: &Reference) -> String {
         desc_b.push(format!("{} {:.1}%", esc(&label), p));
         y += 28;
     };
-    for (fmt, gb, t) in &r.published {
+    for p in &r.published {
         bar(
-            format!("{} · {fmt} · {gb:.2} GB", r.pub_model),
+            format!("llama.cpp · {} · {} · {:.2} GB", r.pub_model, p.fmt, p.gb),
             CYANOTYPE,
-            gb * t,
+            p.gb * p.tok_s,
             &mut bsvg,
         );
+        if let Some((ggb, gt, _)) = p.gibbs {
+            bar(
+                format!("Gibbs · {} · {} · {ggb:.2} GB", r.pub_model, p.fmt),
+                BRASS,
+                ggb * gt,
+                &mut bsvg,
+            );
+        }
     }
     for row in &gibbs {
         bar(
@@ -1177,13 +1206,21 @@ fn compare_block(b: &Bench, r: &Reference) -> String {
             gbps / b.ceiling * 100.0
         );
     };
-    for (fmt, gb, t) in &r.published {
+    for p in &r.published {
         row_md(
             &mut s,
-            &format!("llama.cpp · {} {fmt}", r.pub_model),
-            *gb,
-            *t,
+            &format!("llama.cpp · {} {}", r.pub_model, p.fmt),
+            p.gb,
+            p.tok_s,
         );
+        if let Some((ggb, gt, _)) = p.gibbs {
+            row_md(
+                &mut s,
+                &format!("Gibbs · {} {}", r.pub_model, p.fmt),
+                ggb,
+                gt,
+            );
+        }
     }
     let gibbs = by_bytes(b);
     for row in &gibbs {
@@ -1194,7 +1231,7 @@ fn compare_block(b: &Bench, r: &Reference) -> String {
             row.tok_s,
         );
     }
-    let pub_pct = |(_, gb, t): &(String, f64, f64)| gb * t / r.pub_spec * 100.0;
+    let pub_pct = |p: &PubRow| p.gb * p.tok_s / r.pub_spec * 100.0;
     let (pmin, pmax) = r
         .published
         .iter()
@@ -1203,30 +1240,58 @@ fn compare_block(b: &Bench, r: &Reference) -> String {
     let (gbmin, gbmax) = r
         .published
         .iter()
-        .map(|p| p.1)
+        .map(|p| p.gb)
         .fold((f64::MAX, f64::MIN), |(lo, hi), g| (lo.min(g), hi.max(g)));
     let top = r
         .published
         .iter()
-        .max_by(|x, y| (x.1 * x.2).total_cmp(&(y.1 * y.2)))
+        .max_by(|x, y| (x.gb * x.tok_s).total_cmp(&(y.gb * y.tok_s)))
         .expect("published rows");
     let best = gibbs
         .iter()
         .max_by(|x, y| (x.bytes * x.tok_s).total_cmp(&(y.bytes * y.tok_s)))
         .expect("gibbs rows");
-    let _ = write!(
+    let l2_summary: Vec<String> = r
+        .published
+        .iter()
+        .filter_map(|p| {
+            let (ggb, gt, gpp) = p.gibbs?;
+            let pp = gpp.map_or(String::new(), |v| format!(", prefill {v:.0} tok/s"));
+            Some(format!(
+                "{} {:.1} vs {:.1} tok/s ({:.2}×, {:.1} GB/s streamed = {:.1}% of Gibbs's ceiling{pp})",
+                p.fmt,
+                gt,
+                p.tok_s,
+                gt / p.tok_s,
+                ggb * gt,
+                ggb * gt / b.ceiling * 100.0
+            ))
+        })
+        .collect();
+    let l2_note = if l2_summary.is_empty() {
+        format!(
+            "There is no Gibbs run of {model}, so this table compares different models on one chip.",
+            model = r.pub_model
+        )
+    } else {
+        format!(
+            "On the same {model} variants (`bench/reference-7b.json`, `--reencode bit-exact`), Gibbs decodes at: {}.",
+            l2_summary.join("; "),
+            model = r.pub_model
+        )
+    };
+    let _ = writeln!(
         s,
-        "\nEffective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On {gbmin:.1}–{gbmax:.1} GB per token, llama.cpp streams at {pmin:.0}–{pmax:.0}% of the {spec:.0} GB/s spec; its {fmt} run reaches {tg:.0} GB/s, {tc:.1}% of the {ceil:.1} GB/s ceiling Gibbs measures. The Gibbs suite streams {smin:.2}–{smax:.2} GB per token; its highest row is {bl} at {bp:.1}% of spec. There is no Gibbs run of {model}, so this table compares different models on one chip. The phase-by-phase optimization log is in [`autoresearch/roofline-loop.tsv`](autoresearch/roofline-loop.tsv).\n",
+        "\nEffective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On {gbmin:.1}–{gbmax:.1} GB per token, llama.cpp streams at {pmin:.0}–{pmax:.0}% of the {spec:.0} GB/s spec; its {fmt} run reaches {tg:.0} GB/s, {tc:.1}% of the {ceil:.1} GB/s ceiling Gibbs measures. {l2_note} The default Gibbs suite streams {smin:.2}–{smax:.2} GB per token; its highest row is {bl} at {bp:.1}% of spec. The phase-by-phase optimization log is in [`autoresearch/roofline-loop.tsv`](autoresearch/roofline-loop.tsv).",
         spec = r.pub_spec,
-        fmt = top.0,
-        tg = top.1 * top.2,
-        tc = top.1 * top.2 / b.ceiling * 100.0,
+        fmt = top.fmt,
+        tg = top.gb * top.tok_s,
+        tc = top.gb * top.tok_s / b.ceiling * 100.0,
         ceil = b.ceiling,
         smin = gibbs.last().expect("gibbs rows").bytes / 1e9,
         smax = gibbs[0].bytes / 1e9,
         bl = best.label,
         bp = best.bytes / 1e9 * best.tok_s / r.pub_spec * 100.0,
-        model = r.pub_model,
     );
     s.push_str("<!-- gibbs-compare:end -->");
     s

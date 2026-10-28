@@ -86,17 +86,26 @@
       {
         "format": "F16",
         "gib": 12.55,
-        "tok_s": 21.39
+        "tok_s": 21.39,
+        "gibbs_bytes": 13214154752,
+        "gibbs_tok_s": 20.06,
+        "gibbs_pp_tok_s": 400.8
       },
       {
         "format": "Q8_0",
         "gib": 6.67,
-        "tok_s": 38.94
+        "tok_s": 38.94,
+        "gibbs_bytes": 7020019712,
+        "gibbs_tok_s": 35.60,
+        "gibbs_pp_tok_s": 971.4
       },
       {
         "format": "Q4_0",
         "gib": 3.53,
-        "tok_s": 67.59
+        "tok_s": 67.59,
+        "gibbs_bytes": 3716481024,
+        "gibbs_tok_s": 62.40,
+        "gibbs_pp_tok_s": 976.9
       }
     ]
   }

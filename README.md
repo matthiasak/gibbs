@@ -74,8 +74,11 @@ Ref % of Gibbs roofline = Ref decode tok/s ÷ Gibbs roofline tok/s (the bytes Gi
 | Engine · model | Bytes per token | tok/s | Effective GB/s | % of 307 GB/s spec | % of Gibbs's 286.4 GB/s ceiling |
 | :--- | ---: | ---: | ---: | ---: | ---: |
 | llama.cpp · Llama 2 7B F16 | 13.48 GB | 21.4 | 288.2 | 93.9% | 100.6% |
+| Gibbs · Llama 2 7B F16 | 13.21 GB | 20.1 | 265.1 | 86.3% | 92.5% |
 | llama.cpp · Llama 2 7B Q8_0 | 7.16 GB | 38.9 | 278.9 | 90.8% | 97.4% |
+| Gibbs · Llama 2 7B Q8_0 | 7.02 GB | 35.6 | 249.9 | 81.4% | 87.3% |
 | llama.cpp · Llama 2 7B Q4_0 | 3.79 GB | 67.6 | 256.2 | 83.4% | 89.4% |
+| Gibbs · Llama 2 7B Q4_0 | 3.72 GB | 62.4 | 231.9 | 75.5% | 81.0% |
 | Gibbs · Qwen3.5 9B (DavidAU MTP) · IQ2_M | 4.49 GB | 41.1 | 184.9 | 60.2% | 64.5% |
 | Gibbs · Gemma 4 26B-A4B · UD-IQ2_XXS | 2.18 GB | 77.7 | 169.5 | 55.2% | 59.2% |
 | Gibbs · Gemma 4 E2B · Q4_K_M | 1.47 GB | 98.3 | 144.9 | 47.2% | 50.6% |
@@ -86,7 +89,7 @@ Ref % of Gibbs roofline = Ref decode tok/s ÷ Gibbs roofline tok/s (the bytes Gi
 | Gibbs · Llama 3.2 1B · bnb 4-bit | 0.67 GB | 249.1 | 166.2 | 54.1% | 58.0% |
 | Gibbs · SmolLM2 135M · safetensors | 0.13 GB | 577.7 | 76.8 | 25.0% | 26.8% |
 
-Effective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On 3.8–13.5 GB per token, llama.cpp streams at 83–94% of the 307 GB/s spec; its F16 run reaches 288 GB/s, 100.6% of the 286.4 GB/s ceiling Gibbs measures. The Gibbs suite streams 0.13–4.49 GB per token; its highest row is Qwen3.5 9B (DavidAU MTP) · IQ2_M at 60.2% of spec. There is no Gibbs run of Llama 2 7B, so this table compares different models on one chip. The phase-by-phase optimization log is in [`autoresearch/roofline-loop.tsv`](autoresearch/roofline-loop.tsv).
+Effective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On 3.8–13.5 GB per token, llama.cpp streams at 83–94% of the 307 GB/s spec; its F16 run reaches 288 GB/s, 100.6% of the 286.4 GB/s ceiling Gibbs measures. On the same Llama 2 7B variants (`bench/reference-7b.json`, `--reencode bit-exact`), Gibbs decodes at: F16 20.1 vs 21.4 tok/s (0.94×, 265.1 GB/s streamed = 92.5% of Gibbs's ceiling, prefill 401 tok/s); Q8_0 35.6 vs 38.9 tok/s (0.91×, 249.9 GB/s streamed = 87.3% of Gibbs's ceiling, prefill 971 tok/s); Q4_0 62.4 vs 67.6 tok/s (0.92×, 231.9 GB/s streamed = 81.0% of Gibbs's ceiling, prefill 977 tok/s). The default Gibbs suite streams 0.13–4.49 GB per token; its highest row is Qwen3.5 9B (DavidAU MTP) · IQ2_M at 60.2% of spec. The phase-by-phase optimization log is in [`autoresearch/roofline-loop.tsv`](autoresearch/roofline-loop.tsv).
 <!-- gibbs-compare:end -->
 
 ## Quickstart
@@ -142,6 +145,37 @@ The design describes every model once in a shared graph IR (`src/graph`) and has
 | `cpu` | Explicit opt-in to the native CPU graph executor (`src/graph/cpu.rs`): packed linears run `src/model/qdot.rs` (activations quantized once per call to Q8_0/Q8_K; `sdot` kernels for q4_0, q8_0, iq4_nl, q4_k, q6_k, q2_k and tq2_0; `smmla` i8mm kernels for q4_0/q8_0/q4_k/q6_k above 8 activation rows; a block-decode path for every other format), dense GEMM uses SME2 `fmopa` 32×32 tiles (`src/model/sme2.rs`) when m, n ≥ 32 on SME2 hosts, and the `par::par_for` worker pool honors `nn::par_limit()`. |
 
 Startup prints the detected host (CPU, core counts, memory, GPU, and CPU features such as SME2 and I8MM); nothing in it is assumed.
+
+#### How Gibbs chooses between Metal, ANE, and hybrid execution
+
+```mermaid
+flowchart TD
+    A["Graph instance (decode, prefill, encoder/tower, or drafter)"] --> B{"Decode instance?\n(CachedAttention with m == 1)"}
+    B -- "Yes" --> M["100% Metal\n(ANE ~0.1 ms sync dispatch never pays)"]
+    B -- "No" --> C{"PlacementMode"}
+    C -- "--backend metal" --> M
+    C -- "--backend cpu" --> CPU["100% CPU (NEON / dotprod / i8mm / SME2)"]
+    C -- "--backend ane\n(force = true)" --> P["Partition into Metal + ANE regions\n(ane::supports_op, ≥2 heavy ops/region)"]
+    C -- "--backend auto\n(force = false)" --> P
+    P --> G{"program::gate per ANE region\n(cached in ane-decisions-<build>.json)"}
+    G -- "force = true\nand rel_err ≤ 2e-2" --> BOTH["Hybrid Metal + ANE\n(shared IOSurface + AnePack/AneUnpack)"]
+    G -- "auto: rel_err ≤ 2e-2 AND\nANE median ≤ 0.95 × Metal" --> BOTH
+    G -- "Otherwise" --> M
+```
+
+1. **Mode & eligibility (`src/graph/program.rs`):**
+   - Single-token decode (`CachedAttention` with `m == 1`) **always runs 100% on Metal** (`is_decode`), because `_ANEInMemoryModel -evaluateWithQoS:` has ~0.1 ms synchronous dispatch overhead per evaluation.
+   - When `ane::probe()` passes (`_ANEDeviceInfo +hasANE` plus a `[1, 64, 1, 64]` 1×1 conv probe in fp16/int8/int4), three non-decode workloads are eligible for ANE offload: encoders/towers/diffusion/classifiers (`compile_reshapable`), full-chunk LLM prefill (`rows == prefill_rows`, default 512), and `Plain` / `Mtp` model drafters (`src/graph/ane/draft.rs`).
+2. **Static graph partitioning (`src/graph/placement.rs`, `src/graph/ane/mil.rs`):**
+   - `place_graph` marks ops supported by `ane::supports_op` (`Linear` lowered as 1×1 conv, `MatMul`, norms, `Rope`, stateless `Attention`, `SwiGlu`/`GeGlu`, `Conv1d`/`Conv2d`, `Megakernel(Mlp)`, and elementwise/movement ops) as `Device::Ane`.
+   - Stateful ops (`CachedAttention`, `CausalConv1d`, `DeltaRule`, `StateWrite`), `Embedding`, `Gather`, `Scatter`, `TopK`, `MoeLinear`, `Conv3d`, and `Concat` stay on `Device::Metal`.
+   - Consecutive same-device nodes in topological order form segments. Any ANE segment with fewer than 2 heavy ops (`Linear` / `MatMul` / `Conv*` / `Megakernel`) is merged back into Metal so boundary conversion is never paid for trivial elementwise chains.
+3. **Zero-copy hybrid execution (`SegmentExec` & `IOSurface`):**
+   - Each tensor crossing a Metal↔ANE boundary lives in a page-aligned `IOSurface` in ANE's `[1, C, 1, S]` channel-major layout (64-byte channel stride), wrapped on the GPU via `newBufferWithBytesNoCopy`.
+   - Metal encodes `Step::AnePack` (`[S, C]` → `[1, C, 1, S]`) at the end of a Metal segment and `Step::AneUnpack` (`[1, C, 1, S]` → `[S, C]`) at the start of the next Metal segment; no host `memcpy` occurs on interior boundaries.
+4. **Measured gate (`program::gate` & `KTuner::place`):**
+   - **Per-region gate (encoders, towers, LLM prefill):** guarded by `ANE_MAX_PROGRAMS = 100` and `current_rss + ane_weight_bytes <= 0.75 * hw.memsize`, keyed by an FNV-64 signature in `~/.cache/gibbs/host/ane-decisions-<os_build>.json`. On first sight, Gibbs compiles both the Metal segment and the ANE MIL program, runs 1 warm-up + 3 timed evaluations, and keeps the ANE region in `auto` mode only if `rel_err <= 2e-2` and `mixed_ms <= 0.95 * metal_ms` (including `AnePack`/`AneUnpack`).
+   - **Whole-step drafter trial (`Plain` / `Mtp`):** `ane::lower_drafter_step` replaces `CachedAttention` with static 1024-row `IOSurface` KV rings so the entire drafter step runs on ANE and enables CPU-thread overlapped drafting (`Plain` on ANE proposes step $t+1$ while Metal verifies step $t$). Over the first 64 decode steps (alternating every 8 steps), `KTuner::place` times decode tok/s on Metal vs ANE, keeps the faster device, and persists the choice.
 
 ### Components
 
@@ -438,6 +472,16 @@ One screen, redrawn on input and streamed output and every 250 ms otherwise; pro
 | `↑` / `↓` | Cycle prior user prompt entries for immediate retry (`Enter`) or inline editing. |
 | Trackpad / Mouse Wheel, `j k`, `PgUp PgDn`, `Home End` | Scroll the console (or the model picker / placement modal when open). |
 | `q` | Quit from the dashboard; `Ctrl-C` quits anywhere. |
+
+
+#### Multi-turn memory and TTFT in `--tui`
+
+- **Weights stay resident across turns:** `TuiApp::prompt_job` (`src/tui/mod.rs`) reuses the loaded `ExecutableModel` (`SpecLm` → `GraphProgram` → `metal::Session`) and `KvPool`. The model is only reloaded if you change the re-encode or variant policy (`F4` `1`/`2`, `/reencode`, `/variant`), and an extra generation pass only runs before a turn when session compaction Tier 3 triggers (`prompt_tokens > 0.75 * ctx` in `Auto`/`Aggressive` mode, running greedy summarization in `compact_turns`).
+- **What governs per-turn TTFT on larger models:**
+  1. **`PrefillTuner` chunking & shape-cache planning (`src/scheduler/mod.rs`, `src/graph/program.rs`):** unlike CLI `--prompt` (which sets `whole_prompt = true` and prefills in full `prefill_rows = 512` passes), `--tui` sizes prefill chunks to `IDLE_STEP = 100 ms` from a running `prefill_ns_per_token` EWMA (`INITIAL_PREFILL_CHUNK = 64`). On a large bandwidth-bound model, a short turn or tail chunk still streams all model weights once, inflating `elapsed / chunk_len` and shrinking subsequent `prefill_budget`s into multiple smaller chunks; each distinct chunk length `m` also plans a reshaped instance in `GraphProgram::run_reshaped` (8-entry LRU cache `INSTANCE_SHAPES = 8`).
+  2. **Quantized batched GEMM dequantization at `m > 15` (`src/graph/metal.rs`):** chunk sizes `m <= 15` stream packed weights directly through `codegen::gemv_packed_mr`. At `m > 15` (`Step::GemmBatchedPacked`), `BF16`, `F16`, `Q4_0`, and `Q8_0` use direct packed GEMM kernels, whereas other codecs (`Q4_K_M`, `Q2_K`, `Q3_K`, `Q6_K`, `IQ*`) expand each weight matrix into F32 in `Session::dequant_scratch` per chunk.
+  3. **Radix prefix-cache boundaries on sliding-window / recurrent models (`src/runtime/lm.rs`):** full-attention models resume `RadixPrefixCache` at any token offset, whereas models with sliding-window ring KV classes (Gemma 3/4) or recurrent state (Qwen 3.5, LFM2) require an exact `Boundary` snapshot (`boundary.len == matched_len`). When a recurrent model uses the device decode stream (`stream_token`), draining the 1 in-flight lookahead token at sequence end sets `recurrent_ahead = true` and skips the sequence-end `kv_export`, so the next turn resumes from the prior prefill boundary and re-prefills the prior assistant reply.
+  4. **Unified-memory working set & KV slab granularity (`src/kv/mod.rs`, `src/graph/metal.rs`):** GGUF weights are mapped zero-copy (`mmap` + `newBufferWithBytesNoCopy`), not `mlock`ed, whereas `KvPool` allocates 256-page (`16,384`-token) slabs per KV state and registers them in an `MTLResidencySet`. When resident weights + KV slabs + `dequant_scratch` approach `MTLDevice.recommendedMaxWorkingSetSize`, macOS can page out clean file-backed weight pages between turns unless `iogpu.wired_limit_mb` is raised (see [`plans/perf-followup-plan.md`](plans/perf-followup-plan.md)).
 
 <details><summary>Model picker and console commands</summary>
 

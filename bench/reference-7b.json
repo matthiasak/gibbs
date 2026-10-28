@@ -7,12 +7,16 @@
   },
   "models": [
     {
-      "id": "ggml-org/Llama-2-7B-GGUF/Llama-2-7B-Q4_0.gguf",
-      "name": "llama2-7b-q4_0"
+      "id": "ggml-org/Llama-2-7B-GGUF/Llama-2-7B-F16.gguf",
+      "name": "llama2-7b-f16"
     },
     {
       "id": "ggml-org/Llama-2-7B-GGUF/Llama-2-7B-Q8_0.gguf",
       "name": "llama2-7b-q8_0"
+    },
+    {
+      "id": "ggml-org/Llama-2-7B-GGUF/Llama-2-7B-Q4_0.gguf",
+      "name": "llama2-7b-q4_0"
     }
   ]
 }
