@@ -70,7 +70,8 @@ struct Cli {
     #[arg(long)]
     draft_max_k: Option<usize>,
 
-    /// Target speculative acceptance rate (0.10..=0.98) for KTuner.
+    /// Target speculative acceptance rate (0.10..=0.98) for KTuner; also the guess hit rate a
+    /// drafting k with no known cost must reach before it is measured.
     #[arg(long)]
     draft_target_accept: Option<f32>,
 
@@ -220,6 +221,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     explain_placement: bool,
 
+    /// With --tui, append each drawn frame's time in ms to this file (one number per line).
     #[arg(long)]
     tui_frame_log: Option<String>,
 
