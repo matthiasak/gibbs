@@ -2570,8 +2570,7 @@ pub fn check(model: &Model) -> Result<(), String> {
 
 // ---- re-encode gate ---------------------------------------------------------------------------
 
-#[cfg(test)]
-static TEST_GATED_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+static GATED_LOAD: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
 
 /// The KL-gated re-encode ladder: loads with `load_once` under each policy the user's effective
 /// configuration allows (on Metal: max-speed -> max-speed (FFN only) -> low-bit-native ->
@@ -2583,17 +2582,17 @@ pub fn gated<T>(
     load_once: impl Fn() -> Option<Result<T, String>>,
     kl: impl Fn(&T, &T) -> Result<GateReport, String>,
 ) -> Option<Result<T, String>> {
-    #[cfg(test)]
-    let _test_guard = TEST_GATED_LOCK.lock();
+    let _gated_guard = GATED_LOAD.lock();
     use crate::model::reencode::{
         native_stats, reset_native_stats, save_reencode_cache, set_gate_context,
         set_native_applied, take_pending_reencode, ChoiceRecord, GateContext,
     };
     use crate::model::weight_format::{
-        gate_passes, reencode_override, set_reencode_override,
+        gate_passes, reencode_override, set_reencode_override, HopePolicy,
         ReencodePolicy::{BitExact, LowBitNative, MaxSpeed, MinSize},
     };
     let user = ReencodeConfig::effective();
+    let mut hope = user.hope;
     let attempts: &[(&str, ReencodePolicy, bool)] = match user.policy {
         _ if !on_metal => &[("bit-exact", BitExact, false)],
         MinSize => &[
@@ -2622,144 +2621,197 @@ pub fn gated<T>(
         }
     };
     let previous = reencode_override();
-    let load_as = |policy: ReencodePolicy, ffn_only: bool, allow_redirect: bool| {
-        if let Some(p) = &user.progress {
-            // Every attempt counts its own tensors.
-            p.done.store(0, std::sync::atomic::Ordering::Relaxed);
-            p.total.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-        set_reencode_override(Some(ReencodeConfig {
-            policy,
-            ffn_only,
-            ..user.clone()
-        }));
-        set_gate_context(Some(GateContext {
-            requested_policy: user.policy,
-            max_kl: user.max_kl,
-            allow_redirect,
-        }));
-        reset_native_stats();
-        load_once()
-    };
+    let load_as =
+        |policy: ReencodePolicy, ffn_only: bool, hope_cur: HopePolicy, allow_redirect: bool| {
+            if let Some(p) = &user.progress {
+                // Every attempt counts its own tensors.
+                p.done.store(0, std::sync::atomic::Ordering::Relaxed);
+                p.total.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            set_reencode_override(Some(ReencodeConfig {
+                policy,
+                hope: hope_cur,
+                ffn_only,
+                ..user.clone()
+            }));
+            set_gate_context(Some(GateContext {
+                requested_policy: user.policy,
+                max_kl: user.max_kl,
+                allow_redirect: allow_redirect && !hope_cur.is_active(),
+            }));
+            reset_native_stats();
+            load_once()
+        };
     let mut reference: Option<T> = None;
     let mut result = None;
     let mut i = 0usize;
-    let mut allow_redirect = true;
-    while i < attempts.len() {
-        let (mut label, mut policy, ffn_only) = attempts[i];
-        let Some(loaded) = load_as(policy, ffn_only, allow_redirect && i == 0) else {
-            result = None; // not this loader's architecture: the caller's fallback applies its own policy
-            break;
-        };
-        let cand = match loaded {
-            Ok(c) => c,
-            Err(e) => {
-                result = Some(Err(e));
+    let mut allow_redirect = !hope.is_active();
+    let mut last_hope_kl: Option<f64> = None;
+    loop {
+        while i < attempts.len() {
+            let (mut label, mut policy, ffn_only) = attempts[i];
+            let Some(loaded) = load_as(policy, ffn_only, hope, allow_redirect && i == 0) else {
+                result = None; // not this loader's architecture: the caller's fallback applies its own policy
+                break;
+            };
+            let cand = match loaded {
+                Ok(c) => c,
+                Err(e) => {
+                    result = Some(Err(e));
+                    break;
+                }
+            };
+            let stats = native_stats();
+            let pending = take_pending_reencode();
+            let saved = stats.bytes_before.saturating_sub(stats.bytes_after);
+            if !hope.is_active() {
+                if let Some(choice) = stats.cached_choice {
+                    if stats.cache_mismatch
+                        || stats.cache_hits != stats.reencoded
+                        || stats.reencoded == 0
+                    {
+                        // Cached rung was stale or mismatched; retry from rung 0 without redirecting.
+                        allow_redirect = false;
+                        continue;
+                    }
+                    policy = choice.policy;
+                    label = attempts
+                        .iter()
+                        .find(|&&(_, p, f)| p == choice.policy && f == choice.ffn_only)
+                        .map_or(policy.name(), |&(l, _, _)| l);
+                    log(format!(
+                        "reencode: {label} accepted (cached; mean KL {:.4} nats, top-1 {:.1}%; {} tensors, {:.0} MB saved)",
+                        choice.mean_kl,
+                        choice.top1 * 100.0,
+                        stats.reencoded,
+                        saved as f64 / 1e6
+                    ));
+                    set_native_applied(policy, saved, user.force);
+                    result = Some(Ok(cand));
+                    break;
+                }
+            }
+            i += 1;
+            if !on_metal || (!hope.is_active() && (policy == BitExact || stats.reencoded == 0)) {
+                set_native_applied(
+                    if stats.reencoded == 0 {
+                        BitExact
+                    } else {
+                        policy
+                    },
+                    saved,
+                    user.force,
+                );
+                if stats.reencoded > 0 || user.policy != BitExact {
+                    log(format!(
+                        "reencode: {label} applied ({} of {} tensors re-encoded)",
+                        stats.reencoded, stats.tensors
+                    ));
+                }
+                result = Some(Ok(cand));
                 break;
             }
-        };
-        let stats = native_stats();
-        let pending = take_pending_reencode();
-        let saved = stats.bytes_before.saturating_sub(stats.bytes_after);
-        if let Some(choice) = stats.cached_choice {
-            if stats.cache_mismatch || stats.cache_hits != stats.reencoded || stats.reencoded == 0 {
-                // Cached rung was stale or mismatched; retry from rung 0 without redirecting.
-                allow_redirect = false;
-                continue;
-            }
-            policy = choice.policy;
-            label = attempts
-                .iter()
-                .find(|&&(_, p, f)| p == choice.policy && f == choice.ffn_only)
-                .map_or(policy.name(), |&(l, _, _)| l);
-            log(format!(
-                "reencode: {label} accepted (cached; mean KL {:.4} nats, top-1 {:.1}%; {} tensors, {:.0} MB saved)",
-                choice.mean_kl,
-                choice.top1 * 100.0,
-                stats.reencoded,
-                saved as f64 / 1e6
-            ));
-            set_native_applied(policy, saved, user.force);
-            result = Some(Ok(cand));
-            break;
-        }
-        i += 1;
-        if policy == BitExact || stats.reencoded == 0 {
-            set_native_applied(
-                if stats.reencoded == 0 {
-                    BitExact
-                } else {
-                    policy
-                },
-                saved,
-                user.force,
-            );
-            if stats.reencoded > 0 || user.policy != BitExact {
-                log(format!(
-                    "reencode: {label} applied ({} of {} tensors re-encoded)",
-                    stats.reencoded, stats.tensors
-                ));
-            }
-            result = Some(Ok(cand));
-            break;
-        }
-        if reference.is_none() {
-            match load_as(BitExact, false, false) {
-                Some(Ok(r)) => {
-                    reference = Some(r);
-                    set_reencode_override(Some(ReencodeConfig {
-                        policy,
-                        ffn_only,
-                        ..user.clone()
-                    }));
+            if reference.is_none() {
+                match load_as(BitExact, false, HopePolicy::Off, false) {
+                    Some(Ok(r)) => {
+                        reference = Some(r);
+                        set_reencode_override(Some(ReencodeConfig {
+                            policy,
+                            hope,
+                            ffn_only,
+                            ..user.clone()
+                        }));
+                    }
+                    other => {
+                        log(format!(
+                            "reencode: no bit-exact reference to gate against ({}); using bit-exact",
+                            other.and_then(Result::err).unwrap_or_default()
+                        ));
+                        result =
+                            other_exact(&|p, f, a| load_as(p, f, HopePolicy::Off, a), user.force);
+                        break;
+                    }
                 }
-                other => {
+            }
+            // `load_as(BitExact)` above reset the stats: the candidate's own were read first.
+            let gate = kl(reference.as_ref().expect("loaded above"), &cand);
+            let hope_kl_limit = user.max_kl.unwrap_or_else(|| hope.kl_limit());
+            let passes = |r: &GateReport| {
+                if hope.is_active() {
+                    let top1_floor = (1.0 - hope_kl_limit * 1.5).clamp(0.50, 0.90);
+                    r.mean_kl <= hope_kl_limit && r.top1 >= top1_floor
+                } else {
+                    gate_passes(policy, user.max_kl, r)
+                }
+            };
+            match gate {
+                Ok(r) if passes(&r) => {
+                    if !hope.is_active() {
+                        if let Some(p) = pending {
+                            let choice = ChoiceRecord {
+                                policy,
+                                ffn_only,
+                                mean_kl: r.mean_kl,
+                                top1: r.top1,
+                            };
+                            if let Err(e) = save_reencode_cache(p, choice) {
+                                tracing::warn!("reencode cache: {e}");
+                            }
+                        }
+                    }
+                    let tag = if hope.is_active() {
+                        format!("{label} + hope={hope}")
+                    } else {
+                        label.to_string()
+                    };
                     log(format!(
-                        "reencode: no bit-exact reference to gate against ({}); using bit-exact",
-                        other.and_then(Result::err).unwrap_or_default()
+                        "reencode: {tag} accepted (mean KL {:.4} nats, top-1 {:.1}%; {} tensors, {:.0} MB saved)",
+                        r.mean_kl, r.top1 * 100.0, stats.reencoded, saved as f64 / 1e6
                     ));
-                    result = other_exact(&load_as, user.force);
+                    set_native_applied(policy, saved, user.force);
+                    result = Some(Ok(cand));
+                    break;
+                }
+                Ok(r) => {
+                    last_hope_kl = Some(r.mean_kl);
+                    if !hope.is_active() {
+                        crate::model::reencode::retain_pending_reencode(policy, pending);
+                    }
+                    let tag = if hope.is_active() {
+                        format!("{label} + hope={hope}")
+                    } else {
+                        label.to_string()
+                    };
+                    log(format!(
+                        "reencode: {tag} rejected (mean KL {:.4} nats, top-1 {:.1}%)",
+                        r.mean_kl,
+                        r.top1 * 100.0
+                    ));
+                    if hope.is_active() && stats.reencoded == 0 {
+                        // All subsequent re-encode rungs keep the exact same source blocks; step HOPE back now.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log(format!("reencode: gate unavailable ({e}); using bit-exact"));
+                    result = other_exact(&|p, f, a| load_as(p, f, HopePolicy::Off, a), user.force);
                     break;
                 }
             }
         }
-        // `load_as(BitExact)` above reset the stats: the candidate's own were read first.
-        let gate = kl(reference.as_ref().expect("loaded above"), &cand);
-        match gate {
-            Ok(r) if gate_passes(policy, user.max_kl, &r) => {
-                if let Some(p) = pending {
-                    let choice = ChoiceRecord {
-                        policy,
-                        ffn_only,
-                        mean_kl: r.mean_kl,
-                        top1: r.top1,
-                    };
-                    if let Err(e) = save_reencode_cache(p, choice) {
-                        tracing::warn!("reencode cache: {e}");
-                    }
-                }
-                log(format!(
-                    "reencode: {label} accepted (mean KL {:.4} nats, top-1 {:.1}%; {} tensors, {:.0} MB saved)",
-                    r.mean_kl, r.top1 * 100.0, stats.reencoded, saved as f64 / 1e6
-                ));
-                set_native_applied(policy, saved, user.force);
-                result = Some(Ok(cand));
-                break;
-            }
-            Ok(r) => {
-                crate::model::reencode::retain_pending_reencode(policy, pending);
-                log(format!(
-                    "reencode: {label} rejected (mean KL {:.4} nats, top-1 {:.1}%)",
-                    r.mean_kl,
-                    r.top1 * 100.0
-                ));
-            }
-            Err(e) => {
-                log(format!("reencode: gate unavailable ({e}); using bit-exact"));
-                result = other_exact(&load_as, user.force);
-                break;
-            }
+        if result.is_some() || !hope.is_active() {
+            break;
         }
+        let limit = user.max_kl.unwrap_or_else(|| hope.kl_limit());
+        let next = hope.step_back();
+        log(format!(
+            "hope: KL {:.4} exceeded {:.3}; stepping back to {next}",
+            last_hope_kl.unwrap_or(f64::NAN),
+            limit
+        ));
+        hope = next;
+        i = 0;
+        allow_redirect = !hope.is_active();
     }
     crate::model::reencode::clear_retained_pending();
     set_gate_context(None);
@@ -2916,7 +2968,7 @@ mod tests {
     #[test]
     fn reencoded_blocks_persist_and_mmap_zero_copy_on_second_load() {
         use crate::model::weight_format::{reencode_override, set_reencode_override};
-        let _test_guard = TEST_GATED_LOCK.lock();
+        let _gated_guard = GATED_LOAD.lock();
         let d = tempfile::tempdir().unwrap();
         let (rows, cols) = (64, 256);
         let v: Vec<f32> = (0..rows * cols)

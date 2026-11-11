@@ -145,6 +145,68 @@ impl TuiApp {
         if let Some((rows, scroll)) = &self.placement_modal {
             self.render_placement_modal(f, area, rows, *scroll, &th);
         }
+        if let Some((list, sel)) = &self.sessions_modal {
+            self.render_sessions_modal(f, area, list, *sel, &th);
+        }
+    }
+
+    fn render_sessions_modal(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        list: &[super::sessions::SavedSession],
+        sel: usize,
+        th: &Theme,
+    ) {
+        let popup = centered(
+            area,
+            (area.width * 70 / 100).max(50),
+            (area.height * 60 / 100).max(12),
+        );
+        f.render_widget(Clear, popup);
+        let block = instrument("Sessions (F3)", None, true, th);
+        let bold = th.fg(Token::Parchment).add_modifier(Modifier::BOLD);
+        let mut lines = vec![
+            Line::from(Span::styled(
+                " ↑↓ select · Enter load · n new · ctrl-d/Del delete · Esc/F3 close",
+                bold,
+            )),
+            Line::default(),
+        ];
+        if list.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " No saved sessions yet: every finished chat reply saves the conversation.",
+                th.fg(Token::Dim),
+            )));
+        }
+        let now = super::sessions::now_unix();
+        let rows = (popup.height as usize).saturating_sub(4).max(1);
+        for (i, s) in list.iter().enumerate().skip(sel.saturating_sub(rows - 1)).take(rows) {
+            let age = now.saturating_sub(s.updated_unix);
+            let ago = match age {
+                0..60 => "just now".to_string(),
+                60..3600 => format!("{}m ago", age / 60),
+                3600..86400 => format!("{}h ago", age / 3600),
+                _ => format!("{}d ago", age / 86400),
+            };
+            let current = self.session_id.as_deref() == Some(s.id.as_str());
+            let style = if i == sel {
+                th.fg(Token::Brass).add_modifier(Modifier::BOLD)
+            } else {
+                th.fg(Token::Dim)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}{} {} ", if i == sel { " ▸" } else { "  " }, if current { "*" } else { " " }, s.title),
+                    style,
+                ),
+                Span::styled(
+                    format!("· {} · {ago} · {} msgs", s.model_id, s.turns.len()),
+                    th.fg(Token::Dim),
+                ),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines).block(block), popup);
     }
 
     fn render_requests(&self, f: &mut Frame, area: Rect, th: &Theme) {
@@ -327,6 +389,7 @@ impl TuiApp {
                 ("i", "prompt"),
                 ("m", "models"),
                 ("F2", "templates"),
+                ("F3", "sessions"),
                 ("F4", "options"),
                 ("↑↓", "history"),
                 ("q", "quit"),
@@ -335,6 +398,7 @@ impl TuiApp {
                 ("enter", "run"),
                 ("↑↓", "history"),
                 ("F2", "templates"),
+                ("F3", "sessions"),
                 ("F4", "options"),
                 ("esc/ctrl-x", "cancel/back"),
                 ("ctrl-c", "quit"),
@@ -410,7 +474,7 @@ impl TuiApp {
         let popup = centered(
             area,
             (area.width * 74 / 100).max(58),
-            (area.height * 60 / 100).max(16),
+            (area.height * 64 / 100).max(17),
         );
         f.render_widget(Clear, popup);
         let block = instrument(
@@ -481,7 +545,7 @@ impl TuiApp {
                 Span::styled(" [1] Re-encode Policy:   ", label),
                 Span::styled(reencode_val, value),
                 Span::styled(
-                    " — highest-GB/s GPU codec for host ceiling (KL ≤ 0.05)  (1: max-speed / low-bit / bit-exact)",
+                    " — highest-GB/s GPU codec for host ceiling (KL ≤ 0.05)  (1: max-speed / low-bit / min-size / bit-exact)",
                     dim,
                 ),
             ]),
@@ -490,6 +554,14 @@ impl TuiApp {
                 Span::styled(variant_val, value),
                 Span::styled(
                     " — ranks checkpoints by predicted decode tok/s  (2: fastest / fastest-4bit / quality)",
+                    dim,
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" [H] HOPE Compression:   ", label),
+                Span::styled(self.hope_policy.to_string().to_uppercase(), value),
+                Span::styled(
+                    " — data-free Hilbert-Schmidt neuron merge/prune & block eviction  (H: off / light / balanced / aggressive)",
                     dim,
                 ),
             ]),
@@ -534,7 +606,11 @@ impl TuiApp {
                 Span::styled(" [8] Auto Compaction:    ", label),
                 Span::styled(compact_val, value),
                 Span::styled(
-                    " — 4-tier trim at 85%→60% ctx preserving Paged-Radix KV prefix  (8: cycle auto / light / aggressive / off)",
+                    format!(
+                        " — 4-tier trim at {:.0}%→{:.0}% ctx preserving Paged-Radix KV prefix  (8: cycle auto / light / aggressive / off)",
+                        self.compact_config.trigger_ratio * 100.0,
+                        self.compact_config.target_ratio * 100.0
+                    ),
                     dim,
                 ),
             ]),

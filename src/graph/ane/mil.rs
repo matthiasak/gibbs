@@ -189,10 +189,9 @@ pub fn rope_table(
 
 /// Whether placement may put `node` of `graph` on the ANE: [`check`] passes. State ops, gathers,
 /// scatters, `TopK`, `MoeLinear`, `Conv3d`, `Ln`, `RoundEven`, `Sign` and bicubic or 3-D
-/// upsampling stay on Metal; so does `Concat`, which [`lower`] takes only in drafter steps
-/// ([`super::draft`]).
+/// upsampling stay on Metal.
 pub fn supports_op(graph: &Graph, node: &Node) -> bool {
-    !matches!(node.op, Op::Concat { .. }) && check(graph, node).is_ok()
+    check(graph, node).is_ok()
 }
 
 /// How a `Binary` combines its operands, mirroring the CPU executor's order of attempts.
@@ -353,7 +352,9 @@ pub fn check(graph: &Graph, node: &Node) -> Result<(), String> {
             }
             need(
                 o <= MAX_CONV_OUT || (s == 1 && ins.len() == 2 && wide_split(o).is_some()),
-                &|| format!("{o} outputs exceed {MAX_CONV_OUT} channels (split only for one unbiased row)"),
+                &|| {
+                    format!("{o} outputs exceed {MAX_CONV_OUT} channels (split only for one unbiased row)")
+                },
             )?;
             out_is(&[s, o])
         }
@@ -659,15 +660,20 @@ pub fn check(graph: &Graph, node: &Node) -> Result<(), String> {
         }
         Op::Concat { axis } => {
             need(ins.len() >= 2, &|| "Concat of one operand".into())?;
-            need(norm_axis(*axis, os.len())? + 1 == os.len(), &|| {
-                "Concat lowers along the last axis only".into()
-            })?;
-            let s = flat2(shape(0)).0;
-            let c: usize = (0..ins.len()).map(|k| flat2(shape(k)).1).sum();
-            need((0..ins.len()).all(|k| flat2(shape(k)).0 == s), &|| {
-                "Concat operands differ in rows".into()
-            })?;
-            out_is(&[s, c])
+            let r = os.len();
+            need((1..=4).contains(&r), &|| format!("Concat rank {r} > 4"))?;
+            let ax = norm_axis(*axis, r)?;
+            let s0 = shape(0);
+            need(
+                (0..ins.len()).all(|k| {
+                    let sk = shape(k);
+                    sk.len() == r && (0..r).all(|d| d == ax || sk[d] == s0[d])
+                }),
+                &|| "Concat operands differ on non-concat dimensions".into(),
+            )?;
+            let mut want = s0.to_vec();
+            want[ax] = (0..ins.len()).map(|k| shape(k)[ax]).sum();
+            out_is(&want)
         }
         Op::L2Normalize => {
             arity(1, 1)?;
@@ -1259,7 +1265,11 @@ impl<'a> Lower<'a> {
 
     /// Rows `rows` of a Linear weight `[out, in]` as an fp16 `[rows, in, 1, 1]` conv weight in
     /// the most compact form the probe passed.
-    fn linear_weight(&mut self, v: ValueId, rows: std::ops::Range<usize>) -> Result<String, String> {
+    fn linear_weight(
+        &mut self,
+        v: ValueId,
+        rows: std::ops::Range<usize>,
+    ) -> Result<String, String> {
         let t = self.weight(v)?;
         let [_, k] = self.shape(v)[..] else {
             return Err(format!(
@@ -1847,10 +1857,33 @@ impl<'a> Lower<'a> {
                     self.set(out, y, false);
                 }
             }
-            Op::Concat { .. } => {
-                let parts = ins.iter().map(|&v| self.tok(v)).collect::<Result<Vec<_>, _>>()?;
-                let y = self.concat(1, false, &parts);
-                self.set(out, y, true);
+            Op::Concat { axis } => {
+                let r = in_shape.len();
+                let ax = norm_axis(*axis, r)?;
+                if ax + 1 == r && r <= 2 {
+                    let parts = ins
+                        .iter()
+                        .map(|&v| self.tok(v))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let y = self.concat(1, false, &parts);
+                    self.set(out, y, true);
+                } else if ax == 0 && r == 2 && ins.iter().all(|&v| self.mv(v).is_ok_and(|m| m.tok))
+                {
+                    let parts = ins
+                        .iter()
+                        .map(|&v| self.tok(v))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let y = self.concat(3, false, &parts);
+                    self.set(out, y, true);
+                } else {
+                    let mut parts = Vec::with_capacity(ins.len());
+                    for v in ins {
+                        parts.push(self.row(v)?.0);
+                    }
+                    let mil_ax = ax + 4 - r;
+                    let y = self.concat(mil_ax, false, &parts);
+                    self.set(out, y, false);
+                }
             }
             Op::Tile { reps } => {
                 let (x, p) = self.row(ins[0])?;

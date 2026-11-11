@@ -11,6 +11,7 @@ mod picker;
 pub mod qos;
 mod render;
 pub mod settings;
+mod sessions;
 #[cfg(test)]
 mod snapshot;
 pub mod theme;
@@ -81,10 +82,21 @@ enum SlashCmd {
     /// `None` cycles to the next policy.
     Reencode(Option<ReencodePolicy>),
     Variant(Option<VariantPolicy>),
+    Hope(Option<crate::model::weight_format::HopePolicy>),
     Profile(ProfileArg),
     Placement,
     /// No arguments: print the status.
     Spec(Vec<SpecArg>),
+    Session(SessionArg),
+}
+
+/// `/session` arguments.
+#[derive(Debug, PartialEq)]
+enum SessionArg {
+    List,
+    New,
+    Load(String),
+    Delete(String),
 }
 
 /// `/profile` arguments.
@@ -138,8 +150,24 @@ fn parse_slash(raw: &str) -> Option<Result<SlashCmd, String>> {
                     "unknown variant policy '{arg}'; valid: fastest, fastest-4bit, best-quality"
                 )
             }),
+        "/hope" if arg.is_empty() => Ok(SlashCmd::Hope(None)),
+        "/hope" => arg.parse().map(|p| SlashCmd::Hope(Some(p))),
         "/profile" => parse_profile(arg).map(SlashCmd::Profile),
         "/spec" => parse_spec(arg).map(SlashCmd::Spec),
+        "/session" => {
+            let (sub, id) = arg
+                .split_once(char::is_whitespace)
+                .map_or((arg, ""), |(a, b)| (a, b.trim()));
+            match (sub, id) {
+                ("" | "list", _) => Ok(SlashCmd::Session(SessionArg::List)),
+                ("new", _) => Ok(SlashCmd::Session(SessionArg::New)),
+                ("load", id) if !id.is_empty() => Ok(SlashCmd::Session(SessionArg::Load(id.into()))),
+                ("delete", id) if !id.is_empty() => {
+                    Ok(SlashCmd::Session(SessionArg::Delete(id.into())))
+                }
+                _ => Err("usage: /session [list|new|load <id>|delete <id>]".into()),
+            }
+        }
         _ => return None,
     })
 }
@@ -540,6 +568,11 @@ pub struct TuiApp {
     pub history: Vec<Entry>,
     /// Multi-turn conversation history (`("user" | "assistant", content)` pairs).
     pub chat_history: Vec<(String, String)>,
+    /// Saved session `chat_history` auto-saves into after each finished turn; `None` until the
+    /// first save (and after `/clear` or `n` in the F3 modal) mints a new id.
+    session_id: Option<String>,
+    /// F3 sessions modal: the saved sessions (newest first) and the highlighted row.
+    sessions_modal: Option<(Vec<sessions::SavedSession>, usize)>,
     pub input: String,
     pub prompt_history: Vec<String>,
     pub prompt_history_idx: Option<usize>,
@@ -580,6 +613,7 @@ pub struct TuiApp {
     placement_modal: Option<(Vec<crate::graph::placement::PlacementRow>, usize)>,
     pub reencode_policy: crate::model::weight_format::ReencodePolicy,
     pub variant_policy: crate::model::weight_format::VariantPolicy,
+    pub hope_policy: crate::model::weight_format::HopePolicy,
     pub draft_knobs: crate::runtime::noise_draft::DraftKnobs,
     pub compact_config: crate::compact::CompactionConfig,
     pub ctx_limit: usize,
@@ -662,6 +696,8 @@ impl TuiApp {
             scratch_dir: tempfile::tempdir().expect("scratch directory for TUI images"),
             history: Vec::new(),
             chat_history: Vec::new(),
+            session_id: None,
+            sessions_modal: None,
             input: String::new(),
             prompt_history: Vec::new(),
             prompt_history_idx: None,
@@ -693,6 +729,7 @@ impl TuiApp {
             placement_modal: None,
             reencode_policy: saved.reencode,
             variant_policy: saved.variant,
+            hope_policy: saved.hope,
             draft_knobs: saved.draft,
             compact_config: saved.compact,
             ctx_limit: 8192,
@@ -819,7 +856,7 @@ impl TuiApp {
                 self.roofline_probe_result = probe.as_ref().ok().cloned();
                 Some(probe)
             }
-            "/reencode" | "/variant" | "/profile" | "/placement" | "/spec" => Some(
+            "/reencode" | "/variant" | "/hope" | "/profile" | "/placement" | "/spec" | "/session" => Some(
                 parse_slash(&raw)
                     .unwrap_or_else(|| Err(format!("unknown command '{cmd}'")))
                     .and_then(|c| self.run_slash(c, &raw)),
@@ -836,6 +873,7 @@ impl TuiApp {
             "/clear" | "/reset" | "/new" => {
                 let prev_turns = self.chat_history.len() / 2;
                 self.chat_history.clear();
+                self.session_id = None;
                 if let Some(s) = &self.scheduler {
                     s.radix.clear();
                 }
@@ -888,7 +926,7 @@ impl TuiApp {
                 Some(Ok(
                     "GIBBS ENGINE COMMAND & KEY REFERENCE:\n\
                      Keybindings:\n\
-                     · m / Esc    : Switch between Dashboard & Model Picker (there ^r / ^f cycle the re-encode / variant policy and reload the model)\n\
+                     · m / Esc    : Switch between Dashboard & Model Picker (there ^r / ^f / ^o cycle re-encode / variant / HOPE policy and reload)\n\
                      · ↑ / ↓      : Cycle prior prompt entries for retry or editing\n\
                      · F2         : System Prompt / Chat Template Selector\n\
                      · F4         : Policy & Speed Options modal (defaults = fastest for model)\n\
@@ -898,6 +936,7 @@ impl TuiApp {
                      Slash Commands:\n\
                      · /reencode [max-speed|min-size|low-bit-native|bit-exact] : Set the weight re-encode policy (no argument cycles) and reload the active model under it\n\
                      · /variant [fastest|fastest-4bit|best-quality] : Set the variant policy of the picker and downloads (no argument cycles) and reload the active model\n\
+                     · /hope [off|light|balanced|aggressive|0.50..0.99] : Set on-the-fly HOPE progressive compression (no argument cycles) and reload\n\
                      · /settings  : Show the policy settings modal (F4) and the current policies\n\
                      · /profile on|off|sort <time|bandwidth|share> : Sample one decode token every 5 s, step by step, into the KERNELS panel; sort its rows (key s cycles)\n\
                      · /bench     : Benchmark the loaded model on Metal (128 tokens x 3 runs): tok/s, roofline % and where each token's time goes; refuses while generating\n\
@@ -911,6 +950,7 @@ impl TuiApp {
                      · /embed <text>     : Compute L2-normalized embedding on the active System 1 or LLM model\n\
                      · /chat <msg>: Send chat message to active model\n\
                      · /connect   : Print curl/OpenAI API connection commands\n\
+                     · F3 / /session [list|new|load <id>|delete <id>] : Saved multi-turn chat sessions (auto-saved after every reply)\n\
                      · /clear (/reset, /new) : Clear multi-turn chat history and KV prefix cache\n\
                      · /pop (/undo)          : Remove the last user/assistant turn from chat history\n\
                      · /history              : Inspect active multi-turn chat messages\n\
@@ -939,7 +979,7 @@ impl TuiApp {
             "/classify" | "/cls" => (Ok(Route::Classify), rest.trim()),
             "/i2v" => (Ok(Route::Video { image: true }), rest.trim()),
             "/video" | "/vid" | "/t2v" => (Ok(Route::Video { image: false }), rest.trim()),
-            c if c.starts_with('/') => (Err(format!("unknown command '{c}'; use /chat, /system1, /image, /decide, /embed, /classify, /connect, /agent, /roofline, /reencode, /variant, /settings, /profile, /bench, /placement, /quant, /help, /gibbs")), ""),
+            c if c.starts_with('/') => (Err(format!("unknown command '{c}'; use /chat, /system1, /image, /decide, /embed, /classify, /connect, /agent, /roofline, /reencode, /variant, /hope, /settings, /profile, /bench, /placement, /quant, /help, /gibbs")), ""),
             _ if self.classifier.read().is_some() => (Ok(Route::Classify), raw.as_str()),
             _ if self.image_model.read().is_some() => (Ok(Route::Image), raw.as_str()),
             _ if self.jev_model.read().is_some() => (
@@ -997,6 +1037,7 @@ impl TuiApp {
             SlashCmd::Placement => self.placement_report(prompt),
             SlashCmd::Reencode(p) => self.set_reencode(p),
             SlashCmd::Variant(p) => self.set_variant(p),
+            SlashCmd::Hope(p) => self.set_hope(p),
             SlashCmd::Profile(a) => {
                 match a {
                     ProfileArg::Status => {}
@@ -1013,7 +1054,78 @@ impl TuiApp {
                 ))
             }
             SlashCmd::Spec(a) => self.apply_spec_cmd(a),
+            SlashCmd::Session(a) => match a {
+                SessionArg::List => {
+                    let all = sessions::list();
+                    if all.is_empty() {
+                        return Ok("No saved sessions.".into());
+                    }
+                    let mut lines = vec![format!("SAVED SESSIONS ({}, newest first):", all.len())];
+                    for s in &all {
+                        lines.push(format!(
+                            "  {}  {}  [{} · {} msgs]",
+                            s.id,
+                            s.title,
+                            s.model_id,
+                            s.turns.len()
+                        ));
+                    }
+                    Ok(lines.join("\n"))
+                }
+                SessionArg::New => {
+                    self.new_session();
+                    Ok("Started a new session (chat history cleared).".into())
+                }
+                SessionArg::Load(id) => self.open_session(&id),
+                SessionArg::Delete(id) => sessions::delete(&id).map(|()| format!("Deleted session {id}.")),
+            },
         }
+    }
+
+    /// Saves `chat_history` as the current session (minting its id on the first save).
+    fn save_session(&mut self) {
+        if self.chat_history.is_empty() {
+            return;
+        }
+        let turns: Vec<sessions::SavedTurn> = self
+            .chat_history
+            .iter()
+            .map(|(role, text)| sessions::SavedTurn {
+                role: role.clone(),
+                text: text.clone(),
+                media_paths: Vec::new(),
+            })
+            .collect();
+        let s = sessions::SavedSession {
+            id: self.session_id.get_or_insert_with(sessions::new_id).clone(),
+            title: sessions::title_of(&turns),
+            updated_unix: sessions::now_unix(),
+            model_id: self.model_id(),
+            system_prompt: self.system_prompt.clone(),
+            turns,
+        };
+        if let Err(e) = sessions::save(&s) {
+            self.telemetry.log_info(&format!("TUI: session save failed: {e}"));
+        }
+    }
+
+    /// Replaces `chat_history` and the system prompt with saved session `id`, which later turns extend.
+    fn open_session(&mut self, id: &str) -> Result<String, String> {
+        let s = sessions::load(id)?;
+        self.chat_history = s.turns.into_iter().map(|t| (t.role, t.text)).collect();
+        self.system_prompt = s.system_prompt;
+        self.session_id = Some(s.id);
+        Ok(format!(
+            "Loaded session '{}' ({} messages).",
+            s.title,
+            self.chat_history.len()
+        ))
+    }
+
+    /// Clears `chat_history`; the next finished turn saves under a new session id.
+    fn new_session(&mut self) {
+        self.chat_history.clear();
+        self.session_id = None;
     }
 
     /// `/system1 [on|off]`: turns any loaded LLM into a System 1 model (or returns it to chat).
@@ -1080,6 +1192,19 @@ impl TuiApp {
         s.variant = next;
         settings::save_settings(&s)?;
         Ok(self.reload_for("variant", next.name()))
+    }
+
+    /// `/hope [policy]`: as [`Self::set_reencode`], for HOPE progressive weight compression.
+    fn set_hope(
+        &mut self,
+        policy: Option<crate::model::weight_format::HopePolicy>,
+    ) -> Result<String, String> {
+        let next = policy.unwrap_or_else(|| self.hope_policy.next());
+        self.hope_policy = next;
+        let mut s = settings::load_settings();
+        s.hope = next;
+        settings::save_settings(&s)?;
+        Ok(self.reload_for("hope", &next.to_string()))
     }
 
     /// Applies `/spec` arguments to `self.draft_knobs`, `settings.json` and the live scheduler, and
@@ -1841,12 +1966,8 @@ impl TuiApp {
             set_reencode_override(Some(reencode_cfg.clone()));
             // A panic inside loading must surface as an error, not leave the load stuck.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let backend = match placement {
-                    PlacementMode::Pin(d) => d,
-                    PlacementMode::Auto => crate::hardware::default_device(),
-                };
                 let o = crate::arch::LoadOpts {
-                    placement: PlacementMode::Pin(backend),
+                    placement,
                     token: token.as_deref(),
                     quant_name: None,
                     hw: &hw,
@@ -1965,7 +2086,10 @@ impl TuiApp {
         std::thread::spawn(move || {
             crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
             let attach = || -> Result<String, String> {
-                if matches!(id.as_str(), "noise" | "online-noise" | "suffix") {
+                if matches!(
+                    id.as_str(),
+                    "noise" | "online-noise" | "noise-dflash" | "suffix"
+                ) {
                     let mode = if id == "suffix" {
                         crate::runtime::noise_draft::DraftMode::Suffix
                     } else {
@@ -2134,6 +2258,7 @@ impl TuiApp {
             return;
         }
         self.running -= 1;
+        let turn_done = kind == Kind::Text && e.chat_user.is_some();
         if kind == Kind::Text {
             if let Some(user_msg) = e.chat_user.take() {
                 self.chat_history.push(("user".to_string(), user_msg));
@@ -2146,6 +2271,9 @@ impl TuiApp {
         (e.kind, e.output, e.stats) = (kind, text, stats);
         e.took = Some(e.started.elapsed());
         e.cancel = None;
+        if turn_done {
+            self.save_session();
+        }
     }
 
     /// Cancels the newest running chat: its thread drops the token receiver (freeing the
@@ -2372,6 +2500,48 @@ impl TuiApp {
                 _ => {}
             }
         }
+        if key.code == KeyCode::F(3) {
+            self.sessions_modal = match self.sessions_modal {
+                Some(_) => None,
+                None => Some((sessions::list(), 0)),
+            };
+            return false;
+        }
+        if let Some((list, sel)) = &mut self.sessions_modal {
+            let delete = key.code == KeyCode::Delete || (ctrl && key.code == KeyCode::Char('d'));
+            match key.code {
+                _ if delete => {
+                    if *sel < list.len() {
+                        let _ = sessions::delete(&list.remove(*sel).id);
+                        *sel = (*sel).min(list.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Esc => self.sessions_modal = None,
+                KeyCode::Up => *sel = sel.saturating_sub(1),
+                KeyCode::Down => *sel = (*sel + 1).min(list.len().saturating_sub(1)),
+                KeyCode::Enter => {
+                    let id = list.get(*sel).map(|s| s.id.clone());
+                    self.sessions_modal = None;
+                    if let Some(id) = id {
+                        let (kind, text) = self
+                            .open_session(&id)
+                            .map_or_else(|e| (Kind::Error, e), |t| (Kind::Text, t));
+                        self.push_entry(format!("/session load {id}"), kind, text);
+                    }
+                }
+                KeyCode::Char('n') => {
+                    self.sessions_modal = None;
+                    self.new_session();
+                    self.push_entry(
+                        "/session new".into(),
+                        Kind::Text,
+                        "Started a new session (chat history cleared).".into(),
+                    );
+                }
+                _ => {}
+            }
+            return false;
+        }
         if key.code == KeyCode::F(2) {
             self.show_template_modal = !self.show_template_modal;
             return false;
@@ -2456,6 +2626,9 @@ impl TuiApp {
                     let next = self.draft_knobs.denoise_steps % 4 + 1;
                     let _ = self.apply_spec_cmd(vec![SpecArg::Steps(next)]);
                 }
+                KeyCode::Char('h') | KeyCode::Char('H') => {
+                    let _ = self.set_hope(None);
+                }
                 KeyCode::Enter => self.show_settings_modal = false,
                 _ => {}
             }
@@ -2475,12 +2648,13 @@ impl TuiApp {
                     let s = settings::load_settings();
                     self.reencode_policy = s.reencode;
                     self.variant_policy = s.variant;
-                    let value = if what == "reencode" {
-                        s.reencode.name()
-                    } else {
-                        s.variant.name()
+                    self.hope_policy = s.hope;
+                    let value = match what {
+                        "reencode" => s.reencode.name().to_string(),
+                        "hope" => s.hope.to_string(),
+                        _ => s.variant.name().to_string(),
                     };
-                    let note = self.reload_for(what, value);
+                    let note = self.reload_for(what, &value);
                     self.picker.set_note(note, theme::Token::Jade);
                 }
                 PickerAction::AttachDraft(id) => {
@@ -3384,7 +3558,7 @@ mod tests {
         // 3. '1' cycles reencode_policy: MaxSpeed -> LowBitNative -> BitExact -> MaxSpeed, saving
         // each step to the settings file.
         assert_eq!(app.reencode_policy, R::MaxSpeed);
-        for p in [R::LowBitNative, R::BitExact, R::MaxSpeed] {
+        for p in [R::LowBitNative, R::MinSize, R::BitExact, R::MaxSpeed] {
             app.handle_key(key(KeyCode::Char('1')));
             assert_eq!(app.reencode_policy, p);
             assert_eq!(settings::load_settings().reencode, p);
@@ -3425,6 +3599,7 @@ mod tests {
         );
         type_and_run(&mut app, "/compact keep=x");
         assert_eq!(app.history.last().unwrap().kind, Kind::Error);
+        app.handle_key(key(KeyCode::Char('1')));
         app.handle_key(key(KeyCode::Char('1')));
         app.handle_key(key(KeyCode::Char('1')));
         app.handle_key(key(KeyCode::Char('2')));
@@ -3638,10 +3813,13 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         let s = crate::tui::settings::load_settings();
-        // From the low-bit-native set above: one step on is bit-exact, saved and followed by the app.
+        // From the low-bit-native set above: min-size -> bit-exact, saved and followed by the app.
+        assert_eq!(s.reencode.name(), "min-size");
+        assert_eq!(app.reencode_policy, s.reencode);
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let s = crate::tui::settings::load_settings();
         assert_eq!(s.reencode.name(), "bit-exact");
         assert_eq!(app.reencode_policy, s.reencode);
-
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         let s = crate::tui::settings::load_settings();
         assert_eq!(s.variant.name(), "best-quality");
@@ -3955,7 +4133,7 @@ mod tests {
         for a in ["max-compress", "minsize", "MinSize"] {
             assert_eq!(a.parse::<R>().ok(), Some(R::MinSize));
         }
-        assert_eq!(R::MinSize.next(), R::MaxSpeed);
+        assert_eq!(R::MinSize.next(), R::BitExact);
         assert_eq!(R::BitExact.next(), R::MaxSpeed);
         for (s, p) in [
             ("fastest", V::Fastest),
@@ -4260,5 +4438,79 @@ mod tests {
         app.input = "/clear".into();
         app.submit_prompt();
         assert!(app.chat_history.is_empty());
+    }
+
+    /// Finishes one chat turn the way a streamed reply does (`Update::Done` on a chat entry).
+    fn finish_turn(app: &mut TuiApp, q: &str, a: &str) {
+        let idx = app.push_entry(q.into(), Kind::Running, String::new());
+        app.history.last_mut().unwrap().chat_user = Some(q.into());
+        app.running += 1;
+        let (kind, text, stats) = (Kind::Text, a.to_string(), String::new());
+        app.updates_tx.send(Update::Done { idx, kind, text, stats }).unwrap();
+        app.drain_updates();
+    }
+
+    /// `^o` (picker), `h` (F4) and `/hope` persist the HOPE policy; finished turns auto-save a
+    /// session that survives a model switch, F3 `n` starts fresh, Enter restores, ctrl-d deletes.
+    #[test]
+    fn picker_ctrl_o_f4_h_and_f3_sessions_round_trip() {
+        use crate::model::weight_format::HopePolicy;
+        let mut app = TuiApp::new(EngineTelemetry::new());
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        app.focus = Focus::Picker;
+        app.handle_key(ctrl('o'));
+        assert_eq!(settings::load_settings().hope, HopePolicy::Light);
+        assert_eq!(app.hope_policy, HopePolicy::Light);
+        app.focus = Focus::Dashboard;
+        app.handle_key(key(KeyCode::F(4)));
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(settings::load_settings().hope, HopePolicy::Balanced);
+        type_and_run(&mut app, "/hope off");
+        assert_eq!(settings::load_settings().hope, HopePolicy::Off);
+        assert_eq!(app.hope_policy, HopePolicy::Off);
+
+        // Two turns with a model load in between: one session, all four messages.
+        finish_turn(&mut app, "What is entropy?", "A measure of disorder.");
+        let id = app.session_id.clone().expect("first finished turn saves a session");
+        let idx = app.push_entry("load other".into(), Kind::Running, String::new());
+        app.running += 1;
+        let (other, result) = ("other/model".to_string(), Ok("shape".to_string()));
+        app.updates_tx.send(Update::Loaded { idx, id: other, result }).unwrap();
+        app.drain_updates();
+        finish_turn(&mut app, "And temperature?", "Mean kinetic energy.");
+        assert_eq!(app.chat_history.len(), 4);
+        assert_eq!(app.session_id.as_deref(), Some(id.as_str()));
+        let saved = sessions::load(&id).unwrap();
+        assert_eq!(saved.title, "What is entropy?");
+        let turns: Vec<(String, String)> =
+            saved.turns.iter().map(|t| (t.role.clone(), t.text.clone())).collect();
+        assert_eq!(turns, app.chat_history);
+
+        // F3 lists it; `n` starts fresh.
+        app.handle_key(key(KeyCode::F(3)));
+        assert!(app.sessions_modal.as_ref().is_some_and(|(l, _)| l.len() == 1 && l[0].id == id));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(app.sessions_modal.is_none());
+        assert!(app.chat_history.is_empty() && app.session_id.is_none());
+
+        // Enter restores the turns and system prompt; `/session list` shows it.
+        app.system_prompt = "something else".into();
+        app.handle_key(key(KeyCode::F(3)));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.chat_history, turns);
+        assert_eq!(app.system_prompt, saved.system_prompt);
+        assert_eq!(app.session_id.as_deref(), Some(id.as_str()));
+        type_and_run(&mut app, "/session list");
+        assert!(app.history.last().unwrap().output.contains(&id));
+
+        // ctrl-d deletes the highlighted session; Esc closes.
+        app.handle_key(key(KeyCode::F(3)));
+        app.handle_key(ctrl('d'));
+        assert!(app.sessions_modal.as_ref().is_some_and(|(l, _)| l.is_empty()));
+        assert!(sessions::list().is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.sessions_modal.is_none());
     }
 }

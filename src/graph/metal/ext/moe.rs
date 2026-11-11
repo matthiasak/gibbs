@@ -17,7 +17,9 @@ use crate::graph::codegen::{
 };
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
-use metal::{CompileOptions, ComputePipelineState, MTLSize};
+#[cfg(test)]
+use metal::CompileOptions;
+use metal::{ComputePipelineState, MTLSize};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -420,13 +422,10 @@ fn quant_embed_pso(sess: &Session, f: QuantFormat) -> Result<ComputePipelineStat
         return Ok(p.clone());
     }
     let c = codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-    let opts = CompileOptions::new();
-    opts.set_fast_math_enabled(false);
-    let lib = device
-        .new_library_with_source(&quant_embed_src(c), &opts)
+    let pso = sess
+        .rt
+        .compile_generated(&quant_embed_src(c), "embed_quant", false)
         .map_err(|e| format!("generated {f:?} embedding gather failed to compile: {e}"))?;
-    let func = lib.get_function("embed_quant", None)?;
-    let pso = device.new_compute_pipeline_state_with_function(&func)?;
     QUANT_EMBED.lock().insert(key, pso.clone());
     Ok(pso)
 }
@@ -475,15 +474,15 @@ fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineSt
         "#include <metal_stdlib>\nusing namespace metal;\n{}",
         gemv_indexed(c, params)
     );
-    let opts = CompileOptions::new();
-    let lib = device.new_library_with_source(&src, &opts).map_err(|e| {
-        format!(
-            "generated {:?} expert GEMV failed to compile: {e}",
-            c.format
-        )
-    })?;
-    let func = lib.get_function(&gemv_indexed_name(c, params), None)?;
-    let pso = device.new_compute_pipeline_state_with_function(&func)?;
+    let pso = sess
+        .rt
+        .compile_generated(&src, &gemv_indexed_name(c, params), true)
+        .map_err(|e| {
+            format!(
+                "generated {:?} expert GEMV failed to compile: {e}",
+                c.format
+            )
+        })?;
     MOE_GEMV.lock().insert(key, pso.clone());
     Ok(pso)
 }
@@ -504,7 +503,7 @@ fn moe_gemm_pso(sess: &Session, c: &Codec, epi: u32) -> Result<ComputePipelineSt
     src.push_str(gemm_common(&super::super::KERNELS_MSL));
     src.push_str(&gemm_packed(c, epi, true));
     let name = gemm_packed_name(c, epi, true);
-    let pso = sess.rt.compile_generated(&src, &name)?;
+    let pso = sess.rt.compile_generated(&src, &name, false)?;
     MOE_GEMM.lock().insert(key, pso.clone());
     Ok(pso)
 }
@@ -1001,7 +1000,7 @@ pub(crate) mod tests {
                         .remove(0)
                         .as_u32()
                         .unwrap()[0];
-                    let want = crate::runtime::lm::sample_logits(&x[..valid], &[], 0.0, 50, 1.0);
+                    let want = crate::runtime::lm::sample_logits(&x[..valid], &[], 0.0, 50, 1.0, 0);
                     assert_eq!(got, want, "head {name} cols={cols} valid={valid}");
                 }
             }

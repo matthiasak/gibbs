@@ -35,6 +35,16 @@ pub struct SharedArenaPlan {
 impl SharedArenaPlan {
     /// Allocates arena offsets for all intermediate node outputs in `graph`.
     pub fn build(graph: &Graph, alignment: usize) -> Self {
+        Self::build_with_aliases(graph, alignment, &HashMap::new())
+    }
+
+    /// Like [`Self::build`], with `aliases` (`alias_value -> (root_value, byte_offset)`) sharing
+    /// `root_value`'s span and extending `root_value`'s lifetime through every alias reader.
+    pub fn build_with_aliases(
+        graph: &Graph,
+        alignment: usize,
+        aliases: &HashMap<ValueId, (ValueId, usize)>,
+    ) -> Self {
         let align = alignment.max(16).next_power_of_two();
         let align_up = |n: usize| (n + align - 1) & !(align - 1);
 
@@ -55,10 +65,19 @@ impl SharedArenaPlan {
         for &out in &graph.outputs {
             last_use.insert(out, n_nodes);
         }
+        for (&alias_vid, &(root_vid, _)) in aliases {
+            if let Some(&end) = last_use.get(&alias_vid) {
+                let e = last_use.entry(root_vid).or_insert(0);
+                *e = (*e).max(end);
+            }
+        }
 
         // Collect values produced at each step and values expiring after each step.
         let mut born_at: Vec<Vec<ValueId>> = vec![Vec::new(); n_nodes];
         for (&vid, &step) in &def_step {
+            if aliases.contains_key(&vid) {
+                continue;
+            }
             let v = graph.value(vid);
             if matches!(v.kind, ValueKind::Node(_)) && step < n_nodes {
                 born_at[step].push(vid);
@@ -122,6 +141,27 @@ impl SharedArenaPlan {
                         bytes: req,
                         first_step: step,
                         last_step: end_step,
+                    },
+                );
+            }
+        }
+        for (&alias_vid, &(root_vid, byte_off)) in aliases {
+            if let Some(&rs) = spans.get(&root_vid) {
+                let v = graph.value(alias_vid);
+                let bytes = match v.dtype {
+                    DType::F32 | DType::U32 => v.shape.iter().product::<usize>().max(1) * 4,
+                    DType::F16 | DType::BF16 => v.shape.iter().product::<usize>().max(1) * 2,
+                    DType::Quant(q) => q
+                        .tensor_bytes(v.shape.iter().product::<usize>().max(1))
+                        .max(4),
+                };
+                spans.insert(
+                    alias_vid,
+                    ArenaSpan {
+                        offset: rs.offset + byte_off,
+                        bytes,
+                        first_step: def_step.get(&alias_vid).copied().unwrap_or(rs.first_step),
+                        last_step: last_use.get(&alias_vid).copied().unwrap_or(rs.last_step),
                     },
                 );
             }

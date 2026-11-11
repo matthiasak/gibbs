@@ -13,14 +13,43 @@ use std::collections::{HashMap, HashSet};
 /// unfused so their Linears read the weights through a codec GEMV instead.
 pub(crate) const MEGAKERNEL_QUANT: &[crate::hardware::QuantFormat] = &[
     crate::hardware::QuantFormat::GGUF_Q4_0,
+    crate::hardware::QuantFormat::GGUF_Q4_1,
+    crate::hardware::QuantFormat::GGUF_Q5_0,
+    crate::hardware::QuantFormat::GGUF_Q5_1,
     crate::hardware::QuantFormat::GGUF_Q8_0,
+    crate::hardware::QuantFormat::GGUF_Q2_K,
+    crate::hardware::QuantFormat::GGUF_Q3_K,
+    crate::hardware::QuantFormat::GGUF_Q4_K_M,
+    crate::hardware::QuantFormat::GGUF_Q5_K_M,
+    crate::hardware::QuantFormat::GGUF_Q6_K,
+    crate::hardware::QuantFormat::GGUF_IQ4_NL,
     crate::hardware::QuantFormat::GGUF_IQ4_XS,
+    crate::hardware::QuantFormat::GGUF_IQ3_S,
+    crate::hardware::QuantFormat::GGUF_IQ3_XXS,
+    crate::hardware::QuantFormat::GGUF_IQ2_XXS,
+    crate::hardware::QuantFormat::GGUF_IQ2_XS,
     crate::hardware::QuantFormat::GGUF_IQ2_M,
     crate::hardware::QuantFormat::GGUF_IQ2_S,
-    crate::hardware::QuantFormat::GGUF_Q4_K_M,
-    crate::hardware::QuantFormat::GGUF_Q2_K,
-    crate::hardware::QuantFormat::GGUF_IQ3_S,
+    crate::hardware::QuantFormat::GGUF_IQ1_M,
+    crate::hardware::QuantFormat::GGUF_IQ1_S,
+    crate::hardware::QuantFormat::GGUF_TQ2_0,
+    crate::hardware::QuantFormat::GGUF_TQ1_0,
+    crate::hardware::QuantFormat::GGUF_NVFP4,
     crate::hardware::QuantFormat::NVFP4,
+    crate::hardware::QuantFormat::MXFP4,
+    crate::hardware::QuantFormat::FP8_E4M3_B32,
+    crate::hardware::QuantFormat::BNB_NF4_B64,
+    crate::hardware::QuantFormat::BNB_NF4_B128,
+    crate::hardware::QuantFormat::BNB_NF4_B256,
+    crate::hardware::QuantFormat::BNB_FP4_B64,
+    crate::hardware::QuantFormat::BNB_FP4_B128,
+    crate::hardware::QuantFormat::BNB_FP4_B256,
+    crate::hardware::QuantFormat::MLX_AFFINE4_G32,
+    crate::hardware::QuantFormat::MLX_AFFINE4_G64,
+    crate::hardware::QuantFormat::MLX_AFFINE4_G128,
+    crate::hardware::QuantFormat::INT4_G32,
+    crate::hardware::QuantFormat::INT4_G64,
+    crate::hardware::QuantFormat::INT4_G128,
 ];
 
 /// Weight dtypes a fused MLP may read: float, or a [`MEGAKERNEL_QUANT`] format with a GEMV codec
@@ -64,8 +93,12 @@ pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: &HashSet<NodeId>) -> usiz
     for i in 0..n_nodes {
         let add_nid = NodeId(i as u32);
         let add_node = graph.node(add_nid);
-        if !matches!(add_node.op, Op::Binary { kind: crate::graph::BinaryKind::Add })
-            || add_node.inputs.len() != 2
+        if !matches!(
+            add_node.op,
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add
+            }
+        ) || add_node.inputs.len() != 2
             || graph.value(add_node.inputs[0]).shape != graph.value(add_node.inputs[1]).shape
             || !only.contains(&add_nid)
         {
@@ -110,7 +143,15 @@ pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: &HashSet<NodeId>) -> usiz
             let swiglu_val = down_node.inputs[0];
             let down_w = down_node.inputs[1];
             // The megakernel is a one-row GEMV chain; batched activations stay as separate GEMMs.
-            if graph.value(swiglu_val).shape.iter().rev().skip(1).product::<usize>() != 1 {
+            if graph
+                .value(swiglu_val)
+                .shape
+                .iter()
+                .rev()
+                .skip(1)
+                .product::<usize>()
+                != 1
+            {
                 return None;
             }
 
@@ -138,7 +179,10 @@ pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: &HashSet<NodeId>) -> usiz
                         let norm_val = gate_node.inputs[0];
                         let gate_w = gate_node.inputs[1];
                         let up_w = up_node.inputs[1];
-                        if ![gate_w, up_w, down_w].iter().all(|&w| fusible_weight(graph, w)) {
+                        if ![gate_w, up_w, down_w]
+                            .iter()
+                            .all(|&w| fusible_weight(graph, w))
+                        {
                             return None;
                         }
 
@@ -148,7 +192,15 @@ pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: &HashSet<NodeId>) -> usiz
                                 if norm_node.inputs.len() >= 2 && norm_node.inputs[0] == res_val {
                                     let norm_w = norm_node.inputs[1];
                                     // The fused kernel normalises and multiplies one row.
-                                    if graph.value(res_val).shape.iter().rev().skip(1).product::<usize>() != 1 {
+                                    if graph
+                                        .value(res_val)
+                                        .shape
+                                        .iter()
+                                        .rev()
+                                        .skip(1)
+                                        .product::<usize>()
+                                        != 1
+                                    {
                                         return None;
                                     }
                                     let hidden_dim =
@@ -355,7 +407,15 @@ mod tests {
             DType::F32,
         );
 
-        let out = g.add("add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down], vec![1, hidden], DType::F32);
+        let out = g.add(
+            "add",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[x, down],
+            vec![1, hidden],
+            DType::F32,
+        );
         g.output(out);
 
         // 1. Run unfused on CPU to get reference output
@@ -366,7 +426,8 @@ mod tests {
         let ref_logits = ref_res[0].as_f32().expect("f32 output");
 
         // 2. Run fusion pass
-        let rewrites = crate::graph::egraph::fuse_rule(&mut g, FuseWeights::None, Rule::MegakernelMlp);
+        let rewrites =
+            crate::graph::egraph::fuse_rule(&mut g, FuseWeights::None, Rule::MegakernelMlp);
         assert_eq!(rewrites, 1, "MLP block must be fused into megakernel");
 
         // 3. Validate SSA and check node structure
@@ -480,7 +541,15 @@ mod tests {
             DType::F32,
         );
 
-        let out = g.add("add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down_norm], vec![1, hidden], DType::F32);
+        let out = g.add(
+            "add",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[x, down_norm],
+            vec![1, hidden],
+            DType::F32,
+        );
         g.output(out);
 
         // 1. Run unfused on CPU to get reference output
@@ -491,7 +560,8 @@ mod tests {
         let ref_logits = ref_res[0].as_f32().expect("f32 output");
 
         // 2. Run fusion pass
-        let rewrites = crate::graph::egraph::fuse_rule(&mut g, FuseWeights::None, Rule::MegakernelMlp);
+        let rewrites =
+            crate::graph::egraph::fuse_rule(&mut g, FuseWeights::None, Rule::MegakernelMlp);
         assert_eq!(
             rewrites, 1,
             "MLP block with post-norm must be fused into megakernel"

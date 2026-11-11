@@ -52,6 +52,22 @@ thread_local! {
     pub(crate) static TEST_DISABLE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
+/// `GIBBS_PHASE_TIMES=1`: one `PHASE <name> <ms> <detail>` line on stderr per timed phase.
+pub fn phase_time(name: &str, start: std::time::Instant, detail: &str) {
+    if phase_times_enabled() {
+        eprintln!(
+            "PHASE {name} {:.3} {detail}",
+            start.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
+
+pub(crate) fn phase_times_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("GIBBS_PHASE_TIMES").as_deref() == Ok("1"));
+    *ON
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
 

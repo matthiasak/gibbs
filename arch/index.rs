@@ -16,6 +16,7 @@
     ("names/qwen35.json5", include_str!("names/qwen35.json5")),
     ("lib/qwen_vit.json5", include_str!("lib/qwen_vit.json5")),
     ("lib/qwen_dit.json5", include_str!("lib/qwen_dit.json5")),
+    ("lib/gemma.json5", include_str!("lib/gemma.json5")),
     ("families/gemma3.json5", include_str!("families/gemma3.json5")),
     ("families/llama.json5", include_str!("families/llama.json5")),
     ("families/glm.json5", include_str!("families/glm.json5")),

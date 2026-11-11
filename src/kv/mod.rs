@@ -828,6 +828,7 @@ impl KvView {
                 .collect(),
             recurrent,
             pool: Some(self.pool.clone()),
+            last_taps: None,
         });
         Ok(KvExport {
             pool: Some(self.pool.clone()),
@@ -1044,6 +1045,8 @@ pub struct Boundary {
     pub recurrent: HashMap<String, crate::graph::Tensor>,
     /// The pool of `rings` (`None` for a model without paged states).
     pub pool: Option<Arc<KvPool>>,
+    /// Tap row `[taps.len() * hidden]` at position `len - 1` when exported from a tapped sequence.
+    pub last_taps: Option<Vec<f32>>,
 }
 
 impl Drop for Boundary {

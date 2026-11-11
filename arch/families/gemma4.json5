@@ -266,6 +266,8 @@
            {glob: "model.vision_tower.*", when: "has_vision && !vision_on"},
            {glob: "model.embed_vision.*", when: "has_vision && !vision_on"}],
   macros: {
+    // Hook after token embedding scale for inline encoder-free patch projection overrides.
+    vision_inline: {params: ["x"], body: [], returns: "x"},
     // ClippableLinear `p` (stem): `{p}.linear.weight` between the optional scalar clamps
     // `{p}.input_min` / `input_max` / `output_min` / `output_max` (a missing bound is the f32 limit).
     clipped_linear: {params: ["x"], body: [
@@ -366,6 +368,7 @@
         {let: {lm: "'model.language_model'"}},
         {op: "Embedding", in: ["w:{lm}.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
         {op: "Unary", args: {kind: {Scale: "embed_scale"}}, in: ["x"], out: "x", name: "embed_scale"},
+        {use: "vision_inline", in: ["x"], out: "x", name: "vision_inline"},
         {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", name: "media", when: "first(media, 0) > 0"},
         {block: [
           {op: "Linear", in: ["x", "w:{lm}.per_layer_model_projection.weight"], out: "pp", name: "model.ple.model_proj"},
@@ -615,7 +618,7 @@
       outputs: ["embeds"],
     },
   },
-  runtime: {bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
+  runtime: {bidir_media_blocks: true, ffn_weights: ["*.mlp.gate_proj.weight", "*.mlp.up_proj.weight", "*.mlp.down_proj.weight", "*.experts.gate_up_proj", "*.experts.down_proj"],
     mmproj: true,
     // gevva cross-encoders (`tokenize_nli_pair_safe`): `<bos>Premise: {text}\nHypothesis: {pair}\nPrediction:`.
     seqcls: {head: "score", pooling: "last_nonpad",

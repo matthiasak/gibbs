@@ -312,6 +312,33 @@ impl CudaApi {
             (self.cu.ctx_set_current)(self.ctx)
         })
     }
+
+    fn compile_ptx(&self, src: &str) -> Result<Vec<u8>, String> {
+        // No fma contraction: codec math must round like the reference decoders.
+        let opts = [
+            self.arch.as_ptr(),
+            c"-default-device".as_ptr(),
+            c"--fmad=false".as_ptr(),
+        ];
+        self.rtc.ptx(src, &opts)
+    }
+
+    fn load_ptx(&self, ptx: &[u8]) -> Result<Module, String> {
+        let owned;
+        let nul_ptx = if ptx.last() == Some(&0) {
+            ptx
+        } else {
+            owned = [ptx, &[0u8]].concat();
+            &owned
+        };
+        self.current()?;
+        let mut m = null_mut();
+        // SAFETY: `nul_ptx` is NUL-terminated PTX text.
+        self.cu.check("cuModuleLoadData", unsafe {
+            (self.cu.module_load_data)(&mut m, nul_ptx.as_ptr().cast())
+        })?;
+        Ok(Module(m as u64))
+    }
 }
 
 impl GpuApi for CudaApi {
@@ -378,20 +405,22 @@ impl GpuApi for CudaApi {
     }
 
     fn compile(&self, src: &str) -> Result<Module, String> {
-        // No fma contraction: codec math must round like the reference decoders.
-        let opts = [
-            self.arch.as_ptr(),
-            c"-default-device".as_ptr(),
-            c"--fmad=false".as_ptr(),
-        ];
-        let ptx = self.rtc.ptx(src, &opts)?;
-        self.current()?;
-        let mut m = null_mut();
-        // SAFETY: `ptx` is NUL-terminated PTX text.
-        self.cu.check("cuModuleLoadData", unsafe {
-            (self.cu.module_load_data)(&mut m, ptx.as_ptr().cast())
-        })?;
-        Ok(Module(m as u64))
+        let ptx = self.compile_ptx(src)?;
+        self.load_ptx(&ptx)
+    }
+
+    fn compile_cached(&self, src: &str, file: &std::path::Path) -> Result<Module, String> {
+        let (ptx, hit) = crate::graph::portable::cached_bytes(file, || self.compile_ptx(src))?;
+        match self.load_ptx(&ptx) {
+            Ok(m) => Ok(m),
+            Err(_) if hit => {
+                let _ = std::fs::remove_file(file);
+                let fresh = self.compile_ptx(src)?;
+                let _ = crate::graph::portable::cached_bytes(file, || Ok(fresh.clone()));
+                self.load_ptx(&fresh)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn kernel(&self, module: &Module, name: &str) -> Result<Kernel, String> {

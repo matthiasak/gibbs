@@ -41,9 +41,9 @@ impl ReencodePolicy {
     pub fn next(self) -> Self {
         match self {
             Self::MaxSpeed => Self::LowBitNative,
-            Self::LowBitNative => Self::BitExact,
+            Self::LowBitNative => Self::MinSize,
+            Self::MinSize => Self::BitExact,
             Self::BitExact => Self::MaxSpeed,
-            Self::MinSize => Self::MaxSpeed,
         }
     }
 }
@@ -70,6 +70,114 @@ impl std::str::FromStr for ReencodePolicy {
             "min-size" | "max-compress" | "minsize" => Ok(Self::MinSize),
             _ => Err(format!("unknown reencode policy '{s}'")),
         }
+    }
+}
+
+/// On-the-fly data-free HOPE progressive weight compression policy (arXiv:2607.21366).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(try_from = "String", into = "String")]
+pub enum HopePolicy {
+    #[default]
+    Off,
+    Light,      // target parameter density 0.90
+    Balanced,   // target parameter density 0.80
+    Aggressive, // target parameter density 0.70
+    Ratio(f32), // custom density in 0.50..=0.99
+}
+
+impl HopePolicy {
+    pub fn density(self) -> f32 {
+        match self {
+            Self::Off => 1.0,
+            Self::Light => 0.90,
+            Self::Balanced => 0.80,
+            Self::Aggressive => 0.70,
+            Self::Ratio(r) => r.clamp(0.50, 0.99),
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        self.density() < 0.999
+    }
+
+    pub fn kl_limit(self) -> f64 {
+        match self {
+            Self::Off => MAX_MEAN_KL,
+            Self::Light => 0.05,
+            Self::Balanced => 0.12,
+            Self::Aggressive => 0.25,
+            Self::Ratio(r) => ((1.0 - r as f64) * 0.80).clamp(0.03, 0.35),
+        }
+    }
+
+    pub fn step_back(self) -> Self {
+        match self {
+            Self::Aggressive => Self::Balanced,
+            Self::Balanced => Self::Light,
+            Self::Light => Self::Off,
+            Self::Ratio(r) if r < 0.80 => Self::Balanced,
+            Self::Ratio(r) if r < 0.90 => Self::Light,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Light,
+            Self::Light => Self::Balanced,
+            Self::Balanced => Self::Aggressive,
+            Self::Aggressive | Self::Ratio(_) => Self::Off,
+        }
+    }
+}
+
+impl std::fmt::Display for HopePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::Light => f.write_str("light"),
+            Self::Balanced => f.write_str("balanced"),
+            Self::Aggressive => f.write_str("aggressive"),
+            Self::Ratio(r) => write!(f, "{:.2}", r.clamp(0.50, 0.99)),
+        }
+    }
+}
+
+impl std::str::FromStr for HopePolicy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" | "1.0" | "100%" => return Ok(Self::Off),
+            "light" | "90%" => return Ok(Self::Light),
+            "balanced" | "80%" | "on" | "true" => return Ok(Self::Balanced),
+            "aggressive" | "70%" => return Ok(Self::Aggressive),
+            _ => {}
+        }
+        let val = if let Some(pct) = trimmed.strip_suffix('%') {
+            pct.trim().parse::<f32>().ok().map(|p| p / 100.0)
+        } else {
+            trimmed.parse::<f32>().ok()
+        };
+        if let Some(r) = val.filter(|r| (0.50..=0.99).contains(r)) {
+            return Ok(Self::Ratio(r));
+        }
+        Err(format!(
+            "unknown --hope value '{s}' (expected off, light, balanced, aggressive, or density 0.50..0.99)"
+        ))
+    }
+}
+
+impl From<HopePolicy> for String {
+    fn from(p: HopePolicy) -> Self {
+        p.to_string()
+    }
+}
+
+impl TryFrom<String> for HopePolicy {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
@@ -146,6 +254,8 @@ const PROBE_TEXT_LONG: &str = " A quantized linear layer maps an input vector x 
 #[derive(Clone, Default)]
 pub struct ReencodeConfig {
     pub policy: ReencodePolicy,
+    /// Data-free on-the-fly HOPE progressive weight compression policy (`off` by default).
+    pub hope: HopePolicy,
     /// Overrides the KL limit of the whole-model gate.
     pub max_kl: Option<f64>,
     /// Filled while tensors are re-encoded, for the load-stage text.
@@ -188,6 +298,7 @@ impl ReencodeConfig {
         let s = crate::tui::settings::load_settings();
         Self {
             policy: s.reencode,
+            hope: s.hope,
             max_kl: s.reencode_max_kl.map(f64::from),
             ..Self::default()
         }
@@ -198,14 +309,21 @@ impl ReencodeConfig {
         OVERRIDE.read().clone().unwrap_or_else(Self::from_settings)
     }
 
-    /// CLI flags (`--reencode`, `--reencode-max-kl`) over the settings file.
-    pub fn resolve(cli_policy: Option<&str>, cli_max_kl: Option<f32>) -> Result<Self, String> {
+    /// CLI flags (`--reencode`, `--reencode-max-kl`, `--hope`) over the settings file.
+    pub fn resolve(
+        cli_policy: Option<&str>,
+        cli_max_kl: Option<f32>,
+        cli_hope: Option<&str>,
+    ) -> Result<Self, String> {
         let mut c = Self::from_settings();
         if let Some(p) = cli_policy {
             c.policy = p.parse()?;
         }
         if let Some(k) = cli_max_kl {
             c.max_kl = Some(f64::from(k));
+        }
+        if let Some(h) = cli_hope {
+            c.hope = h.parse()?;
         }
         Ok(c)
     }

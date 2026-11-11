@@ -2,15 +2,25 @@
 // require higher-precision re-encoding floors.
 {
   applies_to: {
-    family: ["qwen3", "qwen3_5", "qwen3_vl", "gemma3", "gemma4"],
+    family: [
+      "qwen3", "qwen3_5", "qwen3_vl", "qwen4_exp",
+      "gemma2", "gemma3", "gemma4", "gemma4_unified",
+      "llama", "lfm2", "hunyuan", "granite", "glm", "gpt_neox", "gpt2",
+    ],
   },
   patch: {
     runtime: {
       sensitive_weights: [
         "*.mlp.down_proj.weight",
         "*.mlp.gate.weight",
-        "*.shared_expert_gate.weight",
-        "lm_head.weight",
+        "*.router.proj.weight",
+        "*.per_layer_input_gate.weight",
+        "*.per_layer_projection.weight",
+        "*.experts.down_proj",
+        "*.feed_forward.w2.weight",
+        "*.mlp.c_proj.weight",
+        "*.mlp.dense_4h_to_h.weight",
+        "*.hc_mix.weight",
       ],
     },
   },

@@ -25,6 +25,10 @@ pub struct StepGraph {
     pub graph: Graph,
     /// The `Embedding` table the host decodes input `embed` from, and the row width.
     pub embed: (String, usize),
+    /// Extra `Embedding` inputs (`(input_name, weight_name, row_width)`) when >1 Embedding reads `token_ids`.
+    pub extra_embeds: Vec<(String, String, usize)>,
+    /// Active K/V ring window capacity (`<= DRAFT_WINDOW`; shrunk to power-of-2 when all layers are sliding-window).
+    pub window_len: usize,
     /// Window inputs `[W, row]` and the state each stands for.
     rings: Vec<(ValueId, String)>,
     onehot: ValueId,
@@ -39,15 +43,43 @@ pub struct StepGraph {
 /// the module docs). Errs, naming the node, on anything the ANE cannot run: a second `Embedding`, other
 /// state ops, a bidirectional or multi-row cached attention, or an op [`super::check`] refuses.
 pub fn lower_drafter_step(g: &Graph) -> Result<StepGraph, String> {
-    let (f32_, w) = (DType::F32, DRAFT_WINDOW);
+    let f32_ = DType::F32;
+    // Size the ring window tightly when every CachedAttention in `g` uses a sliding window.
+    let mut all_windowed = true;
+    let mut max_win = 0usize;
+    let mut saw_attn = false;
+    for n in &g.nodes {
+        if let Op::CachedAttention { window, .. } = n.op {
+            saw_attn = true;
+            match window {
+                Some(win) => max_win = max_win.max(win),
+                None => all_windowed = false,
+            }
+        }
+    }
+    let w = if saw_attn && all_windowed {
+        (max_win + RING_MARGIN)
+            .max(64)
+            .next_power_of_two()
+            .min(DRAFT_WINDOW)
+    } else {
+        DRAFT_WINDOW
+    };
     let mut s = Graph::new();
     let mut map: HashMap<ValueId, ValueId> = HashMap::new();
-    let ids = g.inputs.iter().copied().find(|&v| g.value(v).name == "token_ids");
-    let mut embedded = None;
+    let ids = g
+        .inputs
+        .iter()
+        .copied()
+        .find(|&v| g.value(v).name == "token_ids");
+    let mut embedded: Option<(String, usize)> = None;
+    let mut extra_embeds: Vec<(String, String, usize)> = Vec::new();
+    let mut embed_by_table: HashMap<String, ValueId> = HashMap::new();
     let mut onehot = None;
-    let (mut rings, mut masks, mut rows) = (Vec::new(), Vec::new(), Vec::<(ValueId, String)>::new());
-    // Keys and values (with this step's row) of each written K state, for later readers.
-    let mut written: HashMap<String, (ValueId, ValueId)> = HashMap::new();
+    let (mut rings, mut masks, mut rows) =
+        (Vec::new(), Vec::new(), Vec::<(ValueId, String)>::new());
+    // Written ring value per state name (supports independent shared K/V and `k_eq_v` where `ks == vs`).
+    let mut written: HashMap<String, ValueId> = HashMap::new();
     for n in &g.nodes {
         let name = &n.name;
         let [out] = n.outputs[..] else {
@@ -63,19 +95,34 @@ pub fn lower_drafter_step(g: &Graph) -> Result<StepGraph, String> {
             let x = match &val.kind {
                 ValueKind::Input => s.input(val.name.clone(), val.shape.clone(), val.dtype),
                 ValueKind::Weight => s.weight(val.name.clone(), val.shape.clone(), val.dtype),
-                _ => return Err(format!("node '{name}' reads '{}', which the ANE step cannot hold", val.name)),
+                _ => {
+                    return Err(format!(
+                        "node '{name}' reads '{}', which the ANE step cannot hold",
+                        val.name
+                    ))
+                }
             };
             map.insert(v, x);
             Ok(x)
         };
         match &n.op {
             Op::Embedding if ids.is_some() && n.inputs.get(1) == ids.as_ref() => {
-                if embedded.is_some() {
-                    return Err(format!("node '{name}': a second Embedding reads token_ids"));
-                }
                 let table = g.value(n.inputs[0]).name.clone();
-                embedded = Some((table, ov.shape.iter().product()));
-                let e = s.input("embed", ov.shape.clone(), f32_);
+                let width: usize = ov.shape.iter().product();
+                let e = if let Some(&existing) = embed_by_table.get(&table) {
+                    existing
+                } else if embedded.is_none() {
+                    embedded = Some((table.clone(), width));
+                    let inp = s.input("embed", ov.shape.clone(), f32_);
+                    embed_by_table.insert(table, inp);
+                    inp
+                } else {
+                    let in_name = format!("embed.{}", extra_embeds.len() + 1);
+                    let inp = s.input(in_name.clone(), ov.shape.clone(), f32_);
+                    extra_embeds.push((in_name, table.clone(), width));
+                    embed_by_table.insert(table, inp);
+                    inp
+                };
                 map.insert(out, e);
             }
             &Op::CachedAttention {
@@ -102,29 +149,71 @@ pub fn lower_drafter_step(g: &Graph) -> Result<StepGraph, String> {
                     ));
                 }
                 let (keys, vals) = if write {
-                    let oh = *onehot.get_or_insert_with(|| s.input("ring.onehot", vec![w, 1], f32_));
-                    let mut ring = |s: &mut Graph, st: &str, x: ValueId, width: usize| {
+                    let oh =
+                        *onehot.get_or_insert_with(|| s.input("ring.onehot", vec![w, 1], f32_));
+                    let mut ring = |s: &mut Graph,
+                                    written: &mut HashMap<String, ValueId>,
+                                    st: &str,
+                                    x: ValueId,
+                                    width: usize|
+                     -> Result<ValueId, String> {
+                        if let Some(&already) = written.get(st) {
+                            return Ok(already);
+                        }
                         let x = operand(s, x)?;
                         let shape = Some(vec![1, width]);
-                        let row = s.add(format!("{st}.row"), Op::Reshape { shape }, &[x], vec![1, width], f32_);
+                        let row = s.add(
+                            format!("{st}.row"),
+                            Op::Reshape { shape },
+                            &[x],
+                            vec![1, width],
+                            f32_,
+                        );
                         rows.push((row, st.to_string()));
                         let win = s.input(format!("ring.{st}"), vec![w, width], f32_);
                         rings.push((win, st.to_string()));
                         let bin = |kind| Op::Binary { kind };
-                        let d = s.add(format!("{st}.d"), bin(BinaryKind::Sub), &[row, win], vec![w, width], f32_);
-                        let d = s.add(format!("{st}.dm"), bin(BinaryKind::Mul), &[d, oh], vec![w, width], f32_);
-                        Ok::<_, String>(s.add(format!("{st}.win"), bin(BinaryKind::Add), &[win, d], vec![w, width], f32_))
+                        let d = s.add(
+                            format!("{st}.d"),
+                            bin(BinaryKind::Sub),
+                            &[row, win],
+                            vec![w, width],
+                            f32_,
+                        );
+                        let d = s.add(
+                            format!("{st}.dm"),
+                            bin(BinaryKind::Mul),
+                            &[d, oh],
+                            vec![w, width],
+                            f32_,
+                        );
+                        let upd = s.add(
+                            format!("{st}.win"),
+                            bin(BinaryKind::Add),
+                            &[win, d],
+                            vec![w, width],
+                            f32_,
+                        );
+                        written.insert(st.to_string(), upd);
+                        Ok(upd)
                     };
-                    let kv = (
-                        ring(&mut s, &ks, n.inputs[1], kv_heads * head_dim)?,
-                        ring(&mut s, &vs, n.inputs[2], kv_heads * v_head_dim)?,
-                    );
-                    written.insert(ks.clone(), kv);
-                    kv
+                    let k_win = ring(&mut s, &mut written, &ks, n.inputs[1], kv_heads * head_dim)?;
+                    let v_win = ring(
+                        &mut s,
+                        &mut written,
+                        &vs,
+                        n.inputs[2],
+                        kv_heads * v_head_dim,
+                    )?;
+                    (k_win, v_win)
                 } else {
-                    *written
-                        .get(&ks)
-                        .ok_or_else(|| format!("node '{name}' reads state {ks} before any write"))?
+                    let k_win = *written.get(&ks).ok_or_else(|| {
+                        format!("node '{name}' reads K state {ks} before any write")
+                    })?;
+                    let v_win = *written.get(&vs).ok_or_else(|| {
+                        format!("node '{name}' reads V state {vs} before any write")
+                    })?;
+                    (k_win, v_win)
                 };
                 let mask = match masks.iter().find(|(_, mw)| *mw == window) {
                     Some(&(m, _)) => m,
@@ -143,7 +232,13 @@ pub fn lower_drafter_step(g: &Graph) -> Result<StepGraph, String> {
                     soft_cap,
                     scale: Some(scale),
                 };
-                let o = s.add(name.clone(), op, &[q, keys, vals, mask], ov.shape.clone(), ov.dtype);
+                let o = s.add(
+                    name.clone(),
+                    op,
+                    &[q, keys, vals, mask],
+                    ov.shape.clone(),
+                    ov.dtype,
+                );
                 map.insert(out, o);
             }
             op => {
@@ -171,6 +266,8 @@ pub fn lower_drafter_step(g: &Graph) -> Result<StepGraph, String> {
     }
     Ok(StepGraph {
         embed,
+        extra_embeds,
+        window_len: w,
         outs: g.outputs.len(),
         rows: rows.into_iter().map(|(_, st)| st).collect(),
         graph: s,
@@ -195,6 +292,8 @@ pub struct DraftStep {
     rows: Vec<String>,
     /// FNV-64 of the MIL text.
     sig: u64,
+    window_len: usize,
+    extra_tables: Vec<(usize, crate::graph::Tensor, usize)>,
 }
 
 impl DraftStep {
@@ -220,8 +319,22 @@ impl DraftStep {
         for b in &io.inputs {
             if let IoSource::RopeTable(n) = b.source {
                 let name = &sg.graph.value(sg.graph.nodes[n].inputs[2]).name;
-                let t = weights.get(name).ok_or_else(|| format!("weight '{name}' is not bound"))?;
+                let t = weights
+                    .get(name)
+                    .ok_or_else(|| format!("weight '{name}' is not bound"))?;
                 tables.insert(name.clone(), t.clone());
+            }
+        }
+        let mut extra_tables = Vec::new();
+        for (in_name, w_name, width) in &sg.extra_embeds {
+            if let Some(pos_idx) = io.inputs.iter().position(|b| match b.source {
+                IoSource::Value(v) => sg.graph.value(v).name == *in_name,
+                _ => false,
+            }) {
+                let t = weights
+                    .get(w_name)
+                    .ok_or_else(|| format!("weight '{w_name}' is not bound"))?;
+                extra_tables.push((pos_idx, t.clone(), *width));
             }
         }
         let program = AneProgram::compile(
@@ -235,6 +348,8 @@ impl DraftStep {
         Ok(Self {
             onehot: surface(sg.onehot)?,
             sig: super::fnv64(&[mil.as_bytes()]),
+            window_len: sg.window_len,
+            extra_tables,
             graph: sg.graph,
             program,
             io,
@@ -252,6 +367,7 @@ impl DraftStep {
         &mut self,
         inputs: &[(&str, &[f32])],
         pos: usize,
+        tok_opt: Option<u32>,
         w: usize,
         mask: &dyn Fn(Option<usize>) -> Vec<f32>,
     ) -> Result<Vec<Vec<f32>>, String> {
@@ -266,15 +382,41 @@ impl DraftStep {
                         match inputs.iter().find(|(n, _)| n == name) {
                             Some((_, d)) => d.to_vec(),
                             None if name == "positions" => vec![pos as f32],
-                            None => return Err(format!("ANE draft step input '{name}' is not supplied")),
+                            None => {
+                                if let Some((_, tbl, width)) =
+                                    self.extra_tables.iter().find(|(si, ..)| *si == i)
+                                {
+                                    let tid = tok_opt.unwrap_or(0) as usize;
+                                    let all = tbl.to_f32();
+                                    let start = tid.saturating_mul(*width);
+                                    if start + *width <= all.len() {
+                                        all[start..start + *width].to_vec()
+                                    } else {
+                                        vec![0.0; *width]
+                                    }
+                                } else {
+                                    return Err(format!(
+                                        "ANE draft step input '{name}' is not supplied"
+                                    ));
+                                }
+                            }
                         }
                     }
                 },
                 IoSource::RopeTable(n) => {
                     let node = &self.graph.nodes[n];
                     let inv = &self.graph.value(node.inputs[2]).name;
-                    let inv = self.tables.get(inv).ok_or("rope table weight is not bound")?.to_f32();
-                    let per_row = self.graph.value(node.inputs[1]).shape.iter().product::<usize>();
+                    let inv = self
+                        .tables
+                        .get(inv)
+                        .ok_or("rope table weight is not bound")?
+                        .to_f32();
+                    let per_row = self
+                        .graph
+                        .value(node.inputs[1])
+                        .shape
+                        .iter()
+                        .product::<usize>();
                     rope_table(&node.op, &vec![pos as u32; per_row], &inv, b.spatial)?
                 }
             };
@@ -360,11 +502,6 @@ impl AneDraft {
         super::fnv64(&sigs.iter().map(|s| &s[..]).collect::<Vec<_>>())
     }
 
-    /// Positions a step attends back at most (the newest is its own).
-    fn reach() -> usize {
-        DRAFT_WINDOW - RING_MARGIN
-    }
-
     /// Whether `r`'s sequence may use the windows: it (or a fork) owns them, or nobody does and
     /// it takes them, starting empty.
     // ponytail: one sequence drafts on the ANE at a time, the others on Metal; give each its own
@@ -390,10 +527,15 @@ impl AneDraft {
         pos: usize,
         inputs: &[(&str, &[f32])],
     ) -> Result<Vec<Vec<f32>>, String> {
-        let (w, slot) = (DRAFT_WINDOW, pos % DRAFT_WINDOW);
+        let w = self.steps[i].window_len;
+        let slot = pos % w;
+        if r.slots.len() < w {
+            r.slots.resize(w, EMPTY);
+        }
+        let reach = w.saturating_sub(RING_MARGIN);
         let slots = &r.slots;
         let mask = |win: Option<usize>| {
-            let lim = win.unwrap_or(usize::MAX).min(Self::reach());
+            let lim = win.unwrap_or(usize::MAX).min(reach);
             (0..w)
                 .map(|s| {
                     let p = slots[s] as usize;
@@ -406,7 +548,8 @@ impl AneDraft {
                 })
                 .collect()
         };
-        let mut out = self.steps[i].eval(inputs, pos, w, &mask)?;
+        let tok_opt = r.ids.get(pos).copied();
+        let mut out = self.steps[i].eval(inputs, pos, tok_opt, w, &mask)?;
         let new = out.split_off(self.steps[i].outs);
         for st in &self.steps {
             for (state, row) in self.steps[i].rows.iter().zip(&new) {

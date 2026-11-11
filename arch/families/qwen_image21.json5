@@ -7,13 +7,12 @@
 // raw text-encoder features; timestep features `timestep_embedding(1000 * sigma)` are generated.
 {
   family: "qwen_image21",
+  extends: "qwen_image",
   // Transformer-only GGUFs say either llama.cpp architecture.
   match: {diffusers_class: ["QwenImage21Pipeline", "QwenImage21Transformer2DModel"],
           gguf_arch: ["qwen_image", "qwen_image21"],
           denoiser_tensors: [["modulation.1.weight", "txt_in.in_layer.weight"]],
           bases: ["Qwen/Qwen-Image-2.1"]},
-  pipeline: "diffusion",
-  use_lib: ["diffusion", "qwen_dit"],
   config: {
     text_width: "shape('txt_in.text_norm.weight')[0]",
     fused: "has('transformer_blocks.0.img_mlp.gate_up.weight')",
@@ -64,12 +63,18 @@
     // The Qwen3-VL text encoder is the `qwen3_vl` family (Phase 5).
     text_encoder: {
       family: "qwen3_vl",
-      dir: "text_encoder",
       ignore: ["lm_head.weight", "score.weight", "model.layers.*.self_attn.rotary_emb.inv_freq", "model.visual.*", "visual.*"],
-      patch: {config: {has_vision: "false"}},
+      patch: {
+        names: null, "transforms+": null,
+        config: {
+          has_vision: "false",
+          tc: null, hidden: null, layers: null, heads: null, kv_heads: null, head_dim: null,
+          inter: null, eps: null, theta: null, rotary_pct: null, rope_variant: null, rope_kind: null, ctx: null,
+        },
+      },
     },
-    transformer: {family: "qwen_image21", dir: "transformer"},
-    vae: {family: "qwen_vae21", dir: "vae"},
+    transformer: {family: "qwen_image21"},
+    vae: {family: "qwen_vae21"},
     // Velocity [h * w, in_ch] for latent tokens on an h x w grid and `nt` text rows.
     denoiser: {
       vars: ["h", "w", "nt"],
@@ -148,16 +153,11 @@
       template: "{prefix}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
       drop: {from: 0, to: "prefix_tokens"},
       vars: {head: "'hidden'", taps: "[fmt('layer.{te.layers - 1}')]"}, outputs: {hidden: "layer.{te.layers - 1}"}}],
-    context: [{features: ["te.hidden"]}],
-    negative: {default: " "},
-    denoiser: {component: "transformer", net: "denoiser"},
     // A finetune's model card may list its own sigmas (`card`); else linspace with the config shift.
-    scheduler: {kind: "flow_euler", sigmas: "card", mu: "'config'"},
-    timestep: "sigma",
+    scheduler: {kind: "flow_euler", sigmas: "card", mu: "'config'", seq: null},
     guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
     latent: {channels: "vae.z", factor: 16, pack: "tokens", noise_scale: 1},
-    vae: {component: "vae", decode: "decoder", encode: null,
-          decode_affine: {mul: "vae.cfg.latents_std", add: "vae.cfg.latents_mean"},
+    vae: {decode_affine: {mul: "vae.cfg.latents_std", add: "vae.cfg.latents_mean"},
           output: "rgba_over_white"},
     defaults: {width: 512, height: 512, steps: 40, guidance: 1, multiple: 32},
     summary: "fmt('Qwen-Image 2.1 ({denoiser.layers} single-stream blocks, dim {denoiser.dim}), Qwen3-VL text encoder + 64-ch VAE')",

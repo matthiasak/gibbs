@@ -801,7 +801,9 @@ fn drafter_step_matches_cached_decode() {
     let pos = c.g.input("positions", vec![1], DType::U32);
     let table = c.weight("embed", vec![vocab, d], 1.0);
     let mut x = c.op("emb", Op::Embedding, &[table, ids]);
-    let inv = (0..hd / 2).map(|i| 1e4f32.powf(-2.0 * i as f32 / hd as f32)).collect();
+    let inv = (0..hd / 2)
+        .map(|i| 1e4f32.powf(-2.0 * i as f32 / hd as f32))
+        .collect();
     let inv = c.weight_data("inv", vec![hd / 2], inv);
     for (l, window) in [None, Some(3)].into_iter().enumerate() {
         let lin = |c: &mut Case, n: &str, x: ValueId, o: usize| {
@@ -835,7 +837,13 @@ fn drafter_step_matches_cached_decode() {
         let a = c.op(&format!("att{l}"), att, &[q, k, v, ks, vs, pos]);
         let wo = c.weight(&format!("o{l}"), vec![d, heads * hd], 0.2);
         let o = c.op(&format!("o{l}.y"), Op::Linear, &[a, wo]);
-        x = c.op(&format!("res{l}"), Op::Binary { kind: BinaryKind::Add }, &[x, o]);
+        x = c.op(
+            &format!("res{l}"),
+            Op::Binary {
+                kind: BinaryKind::Add,
+            },
+            &[x, o],
+        );
     }
     let head = c.weight("head", vec![vocab, d], 0.2);
     let logits = c.op("logits", Op::Linear, &[x, head]);
@@ -862,7 +870,9 @@ fn drafter_step_matches_cached_decode() {
         let want = cpu(toks);
         for p in from..toks.len() {
             let t = toks[p] as usize;
-            let got = lane.run(0, ring, p, &[("embed", &rows[t * d..][..d])]).unwrap();
+            let got = lane
+                .run(0, ring, p, &[("embed", &rows[t * d..][..d])])
+                .unwrap();
             ring.ids.push(toks[p]);
             let e = rel_rms(&got[0], &want[p]);
             eprintln!("position {p}: relative RMS {e:.2e}");
@@ -880,3 +890,155 @@ fn drafter_step_matches_cached_decode() {
     assert!(lane.claim(&mut other) && other.ids.is_empty());
 }
 
+#[test]
+fn concat_axes_and_shared_kv_windowed_drafter_lower_on_ane() {
+    let Ok(info) = probe() else { return };
+
+    // 1. General `Op::Concat`: both last-axis (`axis = -1`) and row-axis (`axis = 0`) are supported by `supports_op` and match CPU on ANE!
+    let mut c = Case::new("concat_axes");
+    let a = c.input("a", vec![4, 16], 1.0);
+    let b = c.input("b", vec![4, 16], 1.0);
+    let cat_last = c.g.add(
+        "cat_last",
+        Op::Concat { axis: -1 },
+        &[a, b],
+        vec![4, 32],
+        DType::F32,
+    );
+    let cls = c.input("cls", vec![1, 32], 1.0);
+    let cat_rows = c.g.add(
+        "cat_rows",
+        Op::Concat { axis: 0 },
+        &[cls, cat_last],
+        vec![5, 32],
+        DType::F32,
+    );
+    c.g.output(cat_rows);
+    for node in &c.g.nodes {
+        assert!(supports_op(&c.g, node), "ANE should support {:?}", node.op);
+    }
+    let (mil, blob, io) = lower(&c.g, &c.w, info).unwrap();
+    let mut prog = AneProgram::compile(
+        &mil,
+        &blob,
+        io.inputs.len(),
+        io.in_bytes(),
+        io.outputs.len(),
+        io.out_bytes(),
+    )
+    .unwrap();
+    let ins = vec![
+        Tensor::F32((0..64).map(|i| (i as f32) * 0.05).collect()),
+        Tensor::F32((0..64).map(|i| -(i as f32) * 0.03).collect()),
+        Tensor::F32((0..32).map(|i| 1.0 + (i as f32) * 0.01).collect()),
+    ];
+    let want = crate::graph::cpu::run_stateless(&c.g, &c.w, ins.clone()).unwrap()[0].to_f32();
+    let got = run(&mut prog, &io, &c.g, &c.w, &ins).unwrap()[0].to_f32();
+    assert!(
+        rel_rms(&got, &want) < 5e-3,
+        "ANE Concat rel_rms = {}",
+        rel_rms(&got, &want)
+    );
+
+    // 2. Windowed + shared-KV (`write: false`) + `k_eq_v` (`ks == vs`) + secondary PLE Embedding drafter step!
+    let (vocab, d, heads, hd) = (32, 16, 2, 8);
+    let mut dc = Case::new("shared_kv_ple_draft");
+    let tok = dc.g.input("token_ids", vec![1], DType::U32);
+    let pos = dc.g.input("positions", vec![1], DType::U32);
+    let emb0 = dc.weight("embed", vec![vocab, d], 0.3);
+    let ple0 = dc.weight("ple_embed", vec![vocab, d], 0.1);
+    let x0 = dc.op("emb0", Op::Embedding, &[emb0, tok]);
+    let xp = dc.op("ple0", Op::Embedding, &[ple0, tok]);
+    let mut x = dc.op(
+        "sum_ple",
+        Op::Binary {
+            kind: BinaryKind::Add,
+        },
+        &[x0, xp],
+    );
+    let wq = dc.weight("wq", vec![heads * hd, d], 0.2);
+    let wk = dc.weight("wk", vec![heads * hd, d], 0.2);
+    let q0 = dc.op("q0", Op::Linear, &[x, wq]);
+    let k0 = dc.op("k0", Op::Linear, &[x, wk]);
+    let ks = dc.g.state("kv0.k", vec![64, heads * hd], DType::F32, false);
+    // Layer 0 writes `kv0.k` with `k_eq_v` (`vs == ks`), window = Some(4)
+    let att0 = Op::CachedAttention {
+        heads,
+        kv_heads: heads,
+        head_dim: hd,
+        v_head_dim: hd,
+        scale: (hd as f32).powf(-0.5),
+        causal: true,
+        window: Some(4),
+        soft_cap: None,
+        write: true,
+    };
+    let a0 = dc.op("att0", att0, &[q0, k0, k0, ks, ks, pos]);
+    x = dc.op(
+        "res0",
+        Op::Binary {
+            kind: BinaryKind::Add,
+        },
+        &[x, a0],
+    );
+    // Layer 1 shares `kv0.k` (`write: false`), window = Some(4)
+    let q1 = dc.op("q1", Op::Linear, &[x, wq]);
+    let att1 = Op::CachedAttention {
+        heads,
+        kv_heads: heads,
+        head_dim: hd,
+        v_head_dim: hd,
+        scale: (hd as f32).powf(-0.5),
+        causal: true,
+        window: Some(4),
+        soft_cap: None,
+        write: false,
+    };
+    let a1 = dc.op("att1", att1, &[q1, q1, q1, ks, ks, pos]);
+    let out = dc.op(
+        "res1",
+        Op::Binary {
+            kind: BinaryKind::Add,
+        },
+        &[x, a1],
+    );
+    dc.g.output(out);
+
+    let sg = draft::lower_drafter_step(&dc.g).unwrap();
+    assert_eq!(
+        sg.window_len, 64,
+        "pure sliding-window drafter shrinks ring window to 64"
+    );
+    assert_eq!(sg.extra_embeds.len(), 1);
+    let step = draft::DraftStep::compile(sg, &dc.w, info).unwrap();
+    let mut lane = draft::AneDraft::new(vec![step]);
+    let mut ring = draft::Ring::new();
+    assert!(lane.claim(&mut ring));
+    let emb_rows = dc.w.get("embed").unwrap().to_f32();
+    let mut cpu_st = StateStore::new();
+    let _exact = crate::model::qdot::exact();
+    for (p, &t) in [2u32, 5, 9, 14, 3, 7].iter().enumerate() {
+        ring.ids.push(t);
+        let got = lane
+            .run(
+                0,
+                &mut ring,
+                p,
+                &[("embed", &emb_rows[t as usize * d..(t as usize + 1) * d])],
+            )
+            .unwrap();
+        let want = crate::graph::cpu::run(
+            &dc.g,
+            &dc.w,
+            &mut cpu_st,
+            vec![Tensor::U32(vec![t]), Tensor::U32(vec![p as u32])],
+        )
+        .unwrap()[0]
+            .to_f32();
+        assert!(
+            rel_rms(&got[0], &want) <= 2e-2,
+            "pos {p}: rel_rms = {}",
+            rel_rms(&got[0], &want)
+        );
+    }
+}

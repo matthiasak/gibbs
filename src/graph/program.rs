@@ -8,7 +8,9 @@ use crate::graph::placement::{
 use crate::graph::{
     cpu, DType, Graph, NodeId, Op, StateStore, Tensor, ValueId, ValueKind, Weights,
 };
-use crate::hardware::{available_devices, Device, PlacementMode};
+#[cfg(test)]
+use crate::hardware::available_devices;
+use crate::hardware::{Device, PlacementMode};
 use std::collections::HashMap;
 
 /// The program's executable form on one device.
@@ -216,11 +218,11 @@ fn secondary_for(mode: PlacementMode, available: &[Device]) -> Option<Secondary>
 }
 
 /// How many instance shapes [`GraphProgram::run_reshaped`] keeps: as many as its callers'
-/// [`crate::arch::build::ShapeCache`] builds. Fewer thrash when a caller cycles through its
-/// shapes (an encoder over 8 sequence lengths), re-fusing and re-planning every call.
-// ponytail: a caller cycling through more shapes (arbitrary-length embedding items) still re-fuses
-// and re-plans every call (~4 ms on MiniLM); bucket its row counts if that matters.
-pub const INSTANCE_SHAPES: usize = 8;
+/// [`crate::arch::build::ShapeCache`] builds. Plans share the session's one activation arena, so
+/// each cached instance costs host memory only.
+// ponytail: a caller cycling through > 32 distinct shapes still re-fuses and re-plans on eviction
+// (~8-14 ms on 1B-2B); replay e-graph picks or bucket non-causal row counts if > 32 shapes thrash.
+pub const INSTANCE_SHAPES: usize = 32;
 
 /// One [`GraphProgram::run_reshaped`] instance shape: the caller's graph canonicalized and fused
 /// onto the fused weights the program already binds.
@@ -263,6 +265,8 @@ pub struct GraphProgram {
     /// Reshaped instance keys whose gate kept every region on Metal: re-planned instances skip
     /// the gate (an evicted instance is rebuilt often).
     ane_metal_only: std::collections::HashSet<((usize, usize), Vec<Vec<usize>>)>,
+    /// Replayable HOPE compression recipe when compiled under an active [`HopePolicy`].
+    hope_recipe: Option<crate::graph::passes::hope::HopeRecipe>,
 }
 
 /// The positions a fed stream from `pos` may write without regrowing contiguous state buffers:
@@ -358,6 +362,21 @@ impl Drop for CompileGuard {
     }
 }
 
+fn instance_rows(g: &Graph) -> usize {
+    let Some(&v) = g.inputs.first() else {
+        return 1;
+    };
+    let val = g.value(v);
+    if val.dtype == DType::U32 || val.shape.len() <= 1 {
+        val.shape.iter().product::<usize>().max(1)
+    } else {
+        val.shape[..val.shape.len() - 1]
+            .iter()
+            .product::<usize>()
+            .max(1)
+    }
+}
+
 impl GraphProgram {
     /// Compiles a Graph and Weights into a single-device GraphProgram under `mode`.
     ///
@@ -392,6 +411,12 @@ impl GraphProgram {
         let _compiling = CompileGuard::enter();
         #[cfg(test)]
         crate::graph::shape::note(&graph);
+        let hope_recipe = if keep_folded {
+            let hope = crate::model::weight_format::ReencodeConfig::effective().hope;
+            crate::graph::passes::hope::compress(&mut graph, &mut weights, hope)?
+        } else {
+            None
+        };
         crate::graph::passes::prefuse(&mut graph);
         let mut scalars = Weights::new();
         for (name, t) in weights.iter() {
@@ -402,13 +427,28 @@ impl GraphProgram {
         let unfused = keep_folded.then(|| weights.clone());
         crate::graph::passes::fuse(&mut graph, FuseWeights::Materialize(&mut weights))?;
         crate::graph::passes::canonical::run(&mut graph, &scalars);
+        if crate::graph::phase_times_enabled() {
+            let wo: Vec<&str> = graph
+                .nodes
+                .iter()
+                .filter(|n| {
+                    !n.inputs.is_empty()
+                        && n.inputs
+                            .iter()
+                            .all(|&v| graph.value(v).kind == ValueKind::Weight)
+                })
+                .map(|n| n.name.as_str())
+                .collect();
+            let names = wo.iter().take(5).copied().collect::<Vec<_>>().join(",");
+            eprintln!("PHASE census.weight_only_nodes 0.000 {} {names}", wo.len());
+        }
         let dump: Option<usize> = std::env::var("GIBBS_PLAN_DUMP_CPU")
             .ok()
             .map(|v| v.parse().unwrap_or(1));
         let available = if dump.is_some() {
             vec![Device::Cpu, Device::Metal]
         } else {
-            available_devices()
+            crate::hardware::devices_for(mode)
         };
         let secondary = secondary_for(mode, &available).filter(|_| dump.is_none());
         // `--backend ane`: Metal runs what the ANE does not.
@@ -505,6 +545,7 @@ impl GraphProgram {
             scalars,
             secondary,
             ane_metal_only: Default::default(),
+            hope_recipe,
         };
         if mode != PlacementMode::Pin(Device::Cpu) {
             COMPILED_CPU_NODES
@@ -700,18 +741,20 @@ impl GraphProgram {
                 if self.reshaped_graphs.len() == INSTANCE_SHAPES {
                     self.reshaped_graphs.remove(0);
                 }
-                let mut g = graph.clone();
-                let program = self.segment.graph();
-                crate::graph::passes::prefuse(&mut g);
-                crate::graph::passes::fuse(&mut g, FuseWeights::ReuseOnly(program))?;
-                crate::graph::passes::canonical::run(&mut g, &self.scalars);
+                let t_inst = std::time::Instant::now();
+                let detail = format!("rows={}", instance_rows(graph));
+                let mut g = self.fuse_instance(graph, &detail)?;
                 #[cfg(target_os = "macos")]
                 let (plan, segments, metal_only) = match &self.segment {
                     CompiledSegment::Metal { session, .. } => {
+                        let t = std::time::Instant::now();
                         let plan = session.prepare_plan(&g)?;
+                        crate::graph::phase_time("inst.plan", t, &detail);
                         let gated = allow_secondary
                             && !self.ane_metal_only.contains(&(key, shapes.clone()));
+                        let t = std::time::Instant::now();
                         let segs = self.instance_segments(&mut g, session, gated)?;
+                        crate::graph::phase_time("inst.ane", t, &detail);
                         let metal_only = gated && segs.is_empty();
                         (Some(plan), segs, metal_only)
                     }
@@ -723,6 +766,7 @@ impl GraphProgram {
                 }
                 #[cfg(not(target_os = "macos"))]
                 let (segments, _) = (Vec::new(), allow_secondary);
+                crate::graph::phase_time("inst.total", t_inst, &detail);
                 ReshapedInstance {
                     key,
                     shapes,
@@ -766,6 +810,148 @@ impl GraphProgram {
             #[cfg(target_os = "macos")]
             CompiledSegment::Ane { .. } => unreachable!("the primary segment is never the ANE"),
         }
+    }
+
+    /// Runs a reshaped Metal verify instance and reduces `logits_idx` to compact per-row top-k
+    /// distributions on the GPU (`Ok(None)` on non-Metal or multi-segment plans).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn run_reshaped_topk_rows(
+        &mut self,
+        graph: &Graph,
+        inputs: Vec<Tensor>,
+        logits_idx: usize,
+        top_k: usize,
+        temp: f32,
+        top_p: f32,
+        valid_vocab: usize,
+    ) -> Result<Option<(Vec<Vec<(u32, f32)>>, Vec<Tensor>)>, String> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (graph, inputs, logits_idx, top_k, temp, top_p, valid_vocab);
+            Ok(None)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(i) = self.metal_instance(graph)? else {
+                return Ok(None);
+            };
+            let CompiledSegment::Metal { session, .. } = &self.segment else {
+                return Ok(None);
+            };
+            let r = &self.reshaped_graphs[i];
+            let plan = r.plan.as_ref().expect("Metal program plans its instances");
+            let res = session.run_prepared_topk_rows(
+                &r.graph,
+                plan,
+                Some(&mut self.state),
+                inputs,
+                logits_idx,
+                top_k,
+                temp,
+                top_p,
+                valid_vocab,
+            )?;
+            Ok(Some(res))
+        }
+    }
+
+    /// Runs a `rows = states.len()` decode instance where row `b` is the next token of sequence
+    /// `states[b]` ([`crate::graph::metal::Session::run_prepared_ragged`]): weights stream once
+    /// for every sequence. `Ok(None)` when the program is not a single Metal segment.
+    pub fn run_ragged(
+        &mut self,
+        graph: &Graph,
+        states: &mut [&mut StateStore],
+        inputs: Vec<Tensor>,
+    ) -> Result<Option<Vec<Tensor>>, String> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (graph, states, inputs);
+            Ok(None)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(i) = self.metal_instance(graph)? else {
+                return Ok(None);
+            };
+            let CompiledSegment::Metal { session, .. } = &self.segment else {
+                return Ok(None);
+            };
+            let r = &self.reshaped_graphs[i];
+            let plan = r.plan.as_ref().expect("Metal program plans its instances");
+            session
+                .run_prepared_ragged(&r.graph, plan, states, inputs)
+                .map(Some)
+        }
+    }
+
+    fn fuse_instance(&mut self, graph: &Graph, detail: &str) -> Result<Graph, String> {
+        let mut g = graph.clone();
+        if let Some(recipe) = &self.hope_recipe {
+            crate::graph::passes::hope::apply_recipe(&mut g, recipe);
+        }
+        let t = std::time::Instant::now();
+        crate::graph::passes::prefuse(&mut g);
+        crate::graph::phase_time("inst.prefuse", t, detail);
+        let t = std::time::Instant::now();
+        let program = self.segment.graph();
+        crate::graph::passes::fuse(&mut g, FuseWeights::ReuseOnly(program))?;
+        crate::graph::phase_time("inst.fuse", t, detail);
+        let t = std::time::Instant::now();
+        crate::graph::passes::canonical::run(&mut g, &self.scalars);
+        crate::graph::phase_time("inst.canonical", t, detail);
+        Ok(g)
+    }
+
+    /// The index in [`Self::reshaped_graphs`] of `graph`'s Metal-only instance (planned, no ANE
+    /// segments), most recently used last; `None` unless the program is one Metal segment.
+    #[cfg(target_os = "macos")]
+    fn metal_instance(&mut self, graph: &Graph) -> Result<Option<usize>, String> {
+        if !self.is_single_metal() {
+            return Ok(None);
+        }
+        self.attach_kv()?;
+        let shapes: Vec<Vec<usize>> = graph
+            .inputs
+            .iter()
+            .map(|&v| graph.value(v).shape.clone())
+            .collect();
+        let key = (graph.nodes.len(), graph.outputs.len());
+        let hit = self
+            .reshaped_graphs
+            .iter()
+            .position(|r| r.key == key && r.shapes == shapes);
+        let entry = match hit {
+            Some(i) => self.reshaped_graphs.remove(i),
+            None => {
+                if self.reshaped_graphs.len() == INSTANCE_SHAPES {
+                    self.reshaped_graphs.remove(0);
+                }
+                let t_inst = std::time::Instant::now();
+                let detail = format!("rows={}", instance_rows(graph));
+                let g = self.fuse_instance(graph, &detail)?;
+                let plan = match &self.segment {
+                    CompiledSegment::Metal { session, .. } => {
+                        let t = std::time::Instant::now();
+                        let p = session.prepare_plan(&g)?;
+                        crate::graph::phase_time("inst.plan", t, &detail);
+                        Some(p)
+                    }
+                    _ => None,
+                };
+                crate::graph::phase_time("inst.total", t_inst, &detail);
+                ReshapedInstance {
+                    key,
+                    shapes,
+                    plan,
+                    segments: Vec::new(),
+                    graph: g,
+                }
+            }
+        };
+        let ok = entry.segments.is_empty();
+        self.reshaped_graphs.push(entry);
+        Ok(ok.then(|| self.reshaped_graphs.len() - 1))
     }
 
     /// Executes the graph program with given inputs.
@@ -2052,7 +2238,7 @@ mod tests {
                     let inputs = vec![Tensor::F32(row.clone()), Tensor::F32(vec![1.0, 2.0, 3.0])];
                     let out = cpu::run_stateless(&head, &Weights::new(), inputs).unwrap();
                     let v = if valid == 0 { n } else { valid.min(n) };
-                    let want = crate::runtime::lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0);
+                    let want = crate::runtime::lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0, 0);
                     assert_eq!(
                         out[0],
                         Tensor::U32(vec![want]),
@@ -2955,6 +3141,54 @@ mod tests {
             );
             cases.push(f.case(&format!("Megakernel geglu={geglu} post={post}"), &[o]));
         }
+        // Multi-row fused QKV (m = 5): exercises segmented-output Linear + offset-view Slices on portable/XLA.
+        {
+            use crate::hardware::QuantFormat;
+            use crate::model::weights::Mat;
+            let fmt = QuantFormat::GGUF_Q4_0;
+            let (m, h, q_dim, kv_dim, hd) = (5usize, 64usize, 64usize, 32usize, 32usize);
+            let mut f = fx();
+            let x = f.x("x", &[m, h]);
+            let pos = f.u("pos", &[0, 1, 2, 3, 4]);
+            let inv = f.w("inv", &[hd / 2]);
+            let mut qwt = |name: &str, rows: usize, seed: u64| -> ValueId {
+                let raw = quant_rows(fmt, rows, h, seed);
+                f.wt(
+                    name,
+                    &[rows, h],
+                    DType::Quant(fmt),
+                    Tensor::Mat(Mat::from_packed_bytes(fmt, raw, rows, h)),
+                )
+            };
+            let wq = qwt("wq", q_dim, 701);
+            let wk = qwt("wk", kv_dim, 702);
+            let wv = qwt("wv", kv_dim, 703);
+            let bq = f.w("bq", &[q_dim]);
+            let bv = f.w("bv", &[kv_dim]);
+            let q = f.op(Op::Linear, &[x, wq, bq]);
+            let k = f.op(Op::Linear, &[x, wk]);
+            let v = f.op(Op::Linear, &[x, wv, bv]);
+            let rope = Op::Rope {
+                head_dim: hd,
+                rotary_dim: hd,
+                variant: crate::graph::RopeVariant::HalfSplit,
+                mscale: 1.0,
+            };
+            let qr = f.op(rope.clone(), &[q, pos, inv]);
+            let kr = f.op(rope, &[k, pos, inv]);
+            let att = f.op(
+                Op::Attention {
+                    heads: 2,
+                    kv_heads: 1,
+                    causal: true,
+                    window: None,
+                    soft_cap: None,
+                    scale: None,
+                },
+                &[qr, kr, v],
+            );
+            cases.push(f.case("Linear fused QKV m=5 segmented", &[att]));
+        }
         cases
     }
 
@@ -2988,7 +3222,7 @@ mod tests {
     /// Linear per weight codec and CachedAttention prefill/decode pairs like the CPU executor:
     /// relative RMS <= 1e-4 (2e-2 on XLA, which holds bf16 weights). Prints each op's worst error.
     #[test]
-    #[ignore = "device: GIBBS_XPU_ANY_OPENCL=1 cargo test --release --lib -- --ignored backends_match_cpu_on_every_op --nocapture"]
+    #[ignore = "device: cargo test --release --lib -- --ignored backends_match_cpu_on_every_op --nocapture"]
     fn backends_match_cpu_on_every_op() {
         let cases = op_cases();
         let covered: std::collections::BTreeSet<&str> = cases

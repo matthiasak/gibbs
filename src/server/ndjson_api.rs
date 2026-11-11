@@ -32,6 +32,9 @@ pub struct ChatRequest {
     pub options: Options,
     /// `false` renders the template with `enable_thinking: false`.
     pub think: Option<bool>,
+    /// Compaction settings over the saved ones ([`core::compact_override`]).
+    #[serde(default)]
+    pub compact: Option<crate::compact::CompactionOverride>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,14 +95,12 @@ impl Options {
     }
 }
 
-fn no_format(format: &Option<Value>) -> Result<(), ApiError> {
-    match format {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) if s.is_empty() => Ok(()),
-        Some(_) => Err(ApiError::bad(
-            "format (JSON / schema output) is not supported",
-        )),
-    }
+/// The request's `format` as an output grammar (400 on a malformed one).
+fn grammar(
+    format: &Option<Value>,
+) -> Result<Option<crate::scheduler::grammar::GrammarConstraint>, ApiError> {
+    crate::scheduler::grammar::GrammarConstraint::from_format_field(format.as_ref())
+        .map_err(ApiError::bad)
 }
 
 /// A user/assistant turn with base64 `images` as image parts ahead of the text.
@@ -146,7 +147,7 @@ fn chat_messages(messages: Vec<ChatTurn>) -> Result<Vec<ChatMessage>, ApiError> 
 
 /// `/api/generate` options this server cannot honor are a 400, never silently dropped.
 fn check_generate(req: &GenerateRequest) -> Result<(), ApiError> {
-    no_format(&req.format)?;
+    grammar(&req.format)?;
     if req.suffix.as_deref().is_some_and(|s| !s.is_empty()) {
         return Err(ApiError::bad(
             "suffix (fill-in-the-middle) is not supported",
@@ -192,14 +193,15 @@ pub async fn chat(
     body: axum::body::Bytes,
 ) -> Response {
     async {
-        let req: ChatRequest = parse(&body)?;
-        no_format(&req.format)?;
+        let mut req: ChatRequest = parse(&body)?;
+        let grammar = grammar(&req.format)?;
         let model = model_name(&state, req.model.clone());
         if req.messages.is_empty() {
             return Ok(load_reply(&model, "message"));
         }
+        let compact = core::compact_override(req.compact.take(), &headers)?;
         let (messages, media) = prepare_messages(chat_messages(req.messages)?).await?;
-        let gen = core::start(
+        let mut gen = core::start(
             &state,
             GenRequest {
                 prompt: Prompt::Chat {
@@ -219,21 +221,27 @@ pub async fn chat(
                         .expect("compat.ndjson_api.label"),
                     &headers,
                 ),
-                compact: None,
+                compact,
+                grammar,
             },
         )
         .await?;
+        let compaction = gen.compaction.take();
         let mut wire = NdjsonWire::new(model, "message", gen.prompt_tokens);
-        if req.stream.unwrap_or(true) {
-            return Ok(stream_response(gen, wire, Framing::Ndjson));
-        }
-        let out = collect(gen).await?;
-        let mut v = wire.chunk(&out.text);
-        if !out.calls.is_empty() {
-            v["message"]["tool_calls"] = out.calls.iter().map(call_json).collect();
-        }
-        wire.finish(&mut v, &out.finish, out.completion_tokens);
-        Ok(Json(v).into_response())
+        let mut resp = if req.stream.unwrap_or(true) {
+            stream_response(gen, wire, Framing::Ndjson)
+        } else {
+            let out = collect(gen).await?;
+            let mut v = wire.chunk(&out.text);
+            if !out.calls.is_empty() {
+                v["message"]["tool_calls"] = out.calls.iter().map(call_json).collect();
+            }
+            wire.finish(&mut v, &out.finish, out.completion_tokens);
+            Json(v).into_response()
+        };
+        resp.headers_mut()
+            .extend(compaction.as_ref().map(|c| c.header()));
+        Ok(resp)
     }
     .await
     .unwrap_or_else(error)
@@ -285,6 +293,7 @@ pub async fn generate(
                     &headers,
                 ),
                 compact: None,
+                grammar: grammar(&req.format)?,
             },
         )
         .await?;
@@ -546,7 +555,7 @@ mod tests {
             json!({"prompt": "hi", "raw": true, "images": ["AAEC"]}),
             json!({"prompt": "hi", "raw": true, "system": "s"}),
             json!({"prompt": "hi", "suffix": "x"}),
-            json!({"prompt": "hi", "format": "json"}),
+            json!({"prompt": "hi", "format": "yaml"}),
         ] {
             assert!(check_generate(&req(bad.clone())).is_err(), "{bad}");
         }

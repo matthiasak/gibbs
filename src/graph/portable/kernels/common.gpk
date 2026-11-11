@@ -48,3 +48,11 @@ DEVFN i32 total_key(float v) {
 
 // NaN ranks below every number (TopK order).
 DEVFN float nan_low(float v) { return v != v ? GPK_NEG_INF : v; }
+
+DEVFN u64 out_index(u32 r, u32 col, u32 n, u32 m, u32 s1, u32 s2, u32 s3) {
+    if (s1 == 0u) return (u64)r * n + col;
+    if (col < s1) return (u64)r * s1 + col;
+    if (col < s2) return (u64)m * s1 + (u64)r * (s2 - s1) + (col - s1);
+    if (col < s3) return (u64)m * s2 + (u64)r * (s3 - s2) + (col - s2);
+    return (u64)m * s3 + (u64)r * (n - s3) + (col - s3);
+}

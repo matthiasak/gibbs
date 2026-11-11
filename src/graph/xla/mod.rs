@@ -19,14 +19,16 @@ pub mod pjrt;
 pub mod probe;
 
 use crate::graph::{DType, Graph, Op, StateStore, Tensor, ValueKind, Weights};
-use emit::Ty;
+use emit::{Ty, WeightSpec};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-/// The loaded plugin and its probed op table (`None` = compiles, `Some(error)` = rejected).
+const XLA_EXE_CACHE_CAP: usize = 24;
+
 pub struct Plugin {
     pub client: pjrt::Client,
     pub ops: HashMap<String, Option<String>>,
+    pub packed_quant_ok: bool,
 }
 
 static PLUGIN: LazyLock<Option<Plugin>> = LazyLock::new(load_plugin);
@@ -69,7 +71,11 @@ fn probe_module(p: &probe::Probe) -> Result<emit::Module, String> {
         .collect();
     emit::emit(
         &p.graph,
-        &|name| p.weights.get(name).map(|t| (t.len(), Ty::F32)),
+        &|name| {
+            p.weights
+                .get(name)
+                .map(|t| WeightSpec::Plain(t.len(), Ty::F32))
+        },
         &states,
         &[],
     )
@@ -83,6 +89,7 @@ fn probe_run(client: &pjrt::Client, m: &emit::Module) -> Result<(), String> {
     for &(n, ty) in &m.params {
         let (elem, size) = match ty {
             Ty::I32 => (pjrt::ElemType::S32, 4),
+            Ty::I8 => (pjrt::ElemType::S8, 1),
             Ty::BF16 => (pjrt::ElemType::BF16, 2),
             _ => (pjrt::ElemType::F32, 4),
         };
@@ -115,9 +122,10 @@ fn probe_ops(client: &pjrt::Client) -> HashMap<String, Option<String>> {
         )
     );
     let version = format!("{}.{}", client.version.0, client.version.1);
-    let file = crate::hardware::default_cache_dir()
-        .ok()
-        .map(|d| d.join("host").join(format!("pjrt-{:016x}.json", fnv64(&client.path))));
+    let file = crate::hardware::default_cache_dir().ok().map(|d| {
+        d.join("host")
+            .join(format!("pjrt-{:016x}.json", fnv64(&client.path)))
+    });
     let mut ops: HashMap<String, Option<String>> = file
         .as_ref()
         .and_then(|f| std::fs::read(f).ok())
@@ -177,13 +185,57 @@ fn load_plugin() -> Option<Plugin> {
     match pjrt::Client::open(&path) {
         Ok(client) => {
             let ops = probe_ops(&client);
-            Some(Plugin { client, ops })
+            let packed_quant_ok = !client.platform.eq_ignore_ascii_case("metal")
+                && probe_packed_quant(&client).is_ok();
+            Some(Plugin {
+                client,
+                ops,
+                packed_quant_ok,
+            })
         }
         Err(e) => {
             eprintln!("XLA unavailable: {e}");
             None
         }
     }
+}
+
+fn probe_packed_quant(client: &pjrt::Client) -> Result<(), String> {
+    let mut g = Graph::new();
+    let x = g.input("x", vec![1, 32], DType::F32);
+    let w8 = g.weight(
+        "w8",
+        vec![2, 32],
+        DType::Quant(crate::hardware::QuantFormat::GGUF_Q8_0),
+    );
+    let w4 = g.weight(
+        "w4",
+        vec![2, 32],
+        DType::Quant(crate::hardware::QuantFormat::GGUF_Q4_0),
+    );
+    let y8 = g.add("l8", Op::Linear, &[x, w8], vec![1, 2], DType::F32);
+    let y4 = g.add("l4", Op::Linear, &[x, w4], vec![1, 2], DType::F32);
+    let y = g.add(
+        "sum",
+        Op::Binary {
+            kind: crate::graph::BinaryKind::Add,
+        },
+        &[y8, y4],
+        vec![1, 2],
+        DType::F32,
+    );
+    g.output(y);
+    let m = emit::emit(
+        &g,
+        &|name| match name {
+            "w8" => Some(WeightSpec::Q8_0(64)),
+            "w4" => Some(WeightSpec::Q4_0(64)),
+            _ => None,
+        },
+        &HashMap::new(),
+        &[],
+    )?;
+    probe_run(client, &m)
 }
 
 /// The process-wide plugin, loaded and probed on first use.
@@ -219,10 +271,18 @@ fn bytes<T: Copy>(v: &[T]) -> &[u8] {
 /// A weight resident on the device: element count and the type the module reads it as.
 struct DeviceWeight {
     buf: pjrt::Buffer,
-    len: usize,
-    ty: Ty,
+    scale_buf: Option<pjrt::Buffer>,
+    spec: WeightSpec,
 }
 
+/// Persistent device-side paged KV window buffer for one state, avoiding full-window host<->device
+/// transfers on sequential decode steps (`tf.aliasing_output` updates `buf` in place on device).
+struct DevKvEntry {
+    tables: Vec<u32>,
+    synced_rows: usize,
+    win_rows: usize,
+    buf: pjrt::Buffer,
+}
 /// Compiled executables by module text hash, least recently used first.
 type ExeCache = Vec<(u64, Arc<pjrt::Executable>, Arc<emit::Module>)>;
 
@@ -244,6 +304,7 @@ pub struct XlaSession {
     plugin: &'static Plugin,
     weights: HashMap<String, DeviceWeight>,
     exes: parking_lot::Mutex<ExeCache>,
+    dev_kv: parking_lot::Mutex<HashMap<String, DevKvEntry>>,
 }
 
 impl XlaSession {
@@ -267,24 +328,86 @@ impl XlaSession {
         let f32_weights = plugin.client.platform.eq_ignore_ascii_case("metal");
         let mut dev = HashMap::new();
         for (name, t) in weights.iter() {
+            let tlen = t.len();
             let w = match t {
                 Tensor::U32(v) => DeviceWeight {
-                    buf: plugin.client.upload(bytes(v), pjrt::ElemType::S32, &[v.len()])?,
-                    len: v.len(),
-                    ty: Ty::I32,
+                    buf: plugin
+                        .client
+                        .upload(bytes(v), pjrt::ElemType::S32, &[v.len()])?,
+                    scale_buf: None,
+                    spec: WeightSpec::Plain(v.len(), Ty::I32),
                 },
+                Tensor::Mat(m)
+                    if plugin.packed_quant_ok
+                        && tlen >= 32
+                        && tlen % 32 == 0
+                        && m.packed().is_some_and(|p| {
+                            matches!(
+                                p.format,
+                                crate::hardware::QuantFormat::GGUF_Q8_0
+                                    | crate::hardware::QuantFormat::GGUF_Q4_0
+                            )
+                        }) =>
+                {
+                    let p = m.packed().unwrap();
+                    let n = tlen;
+                    let b = n / 32;
+                    let raw = &p.map[p.off..p.off + p.format.tensor_bytes(n)];
+                    if p.format == crate::hardware::QuantFormat::GGUF_Q8_0 {
+                        let mut qs = Vec::with_capacity(n);
+                        let mut sc = Vec::with_capacity(b);
+                        for blk in raw.chunks_exact(34) {
+                            let d = crate::model::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                            sc.push(crate::model::f32_to_bf16(d));
+                            qs.extend_from_slice(&blk[2..34]);
+                        }
+                        DeviceWeight {
+                            buf: plugin.client.upload(&qs, pjrt::ElemType::S8, &[n])?,
+                            scale_buf: Some(plugin.client.upload(
+                                bytes(&sc),
+                                pjrt::ElemType::BF16,
+                                &[b],
+                            )?),
+                            spec: WeightSpec::Q8_0(n),
+                        }
+                    } else {
+                        let mut qs = Vec::with_capacity(b * 16);
+                        let mut sc = Vec::with_capacity(b);
+                        for blk in raw.chunks_exact(18) {
+                            let d = crate::model::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                            sc.push(crate::model::f32_to_bf16(d));
+                            qs.extend_from_slice(&blk[2..18]);
+                        }
+                        DeviceWeight {
+                            buf: plugin.client.upload(&qs, pjrt::ElemType::S8, &[b * 16])?,
+                            scale_buf: Some(plugin.client.upload(
+                                bytes(&sc),
+                                pjrt::ElemType::BF16,
+                                &[b],
+                            )?),
+                            spec: WeightSpec::Q4_0(n),
+                        }
+                    }
+                }
                 t => {
                     let v = t.to_f32();
                     let buf = if f32_weights {
-                        plugin.client.upload(bytes(&v), pjrt::ElemType::F32, &[v.len()])?
+                        plugin
+                            .client
+                            .upload(bytes(&v), pjrt::ElemType::F32, &[v.len()])?
                     } else {
                         let h: Vec<u16> = v.iter().map(|&x| crate::model::f32_to_bf16(x)).collect();
-                        plugin.client.upload(bytes(&h), pjrt::ElemType::BF16, &[v.len()])?
+                        plugin
+                            .client
+                            .upload(bytes(&h), pjrt::ElemType::BF16, &[v.len()])?
                     };
                     DeviceWeight {
                         buf,
-                        len: v.len(),
-                        ty: if f32_weights { Ty::F32 } else { Ty::BF16 },
+                        scale_buf: None,
+                        spec: WeightSpec::Plain(
+                            v.len(),
+                            if f32_weights { Ty::F32 } else { Ty::BF16 },
+                        ),
                     }
                 }
             };
@@ -294,6 +417,7 @@ impl XlaSession {
             plugin,
             weights: dev,
             exes: parking_lot::Mutex::new(Vec::new()),
+            dev_kv: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
@@ -309,7 +433,10 @@ impl XlaSession {
         // Rows each KV state must hold this run (`usize::MAX`: not known on the host).
         let mut need: HashMap<&str, usize> = HashMap::new();
         for node in &graph.nodes {
-            let Op::CachedAttention { heads, head_dim, .. } = node.op else {
+            let Op::CachedAttention {
+                heads, head_dim, ..
+            } = node.op
+            else {
                 continue;
             };
             if node.inputs.len() < 6 {
@@ -329,7 +456,9 @@ impl XlaSession {
                     let vis = node.inputs.get(6).map(|_| host(6));
                     match vis {
                         Some(None) => usize::MAX,
-                        Some(Some(v)) => (p as usize + nq).max(v.iter().copied().max().unwrap_or(0) as usize),
+                        Some(Some(v)) => {
+                            (p as usize + nq).max(v.iter().copied().max().unwrap_or(0) as usize)
+                        }
                         None => p as usize + nq,
                     }
                 }
@@ -393,6 +522,7 @@ impl XlaSession {
     /// (rings: its ring slots), padded to a power-of-4 page count of at least 16 so one
     /// executable serves a whole bucket.
     fn bind_paged(
+        &self,
         graph: &Graph,
         state: &mut StateStore,
         inputs: &[Tensor],
@@ -484,6 +614,7 @@ impl XlaSession {
                     _ => ((b.base + i) % held) as i32,
                 })
                 .collect();
+            let dev_kv = self.dev_kv.lock();
             for (name, w, data) in &mut b.names {
                 let rows = kv.host_rows(name).expect("paged above");
                 if rows.elem != 4 {
@@ -491,9 +622,16 @@ impl XlaSession {
                 }
                 let (c, i) = kv.pool().locate(name).expect("paged above");
                 *w = kv.pool().classes[c].names[i].row_width;
-                *data = vec![0f32; win * *w];
-                for (j, out) in data.chunks_exact_mut(*w).enumerate().take(held) {
-                    rows.read(j, out);
+                let hit = dev_kv.get(name).is_some_and(|e| {
+                    e.win_rows == win
+                        && e.synced_rows == b.base
+                        && e.tables.as_slice() == kv.tables[b.class].as_slice()
+                });
+                if !hit {
+                    *data = vec![0f32; win * *w];
+                    for (j, out) in data.chunks_exact_mut(*w).enumerate().take(held) {
+                        rows.read(j, out);
+                    }
                 }
             }
         }
@@ -514,7 +652,7 @@ impl XlaSession {
             ));
         }
         let client = &self.plugin.client;
-        let paged = Self::bind_paged(graph, state, &inputs)?;
+        let paged = self.bind_paged(graph, state, &inputs)?;
         let mut bound = Self::bind_states(graph, state, &inputs)?;
         let classes: Vec<emit::PagedClass> = paged
             .iter()
@@ -536,7 +674,7 @@ impl XlaSession {
             .collect();
         let module = emit::emit(
             graph,
-            &|name| self.weights.get(name).map(|w| (w.len, w.ty)),
+            &|name| self.weights.get(name).map(|w| w.spec),
             &shapes,
             &classes,
         )?;
@@ -551,10 +689,9 @@ impl XlaSession {
                     r
                 }
                 None => {
-                    let n = module.outputs.len() + module.written.len();
+                    let n = module.outputs.len() + module.written.len() + module.paged_deltas.len();
                     let exe = Arc::new(client.compile(&module.text, n)?);
-                    // ponytail: 8 shapes (decode, prefill chunk and tails); more if callers vary more.
-                    if exes.len() == 8 {
+                    if exes.len() == XLA_EXE_CACHE_CAP {
                         exes.remove(0);
                     }
                     let module = Arc::new(module);
@@ -578,78 +715,200 @@ impl XlaSession {
                 ));
             }
             owned.push(match (v.dtype, t) {
-                (DType::U32, Tensor::U32(d)) => client.upload(bytes(d), pjrt::ElemType::S32, &[n])?,
+                (DType::U32, Tensor::U32(d)) => {
+                    client.upload(bytes(d), pjrt::ElemType::S32, &[n])?
+                }
                 (DType::U32, _) => return Err(format!("input '{}' must be u32", v.name)),
                 (_, t) => client.upload(bytes(&t.to_f32()), pjrt::ElemType::F32, &[n])?,
             });
         }
+        let mut dev_kv = self.dev_kv.lock();
+        let mut state_buf_idx: Vec<(usize, bool)> = Vec::with_capacity(module.states.len());
         for name in &module.states {
             let (_, shape, data) = bound
                 .iter()
                 .find(|(n, ..)| n == name)
                 .expect("emitted states are bound");
-            owned.push(client.upload(bytes(data), pjrt::ElemType::F32, &[shape.iter().product()])?);
+            if data.is_empty() && dev_kv.contains_key(name) {
+                state_buf_idx.push((0, true));
+            } else {
+                let idx = owned.len();
+                owned.push(client.upload(
+                    bytes(data),
+                    pjrt::ElemType::F32,
+                    &[shape.iter().product()],
+                )?);
+                state_buf_idx.push((idx, false));
+            }
         }
         for b in &paged {
-            owned.push(client.upload(bytes(&b.slot_row), pjrt::ElemType::S32, &[b.slot_row.len()])?);
+            owned.push(client.upload(
+                bytes(&b.slot_row),
+                pjrt::ElemType::S32,
+                &[b.slot_row.len()],
+            )?);
             owned.push(client.upload(bytes(&b.write_slot), pjrt::ElemType::S32, &[b.nq])?);
             owned.push(client.upload(bytes(&[b.base as i32]), pjrt::ElemType::S32, &[1])?);
         }
         let n_in = graph.inputs.len();
+        let paged_param_start = n_in + state_buf_idx.iter().filter(|(_, cached)| !*cached).count();
         let mut args: Vec<&pjrt::Buffer> = owned[..n_in].iter().collect();
         for name in &module.weights {
-            args.push(&self.weights[name].buf);
+            let w = &self.weights[name];
+            args.push(&w.buf);
+            if let Some(sb) = &w.scale_buf {
+                args.push(sb);
+            }
         }
-        args.extend(owned[n_in..].iter());
+        for (name, &(idx, cached)) in module.states.iter().zip(&state_buf_idx) {
+            if cached {
+                args.push(&dev_kv[name].buf);
+            } else {
+                args.push(&owned[idx]);
+            }
+        }
+        args.extend(owned[paged_param_start..].iter());
         let sizes: Vec<usize> = module
             .outputs
             .iter()
             .map(|&(n, _)| n * 4)
-            .chain(module.written.iter().map(|name| shapes[name].iter().product::<usize>() * 4))
+            .chain(
+                module
+                    .written
+                    .iter()
+                    .map(|name| shapes[name].iter().product::<usize>() * 4),
+            )
+            .chain(module.paged_deltas.iter().map(|&(_, nq, w)| nq * w * 4))
             .collect();
-        let results = client.execute(&exe, &args, &sizes)?;
+        let mut results = client.execute(&exe, &args, &sizes)?;
         drop(owned);
+        let delta_results = results.split_off(module.outputs.len() + module.written.len());
+        let written_results = results.split_off(module.outputs.len());
         let mut outs = Vec::with_capacity(module.outputs.len());
         for (buf, &(n, ty)) in results.iter().zip(&module.outputs) {
             outs.push(if ty == Ty::I32 {
                 let mut v = vec![0u32; n];
-                // SAFETY: u32 storage viewed as bytes for the download.
                 client.download(buf, unsafe {
                     std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 4)
                 })?;
                 Tensor::U32(v)
             } else {
                 let mut v = vec![0f32; n];
-                // SAFETY: as above.
                 client.download(buf, unsafe {
                     std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 4)
                 })?;
                 Tensor::F32(v)
             });
         }
-        for (buf, name) in results[module.outputs.len()..].iter().zip(&module.written) {
-            let mut v = vec![0f32; buf.bytes / 4];
-            // SAFETY: as above.
-            client.download(buf, unsafe {
-                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, buf.bytes)
+        // Sync compact `[nq, w]` paged KV deltas back to host pages and retain full window `buf` on device!
+        for (dbuf, (name, nq, w)) in delta_results.iter().zip(&module.paged_deltas) {
+            let mut delta = vec![0f32; nq * w];
+            client.download(dbuf, unsafe {
+                std::slice::from_raw_parts_mut(delta.as_mut_ptr() as *mut u8, nq * w * 4)
             })?;
-            match paged.iter().find(|b| b.names.iter().any(|(n, ..)| n == name)) {
-                // Copy the rows this run wrote back into their host pages.
-                Some(b) => {
-                    let kv = state.kv.as_ref().expect("paged");
-                    let rows = kv.host_rows(name).expect("paged");
-                    let w = b.names.iter().find(|(n, ..)| n == name).expect("found").1;
-                    for &j in &b.write_slot {
-                        let src = &v[j as usize * w..][..w];
-                        // SAFETY: a host page row of `w` f32 (checked at bind).
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(src.as_ptr(), rows.row(j as usize) as *mut f32, w)
-                        };
-                    }
+            if let Some(b) = paged
+                .iter()
+                .find(|b| b.names.iter().any(|(n, ..)| n == name))
+            {
+                let kv = state.kv.as_ref().expect("paged");
+                let rows = kv.host_rows(name).expect("paged");
+                for (r, &j) in b.write_slot.iter().enumerate() {
+                    let src = &delta[r * w..(r + 1) * w];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            rows.row(j as usize) as *mut f32,
+                            *w,
+                        )
+                    };
                 }
-                None => state.insert(name, Tensor::F32(v)),
+            }
+        }
+        for (buf, name) in written_results.into_iter().zip(&module.written) {
+            if let Some(b) = paged
+                .iter()
+                .find(|b| b.names.iter().any(|(n, ..)| n == name))
+            {
+                let kv = state.kv.as_ref().expect("paged");
+                dev_kv.insert(
+                    name.clone(),
+                    DevKvEntry {
+                        tables: kv.tables[b.class].clone(),
+                        synced_rows: b.base + b.nq,
+                        win_rows: b.slot_row.len(),
+                        buf,
+                    },
+                );
+            } else {
+                let mut v = vec![0f32; buf.bytes / 4];
+                client.download(&buf, unsafe {
+                    std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, buf.bytes)
+                })?;
+                state.insert(name, Tensor::F32(v));
             }
         }
         Ok(outs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hardware::QuantFormat;
+
+    #[test]
+    fn packed_q8_0_and_q4_0_and_paged_deltas_emit_valid_stablehlo() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 32], DType::F32);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let wq = g.weight("wq", vec![32, 32], DType::Quant(QuantFormat::GGUF_Q8_0));
+        let wk = g.weight("wk", vec![32, 32], DType::Quant(QuantFormat::GGUF_Q4_0));
+        let q = g.add("q", Op::Linear, &[x, wq], vec![1, 32], DType::F32);
+        let k = g.add("k", Op::Linear, &[x, wk], vec![1, 32], DType::F32);
+        let ks = g.state("kv.k", vec![64, 32], DType::F32, false);
+        let vs = g.state("kv.v", vec![64, 32], DType::F32, false);
+        let att = g.add(
+            "att",
+            Op::CachedAttention {
+                heads: 4,
+                kv_heads: 4,
+                head_dim: 8,
+                v_head_dim: 8,
+                scale: 0.35355338,
+                causal: true,
+                window: None,
+                soft_cap: None,
+                write: true,
+            },
+            &[q, k, k, ks, vs, pos],
+            vec![1, 32],
+            DType::F32,
+        );
+        g.output(att);
+        let mut states = HashMap::new();
+        states.insert("kv.k".to_string(), vec![64, 32]);
+        states.insert("kv.v".to_string(), vec![64, 32]);
+        let m = emit::emit(
+            &g,
+            &|name| match name {
+                "wq" => Some(WeightSpec::Q8_0(1024)),
+                "wk" => Some(WeightSpec::Q4_0(1024)),
+                _ => None,
+            },
+            &states,
+            &[emit::PagedClass {
+                names: vec!["kv.k".into(), "kv.v".into()],
+                rows: 64,
+                nq: 1,
+                ring: 0,
+            }],
+        )
+        .unwrap();
+        assert!(m.text.contains("tensor<1024xi8>"));
+        assert!(m.text.contains("tensor<512xi8>"));
+        assert!(m.text.contains("tensor<32xbf16>"));
+        assert!(m.text.contains("shift_right_logical"));
+        assert_eq!(m.paged_deltas.len(), 2);
+        assert_eq!(m.paged_deltas[0].1, 1);
     }
 }

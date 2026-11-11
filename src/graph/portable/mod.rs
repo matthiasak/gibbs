@@ -114,7 +114,7 @@ fn tables() -> String {
 
 /// The complete translation unit for `d`: prelude, tables, helpers, codecs and every kernel.
 pub fn source(d: Dialect) -> String {
-    let mut s = String::from(dialect::prelude(d));
+    let mut s = dialect::prelude(d);
     s += &tables();
     s += COMMON;
     s += CODECS;
@@ -225,5 +225,128 @@ pub fn device_api(d: crate::hardware::Device) -> Option<std::sync::Arc<dyn GpuAp
         Device::Rocm => crate::graph::rocm::api(),
         Device::IntelXpu => crate::graph::intel_xpu::api(),
         _ => None,
+    }
+}
+
+/// Returns `(bytes, true)` when `file` exists and is non-empty; otherwise evaluates `make`,
+/// atomically writes `file` via a sibling `.tmp` file, and returns `(bytes, false)`.
+pub(crate) fn cached_bytes(
+    file: &std::path::Path,
+    make: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<(Vec<u8>, bool), String> {
+    if let Ok(bytes) = std::fs::read(file) {
+        if !bytes.is_empty() {
+            return Ok((bytes, true));
+        }
+    }
+    let bytes = make()?;
+    if !bytes.is_empty() {
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = file.with_extension(format!("tmp.{}.{n}", std::process::id()));
+        if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, file).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Ok((bytes, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_rocm_and_opencl_sources_include_warp_sum_dp4a_and_3dispatch_mlp() {
+        let cuda = source(Dialect::Cuda);
+        assert!(cuda.contains("__shfl_down_sync") && cuda.contains("__dp4a"));
+        assert!(cuda.contains("mlp_dual_glu_GGUF_Q4_K_M") && cuda.contains("gemv_res_GGUF_Q4_K_M"));
+        assert!(cuda.contains("gemv_dp4a_GGUF_Q8_0") && cuda.contains("gemv_dp4a_GGUF_Q4_0"));
+
+        let hip = source(Dialect::Hip);
+        assert!(hip.contains("__shfl_down(") && hip.contains("gpk_dp4a"));
+        assert!(hip.contains("mlp_dual_glu_GGUF_Q8_0") && hip.contains("gemv_res_GGUF_Q8_0"));
+
+        let cl = source(Dialect::OpenCl);
+        assert!(cl.contains("WARP_SUM_64") && cl.contains("quantize_x_q8"));
+    }
+
+    #[test]
+    fn dp4a_q8_0_and_q4_0_gemv_match_cpu_when_opencl_available() {
+        let Some(api) = crate::graph::intel_xpu::api() else {
+            return;
+        };
+        use crate::graph::{Graph, StateStore, Tensor, Weights};
+        use crate::model::weights::Mat;
+        let (in_f, out_f) = (256, 16);
+        let w_f32: Vec<f32> = (0..out_f * in_f)
+            .map(|i| (((i * 17 + 5) % 97) as f32 - 48.0) * 0.02)
+            .collect();
+        let x_f32: Vec<f32> = (0..in_f)
+            .map(|i| (((i * 11 + 3) % 53) as f32 - 26.0) * 0.05)
+            .collect();
+        for fmt in [QuantFormat::GGUF_Q8_0, QuantFormat::GGUF_Q4_0] {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![1, in_f], DType::F32);
+            let w = g.weight("w", vec![out_f, in_f], DType::Quant(fmt));
+            let y = g.add("lin", Op::Linear, &[x, w], vec![1, out_f], DType::F32);
+            g.output(y);
+            let packed = crate::model::layers::encode_rows(&w_f32, in_f, fmt).unwrap();
+            let mat = Mat::from_packed_bytes(fmt, packed, out_f, in_f);
+            let mut ws = Weights::new();
+            ws.insert("w", Tensor::Mat(mat));
+            let want = crate::graph::cpu::run_stateless(&g, &ws, vec![Tensor::F32(x_f32.clone())])
+                .unwrap()[0]
+                .to_f32();
+            let mut sess = PortableSession::compile(api.clone(), &g, ws).unwrap();
+            let got = sess
+                .run(&mut StateStore::new(), vec![Tensor::F32(x_f32.clone())])
+                .unwrap()[0]
+                .to_f32();
+            let num: f64 = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                .sum();
+            let den: f64 = want.iter().map(|b| (*b as f64).powi(2)).sum();
+            let rel = (num / den.max(1e-12)).sqrt();
+            assert!(rel < 1e-2, "{fmt:?} DP4A GEMV rel_rms = {rel}");
+        }
+    }
+
+    #[test]
+    fn cached_bytes_misses_then_hits_and_treats_empty_file_as_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sub").join("mod.bin");
+        let calls = std::cell::Cell::new(0usize);
+        let (b1, hit1) = cached_bytes(&file, || {
+            calls.set(calls.get() + 1);
+            Ok(b"ptx-v1".to_vec())
+        })
+        .unwrap();
+        assert!(!hit1);
+        assert_eq!(b1, b"ptx-v1");
+        assert_eq!(calls.get(), 1);
+
+        let (b2, hit2) = cached_bytes(&file, || {
+            calls.set(calls.get() + 1);
+            Ok(b"ptx-v2".to_vec())
+        })
+        .unwrap();
+        assert!(hit2);
+        assert_eq!(b2, b"ptx-v1");
+        assert_eq!(calls.get(), 1);
+
+        std::fs::write(&file, b"").unwrap();
+        let (b3, hit3) = cached_bytes(&file, || {
+            calls.set(calls.get() + 1);
+            Ok(b"ptx-v3".to_vec())
+        })
+        .unwrap();
+        assert!(!hit3);
+        assert_eq!(b3, b"ptx-v3");
+        assert_eq!(calls.get(), 2);
     }
 }

@@ -1,4 +1,4 @@
-use crate::model::weight_format::{ReencodePolicy, VariantPolicy};
+use crate::model::weight_format::{HopePolicy, ReencodePolicy, VariantPolicy};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -17,6 +17,9 @@ pub struct GibbsSettings {
     /// Automatic session compaction configuration.
     #[serde(default)]
     pub compact: crate::compact::CompactionConfig,
+    /// On-the-fly HOPE progressive weight compression policy (`off` default).
+    #[serde(default)]
+    pub hope: HopePolicy,
 }
 
 #[cfg(not(test))]
@@ -87,6 +90,7 @@ mod tests {
         for p in [
             ReencodePolicy::MaxSpeed,
             ReencodePolicy::LowBitNative,
+            ReencodePolicy::MinSize,
             ReencodePolicy::BitExact,
         ] {
             assert_eq!(
@@ -110,6 +114,7 @@ mod tests {
             reencode_max_kl: Some(0.05),
             draft: crate::runtime::noise_draft::DraftKnobs::default(),
             compact: crate::compact::CompactionConfig::default(),
+            hope: HopePolicy::Light,
         };
         save_settings(&s).unwrap();
         assert_eq!(load_settings(), s);

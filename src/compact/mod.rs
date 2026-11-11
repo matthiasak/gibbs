@@ -92,7 +92,8 @@ pub struct CompactionConfig {
     pub keep_recent_turns: usize,
     /// Render the folded transcript as `SnapCompact` glyph pages for vision models (Aggressive).
     pub enable_snapcompact_vision: bool,
-    /// Tier 3 summarizer: `None` is the active model, else a model id loaded beside it.
+    /// Tier 3 summarizer: `None` is the active model, else a model id loaded beside it, or an
+    /// `http(s)://...[#model]` chat API ([`HttpSummarizer`]).
     pub summarizer: Option<String>,
 }
 
@@ -164,9 +165,20 @@ impl CompactionOverride {
     }
 
     /// A summarizer named over HTTP must already be in the local model cache: a request never
-    /// starts a download.
+    /// starts a download. An http(s) summarizer must be the server's own (`--compact-summarizer`):
+    /// a request never picks the URL that receives the API key.
     pub fn check_local(&self) -> Result<(), String> {
         match self.summarizer.as_deref().and_then(summarizer_id) {
+            Some(url) if HttpSummarizer::parse(&url).is_some() => {
+                let saved = crate::tui::settings::load_settings().compact.summarizer;
+                if saved.as_deref() == Some(url.as_str()) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "compact.summarizer '{url}' is not this server's --compact-summarizer"
+                    ))
+                }
+            }
             Some(id)
                 if crate::model::hub::HuggingFaceHub::new()
                     .locate_model(&id)
@@ -219,8 +231,28 @@ pub fn default_thinking_delimiters() -> Vec<(String, String)> {
     ]
 }
 
-/// **Tier 1**: Elides reasoning/thinking traces (`<think>...</think>`) from assistant turns older
-/// than the last `keep_recent_turns` turns. Returns the total number of characters removed.
+/// The text strings of a message `content`: the string itself, or its parts' `text` strings
+/// (`content` of `tool_result` parts).
+fn texts_mut(content: &mut Value) -> Vec<&mut String> {
+    match content {
+        Value::String(s) => vec![s],
+        Value::Array(parts) => parts
+            .iter_mut()
+            .filter_map(|p| {
+                let key = if p["type"] == "tool_result" { "content" } else { "text" };
+                match p.get_mut(key) {
+                    Some(Value::String(s)) => Some(s),
+                    _ => None,
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// **Tier 1**: Elides reasoning/thinking traces (`<think>...</think>` in text, `thinking` /
+/// `redacted_thinking` content parts) from assistant turns older than the last
+/// `keep_recent_turns` turns. Returns the total number of characters removed.
 pub fn elide_thinking_traces(
     messages: &mut [ChatMessage],
     keep_recent_turns: usize,
@@ -239,27 +271,34 @@ pub fn elide_thinking_traces(
         if msg.role != "assistant" {
             continue;
         }
-        let Some(text) = msg.content.as_str() else {
-            continue;
-        };
-        let mut s = text.to_string();
-        let orig_len = s.len();
-        for (open, close) in &delims {
-            while let Some(start) = s.find(open.as_str()) {
-                if let Some(end_rel) = s[start + open.len()..].find(close.as_str()) {
-                    let mut end = start + open.len() + end_rel + close.len();
-                    while end < s.len() && matches!(s.as_bytes()[end], b'\n' | b'\r' | b' ') {
-                        end += 1;
+        if let Value::Array(parts) = &mut msg.content {
+            parts.retain(|p| {
+                let thinking = matches!(p["type"].as_str(), Some("thinking" | "redacted_thinking"));
+                if thinking {
+                    elided_chars += p.to_string().len();
+                }
+                !thinking
+            });
+        }
+        for s in texts_mut(&mut msg.content) {
+            let orig_len = s.len();
+            for (open, close) in &delims {
+                while let Some(start) = s.find(open.as_str()) {
+                    if let Some(end_rel) = s[start + open.len()..].find(close.as_str()) {
+                        let mut end = start + open.len() + end_rel + close.len();
+                        while end < s.len() && matches!(s.as_bytes()[end], b'\n' | b'\r' | b' ') {
+                            end += 1;
+                        }
+                        s.replace_range(start..end, "");
+                    } else {
+                        break;
                     }
-                    s.replace_range(start..end, "");
-                } else {
-                    break;
                 }
             }
-        }
-        if s.len() < orig_len {
-            elided_chars += orig_len - s.len();
-            msg.content = Value::String(s.trim().to_string());
+            if s.len() < orig_len {
+                elided_chars += orig_len - s.len();
+                *s = s.trim().to_string();
+            }
         }
     }
     elided_chars
@@ -353,10 +392,12 @@ fn head_tail(s: &str, n: usize, m: usize) -> (&str, &str) {
     (head, tail)
 }
 
-/// **Tier 2**: In string messages before the last `keep_recent_turns` turns (system messages
-/// excepted), a block over 16 lines or 800 characters is stored whole as an artifact and replaced
-/// by its head and tail around `[… {n} lines compacted; artifact {hex} …]`; a block of at least
-/// 200 characters already seen in an earlier message becomes `[duplicate of artifact {hex}]`.
+/// **Tier 2**: In messages before the last `keep_recent_turns` turns (system messages excepted),
+/// in string content and `text` / `tool_result` parts alike, a block over 16 lines or 800
+/// characters is stored whole as an artifact and replaced by its head and tail around
+/// `[… {n} lines compacted; artifact {hex} …]`; a block of at least 200 characters already seen
+/// in an earlier message becomes `[duplicate of artifact {hex}]`. Tool-call `arguments` over 800
+/// characters become `{"_gibbs_compacted_artifact": hex, "preview": ..}` (still valid JSON).
 /// Returns the characters removed and the artifacts referenced. A block whose artifact cannot be
 /// stored stays verbatim.
 pub fn shake_messages(
@@ -367,64 +408,118 @@ pub fn shake_messages(
     let (mut shaken, mut artifacts) = (0usize, Vec::new());
     let mut seen: HashSet<u64> = HashSet::new();
     for (i, msg) in messages.iter_mut().enumerate() {
-        let Some(text) = msg.content.as_str() else {
-            continue;
-        };
-        let spans = block_spans(text);
-        let hashes: Vec<u64> = spans
-            .iter()
-            .map(|&(s, e)| fnv64(text[s..e].as_bytes()))
-            .collect();
-        if i < cutoff && msg.role != "system" {
-            let (mut out, mut last) = (String::with_capacity(text.len()), 0);
-            for (&(s, e), h) in spans.iter().zip(&hashes) {
-                let block = &text[s..e];
-                let lines = block.lines().count();
-                let replacement = if block.len() >= 200 && seen.contains(h) {
-                    store_artifact(block)
-                        .ok()
-                        .map(|hex| (format!("[duplicate of artifact {hex}]"), hex))
-                } else if lines > 16 || block.len() > 800 {
-                    store_artifact(block).ok().map(|hex| {
-                        let digest = if lines > 16 {
-                            let l: Vec<&str> = block.lines().collect();
-                            format!(
-                                "{}\n[… {} lines compacted; artifact {hex} …]\n{}",
-                                l[..5].join("\n"),
-                                lines - 9,
-                                l[lines - 4..].join("\n")
-                            )
-                        } else {
-                            let (head, tail) = head_tail(block, 240, 160);
-                            let n = block.chars().count().saturating_sub(400);
-                            format!("{head}[… {n} chars compacted; artifact {hex} …]{tail}")
-                        };
-                        (digest, hex)
-                    })
-                } else {
-                    None
-                };
-                out.push_str(&text[last..s]);
-                match replacement {
-                    Some((r, hex)) if r.len() < block.len() => {
-                        out.push_str(&r);
-                        artifacts.push(hex);
-                    }
-                    _ => out.push_str(block),
-                }
-                last = e;
-            }
-            out.push_str(&text[last..]);
-            if out.len() < text.len() {
-                shaken += text.len() - out.len();
-                msg.content = Value::String(out);
-            }
+        let spill = i < cutoff && msg.role != "system";
+        let mut hashes = Vec::new();
+        for text in texts_mut(&mut msg.content) {
+            shaken += shake_text(text, spill, &seen, &mut hashes, &mut artifacts);
         }
         seen.extend(hashes);
+        let Some(Value::Array(calls)) = msg.tool_calls.as_mut().filter(|_| spill) else {
+            continue;
+        };
+        for args in calls.iter_mut().filter_map(|c| c.pointer_mut("/function/arguments")) {
+            let raw = match &*args {
+                Value::String(s) => s.clone(),
+                v => v.to_string(),
+            };
+            if raw.len() <= 800 {
+                continue;
+            }
+            let Ok(hex) = store_artifact(&raw) else {
+                continue;
+            };
+            let stub = serde_json::json!({
+                "_gibbs_compacted_artifact": &hex,
+                "preview": head_tail(&raw, 200, 0).0,
+            });
+            shaken += raw.len() - stub.to_string().len();
+            *args = if args.is_string() {
+                Value::String(stub.to_string())
+            } else {
+                stub
+            };
+            artifacts.push(hex);
+        }
     }
     artifacts.sort_unstable();
     artifacts.dedup();
     (shaken, artifacts)
+}
+
+/// Tier 2 on one string: when `spill`, replaces its long and already-`seen` blocks (see
+/// [`shake_messages`]); records its block hashes in `hashes`. Returns the characters removed.
+fn shake_text(
+    text: &mut String,
+    spill: bool,
+    seen: &HashSet<u64>,
+    hashes: &mut Vec<u64>,
+    artifacts: &mut Vec<String>,
+) -> usize {
+    let spans = block_spans(text);
+    let start = hashes.len();
+    hashes.extend(spans.iter().map(|&(s, e)| fnv64(text[s..e].as_bytes())));
+    if !spill {
+        return 0;
+    }
+    let (mut out, mut last) = (String::with_capacity(text.len()), 0);
+    for (&(s, e), h) in spans.iter().zip(&hashes[start..]) {
+        let block = &text[s..e];
+        let lines = block.lines().count();
+        let replacement = if block.len() >= 200 && seen.contains(h) {
+            store_artifact(block)
+                .ok()
+                .map(|hex| (format!("[duplicate of artifact {hex}]"), hex))
+        } else if lines > 16 || block.len() > 800 {
+            store_artifact(block).ok().map(|hex| {
+                let digest = if lines > 16 {
+                    let l: Vec<&str> = block.lines().collect();
+                    format!(
+                        "{}\n[… {} lines compacted; artifact {hex} …]\n{}",
+                        l[..5].join("\n"),
+                        lines - 9,
+                        l[lines - 4..].join("\n")
+                    )
+                } else {
+                    let (head, tail) = head_tail(block, 240, 160);
+                    let n = block.chars().count().saturating_sub(400);
+                    format!("{head}[… {n} chars compacted; artifact {hex} …]{tail}")
+                };
+                (digest, hex)
+            })
+        } else {
+            None
+        };
+        out.push_str(&text[last..s]);
+        match replacement {
+            Some((r, hex)) if r.len() < block.len() => {
+                out.push_str(&r);
+                artifacts.push(hex);
+            }
+            _ => out.push_str(block),
+        }
+        last = e;
+    }
+    out.push_str(&text[last..]);
+    let shaken = text.len().saturating_sub(out.len());
+    if shaken > 0 {
+        *text = out;
+    }
+    shaken
+}
+
+/// For tool-using agents: every artifact marker of `artifacts` names its retrieval endpoint,
+/// `artifact {hex} (GET /v1/artifacts/{hex})`.
+pub fn link_artifacts(messages: &mut [ChatMessage], artifacts: &[String]) {
+    for m in messages {
+        for text in texts_mut(&mut m.content) {
+            for hex in artifacts {
+                let marker = format!("artifact {hex}");
+                if text.contains(&marker) {
+                    *text = text.replace(&marker, &format!("{marker} (GET /v1/artifacts/{hex})"));
+                }
+            }
+        }
+    }
 }
 
 /// SnapCompact page geometry: 64 columns x 48 rows of 12x16 cells (768x768 px); glyphs are
@@ -756,9 +851,24 @@ pub fn compact_chat_session(
     let folded = &out[first..fold_end];
     let transcript: String = folded
         .iter()
-        .map(|m| format!("{}: {}\n", m.role, m.text()))
+        .map(|m| {
+            let calls = m.tool_calls.as_ref().and_then(Value::as_array);
+            let calls: String = calls
+                .into_iter()
+                .flatten()
+                .map(|c| match &c["function"]["arguments"] {
+                    Value::String(a) => format!("[tool call {} {a}]\n", c["function"]["name"]),
+                    a => format!("[tool call {} {a}]\n", c["function"]["name"]),
+                })
+                .collect();
+            format!("{}: {}\n{calls}", m.role, m.text())
+        })
         .collect();
-    let kept: Vec<ChatMessage> = out[..first].iter().chain(&out[fold_end..]).cloned().collect();
+    let kept: Vec<ChatMessage> = out[..first]
+        .iter()
+        .chain(&out[fold_end..])
+        .cloned()
+        .collect();
     let max_tokens = target_tokens
         .saturating_sub(estimate_tokens(&kept, tok))
         .clamp(64, 1024);
@@ -878,7 +988,7 @@ impl LocalModelSummarizer {
             &hub,
             id,
             &crate::arch::dispatch::LoadOpts {
-                placement: crate::hardware::PlacementMode::Pin(crate::hardware::default_device()),
+                placement: crate::hardware::PlacementMode::Auto,
                 token: token.as_deref(),
                 quant_name: None,
                 hw: &crate::hardware::HardwareCapability::probe_system(),
@@ -908,7 +1018,109 @@ impl Summarizer for LocalModelSummarizer {
     }
 
     fn summarize(&self, transcript: &str, max_tokens: usize) -> Result<String, String> {
-        summarize_on(&self.model.one_shot_scheduler(), true, transcript, max_tokens)
+        summarize_on(
+            &self.model.one_shot_scheduler(),
+            true,
+            transcript,
+            max_tokens,
+        )
+    }
+}
+
+/// Summarizes through a remote chat API: `cfg.summarizer` = `http(s)://<url>[#<model>]`, OpenAI
+/// chat completions, or Anthropic Messages when the path ends in `/v1/messages`. The key comes
+/// from `GIBBS_COMPACT_API_KEY`, else `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`.
+pub struct HttpSummarizer {
+    url: String,
+    model: Option<String>,
+}
+
+impl HttpSummarizer {
+    /// `None` unless `s` is an http(s) URL.
+    pub fn parse(s: &str) -> Option<Self> {
+        if !(s.starts_with("http://") || s.starts_with("https://")) {
+            return None;
+        }
+        let (url, model) = s.split_once('#').unwrap_or((s, ""));
+        Some(Self {
+            url: url.to_string(),
+            model: Some(model.to_string()).filter(|m| !m.is_empty()),
+        })
+    }
+}
+
+impl Summarizer for HttpSummarizer {
+    fn id(&self) -> String {
+        format!("{}#{}", self.url, self.model.as_deref().unwrap_or_default())
+    }
+
+    fn summarize(&self, transcript: &str, max_tokens: usize) -> Result<String, String> {
+        use std::io::Write;
+        let system = SUMMARY_PROMPT.replace("{max_tokens}", &max_tokens.to_string());
+        let anthropic = self.url.trim_end_matches('/').ends_with("/v1/messages");
+        let user = serde_json::json!({"role": "user", "content": transcript});
+        let mut body = if anthropic {
+            serde_json::json!({"system": system, "messages": [user]})
+        } else {
+            serde_json::json!({"messages": [{"role": "system", "content": system}, user]})
+        };
+        body["temperature"] = 0.into();
+        body["max_tokens"] = max_tokens.into();
+        if let Some(m) = &self.model {
+            body["model"] = m.as_str().into();
+        }
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let key = env("GIBBS_COMPACT_API_KEY");
+        let mut headers = vec!["content-type: application/json".to_string(), "Expect:".into()];
+        if anthropic {
+            headers.push("anthropic-version: 2023-06-01".into());
+            headers.extend(key.or_else(|| env("ANTHROPIC_API_KEY")).map(|k| format!("x-api-key: {k}")));
+        } else {
+            headers.extend(key.or_else(|| env("OPENAI_API_KEY")).map(|k| format!("Authorization: Bearer {k}")));
+        }
+        // Everything goes through a curl config on stdin: the key never shows in `ps`.
+        let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        let mut config = format!("url = {}\ndata-binary = {}\n", q(&self.url), q(&body.to_string()));
+        for h in &headers {
+            config += &format!("header = {}\n", q(h));
+        }
+        let mut child = std::process::Command::new("curl")
+            .args(["-sS", "--fail-with-body", "--max-time", "60", "--proto", "=http,https", "-K", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("summarizer curl: {e}"))?;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(config.as_bytes())
+            .map_err(|e| format!("summarizer curl: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("summarizer curl: {e}"))?;
+        let reply = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() {
+            return Err(format!(
+                "summarizer {}: {} {:.300}",
+                self.url,
+                String::from_utf8_lossy(&out.stderr).trim(),
+                reply
+            ));
+        }
+        let v: Value = serde_json::from_str(&reply)
+            .map_err(|e| format!("summarizer {}: {e}: {reply:.300}", self.url))?;
+        let text: Option<String> = if anthropic {
+            v["content"]
+                .as_array()
+                .map(|b| b.iter().filter_map(|b| b["text"].as_str()).collect())
+        } else {
+            v["choices"][0]["message"]["content"].as_str().map(String::from)
+        };
+        text.map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| format!("summarizer {}: no summary in {reply:.300}", self.url))
     }
 }
 
@@ -925,20 +1137,28 @@ pub fn compact_for_scheduler(
     force: bool,
 ) -> Result<CompactionReport, String> {
     let model = sched.model();
-    let traits = model.as_ref().map_or_else(ModelTraits::default, |m| ModelTraits {
-        delimiters: m.thinking_delimiters(),
-        has_vision: m.has_vision(),
-    });
+    let traits = model
+        .as_ref()
+        .map_or_else(ModelTraits::default, |m| ModelTraits {
+            delimiters: m.thinking_delimiters(),
+            has_vision: m.has_vision(),
+        });
     let ctx = ctx
         .or_else(|| model.as_ref().and_then(ExecutableModel::context_len))
         .unwrap_or(8192);
-    let local;
+    let (local, http);
     let active = SchedulerSummarizer(sched.clone());
     let summarizer: &dyn Summarizer = match &cfg.summarizer {
-        Some(id) => {
-            local = LocalModelSummarizer::load(id)?;
-            &local
-        }
+        Some(id) => match HttpSummarizer::parse(id) {
+            Some(h) => {
+                http = h;
+                &http
+            }
+            None => {
+                local = LocalModelSummarizer::load(id)?;
+                &local
+            }
+        },
         None => &active,
     };
     let tok = sched.tokenizer();
@@ -1018,8 +1238,14 @@ mod tests {
         let (shaken, artifacts) = shake_messages(&mut msgs, 1);
         assert!(shaken > 100);
         let first = msgs[0].text();
-        assert!(first.starts_with("Look at this:\n\ntier2 log line 0"), "{first}");
-        assert!(first.contains("[… 21 lines compacted; artifact "), "{first}");
+        assert!(
+            first.starts_with("Look at this:\n\ntier2 log line 0"),
+            "{first}"
+        );
+        assert!(
+            first.contains("[… 21 lines compacted; artifact "),
+            "{first}"
+        );
         // The boilerplate block is new in message 0, a repeat in message 2.
         assert!(first.ends_with(&boiler), "{first}");
         let hex = format!("{:016x}", fnv64(boiler.as_bytes()));
@@ -1043,10 +1269,22 @@ mod tests {
         assert_eq!(unique.len(), 95, "two printable characters share a glyph");
         let printable: String = (0x20u8..=0x7e).map(char::from).collect();
         let text: String = (0..30)
-            .map(|i| printable.chars().cycle().skip(i).take(95).collect::<String>() + "\n")
+            .map(|i| {
+                printable
+                    .chars()
+                    .cycle()
+                    .skip(i)
+                    .take(95)
+                    .collect::<String>()
+                    + "\n"
+            })
             .collect();
         let pages = render_snapcompact_pages(&text);
-        assert_eq!(pages.len(), 2, "60 rows fill one 48-row page and part of another");
+        assert_eq!(
+            pages.len(),
+            2,
+            "60 rows fill one 48-row page and part of another"
+        );
         let mut read = Vec::new();
         for page in &pages {
             let img = ImageBuffer::decode(&page.to_png()).unwrap();
@@ -1064,8 +1302,7 @@ mod tests {
                                 }
                             }
                         }
-                        let hits: Vec<usize> =
-                            (0..95).filter(|&i| GLYPHS_5X7[i] == bits).collect();
+                        let hits: Vec<usize> = (0..95).filter(|&i| GLYPHS_5X7[i] == bits).collect();
                         assert_eq!(hits.len(), 1, "cell ({r}, {c}) matches {hits:?}");
                         char::from(0x20 + hits[0] as u8)
                     })
@@ -1108,10 +1345,13 @@ mod tests {
             keep_recent_turns: 2,
             ..CompactionConfig::default()
         };
-        let s = Counting(Cell::new(0), "The user asked six thermodynamics questions.", "org/a");
+        let s = Counting(
+            Cell::new(0),
+            "The user asked six thermodynamics questions.",
+            "org/a",
+        );
         let run = |msgs: &[ChatMessage], s: &Counting| {
-            compact_chat_session(msgs, &tok, 4096, &cfg, &ModelTraits::default(), s, true)
-                .unwrap()
+            compact_chat_session(msgs, &tok, 4096, &cfg, &ModelTraits::default(), s, true).unwrap()
         };
         let json = |m: &[ChatMessage]| serde_json::to_string(m).unwrap();
         let (a, b) = (run(&msgs, &s), run(&msgs, &s));
@@ -1125,7 +1365,10 @@ mod tests {
         assert!(a.report.after_tokens < a.report.before_tokens);
         // The next turn of a client that never adopted the compacted history.
         msgs.push(ChatMessage::new("user", "And the third law?"));
-        msgs.push(ChatMessage::new("assistant", "Entropy goes to a constant at 0 K."));
+        msgs.push(ChatMessage::new(
+            "assistant",
+            "Entropy goes to a constant at 0 K.",
+        ));
         let c = run(&msgs, &s);
         assert_eq!(s.0.get(), 1, "the folded slice did not move");
         assert_eq!(c.messages.len(), 9);
@@ -1173,5 +1416,120 @@ mod tests {
         cfg.enable_snapcompact_vision = false;
         let c = compact_chat_session(&msgs, &tok, ctx, &cfg, &vision, &s, false).unwrap();
         assert!(c.media.is_empty() && c.messages[1].content.is_string());
+    }
+
+    /// Answers one HTTP request with `body` (an OpenAI chat completion); returns the URL and the
+    /// request it received.
+    fn mock_chat_api(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let served = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let (mut req, mut buf) = (Vec::new(), [0u8; 8192]);
+            let complete = |req: &[u8]| {
+                let text = String::from_utf8_lossy(req);
+                let Some((head, rest)) = text.split_once("\r\n\r\n") else {
+                    return false;
+                };
+                let len = head
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|n| n.trim().parse::<usize>().unwrap()))
+                    .unwrap_or(0);
+                rest.len() >= len
+            };
+            while !complete(&req) {
+                let n = conn.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed early");
+                req.extend_from_slice(&buf[..n]);
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            conn.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8(req).unwrap()
+        });
+        (url, served)
+    }
+
+    /// Agent histories as `/v1/messages` and `/v1/responses` deliver them: thinking parts, text
+    /// parts and long tool-call arguments compact in older turns (arguments stay valid JSON and
+    /// markers name `GET /v1/artifacts/{hex}`), and Tier 3 summarizes through a remote API.
+    #[test]
+    fn anthropic_responses_tool_calls_and_http_summarizer_compact() {
+        let log: String = (0..30)
+            .map(|i| format!("http_summarizer test log line {i}: ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let patch = format!("--- a/x.rs\n+++ b/x.rs\n{}", "+ let value = compute();\n".repeat(60));
+        let call = |args: Value| {
+            serde_json::json!([{"id": "c1", "type": "function",
+                "function": {"name": "apply_patch", "arguments": args}}])
+        };
+        let mut msgs = vec![
+            ChatMessage::new("user", "Fix the build"),
+            ChatMessage {
+                content: serde_json::json!([
+                    {"type": "thinking", "thinking": "The build fails because ..."},
+                    {"type": "text", "text": format!("Build output:\n\n{log}")}
+                ]),
+                tool_calls: Some(call(serde_json::json!({ "patch": patch }))),
+                ..ChatMessage::new("assistant", "")
+            },
+            ChatMessage {
+                tool_call_id: Some("c1".into()),
+                ..ChatMessage::new("tool", "applied")
+            },
+            ChatMessage {
+                tool_calls: Some(call(Value::String(serde_json::json!({ "patch": patch }).to_string()))),
+                ..ChatMessage::new("assistant", "Again.")
+            },
+            ChatMessage::new("user", "Thanks"),
+            ChatMessage::new("assistant", "Done."),
+        ];
+        assert!(elide_thinking_traces(&mut msgs, 1, &[]) > 20);
+        assert_eq!(msgs[1].content.as_array().unwrap().len(), 1, "thinking part dropped");
+        let (shaken, artifacts) = shake_messages(&mut msgs, 1);
+        assert!(shaken > 1000, "{shaken}");
+        let log_hex = format!("{:016x}", fnv64(log.as_bytes()));
+        let text = msgs[1].content[0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("[… 21 lines compacted; artifact {log_hex} …]")), "{text}");
+        // Object arguments stay an object, string arguments a JSON string; both name the artifact.
+        let args = &msgs[1].tool_calls.as_ref().unwrap()[0]["function"]["arguments"];
+        let hex = args["_gibbs_compacted_artifact"].as_str().unwrap();
+        let original: Value = serde_json::from_str(&read_artifact(hex).unwrap()).unwrap();
+        assert_eq!(original["patch"], patch.as_str());
+        assert!(args["preview"].as_str().unwrap().starts_with("{\"patch\":\"--- a/x.rs"));
+        let args = &msgs[3].tool_calls.as_ref().unwrap()[0]["function"]["arguments"];
+        let parsed: Value = serde_json::from_str(args.as_str().unwrap()).unwrap();
+        assert_eq!(parsed["_gibbs_compacted_artifact"], hex);
+        assert!(artifacts.contains(&log_hex) && artifacts.contains(&hex.to_string()));
+        link_artifacts(&mut msgs, &artifacts);
+        let text = msgs[1].content[0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("artifact {log_hex} (GET /v1/artifacts/{log_hex}) …]")), "{text}");
+
+        let (url, served) = mock_chat_api(
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"  The agent patched x.rs.  "}}]}"#,
+        );
+        let s = HttpSummarizer::parse(&format!("{url}#mock-model")).unwrap();
+        let cfg = CompactionConfig {
+            mode: CompactionMode::Aggressive,
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        };
+        let tok = Tokenizer::default_bpe();
+        let c = compact_chat_session(&msgs, &tok, 4096, &cfg, &ModelTraits::default(), &s, true)
+            .unwrap();
+        let request = served.join().unwrap();
+        assert!(request.starts_with("POST /v1/chat/completions "), "{request}");
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!((body["model"].as_str(), body["temperature"].as_u64()), (Some("mock-model"), Some(0)));
+        assert!(body["messages"][1]["content"].as_str().unwrap().contains("[tool call \"apply_patch\" "));
+        assert_eq!(c.report.tier3_turns_summarized, 2);
+        assert!(c.messages[0].text().ends_with("\nThe agent patched x.rs."), "{:?}", c.messages[0]);
+        // Cached: the same fold never calls the (now gone) server again.
+        let again = compact_chat_session(&msgs, &tok, 4096, &cfg, &ModelTraits::default(), &s, true);
+        assert_eq!(again.unwrap().messages, c.messages);
     }
 }

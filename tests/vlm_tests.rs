@@ -60,7 +60,7 @@ fn ask(m: &dyn NativeLm, images: &[Vec<u8>], question: &str, max_tokens: usize) 
     );
     let mut out = Vec::new();
     for pos in ids.len()..ids.len() + max_tokens {
-        let next = gibbs_engine::runtime::lm::sample_logits(&logits, &out, 0.0, 1, 1.0);
+        let next = gibbs_engine::runtime::lm::sample_logits(&logits, &out, 0.0, 1, 1.0, 0);
         if tok.is_special(next) {
             break;
         }

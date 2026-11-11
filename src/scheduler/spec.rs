@@ -56,6 +56,12 @@ pub trait Drafter: Send + Sync {
     /// After a verify: the target's logits rows (`width` wide) for the sequence's last token and
     /// the accepted drafts; `accepted[j]` is the token committed from row `j`.
     fn observe(&self, _st: &mut DraftState, _accepted: &[u32], _logits: &[f32], _width: usize) {}
+    /// Compact GPU verification counterpart of [`Self::observe`]: receives each accepted row's
+    /// normalized `(token_id, prob)` top-k distribution directly from the GPU without host logits.
+    fn observe_topk(&self, _st: &mut DraftState, _accepted: &[u32], _rows: &[Vec<(u32, f32)>]) {}
+    /// Advances a fresh `DraftState` past `skipped` restored prefix positions before the boundary's
+    /// `last_taps` row (`RadixPrefixCache` hit with tap drafters).
+    fn skip_prefix(&self, _st: &mut DraftState, _skipped: usize) {}
     /// A copy of `st` that a [`Self::propose`] may run ahead on during the target's verify;
     /// `None` when the drafter cannot.
     fn fork_state(&self, _st: &DraftState) -> Option<DraftState> {
@@ -138,6 +144,10 @@ impl SpecSeq {
     pub(super) fn drafter(&self) -> &dyn Drafter {
         &*self.drafter
     }
+
+    pub(super) fn skip_prefix(&mut self, skipped: usize) {
+        self.drafter.skip_prefix(&mut self.draft, skipped);
+    }
 }
 
 /// What one decode step produced.
@@ -168,6 +178,25 @@ impl ExecutableModel {
     ) -> Result<Vec<f32>, String> {
         self.0
             .forward_all(tokens, start, kv.as_mut().ok_or(NO_STATE)?)
+    }
+
+    fn verify_topk(
+        &self,
+        tokens: &[u32],
+        start: usize,
+        temp: f32,
+        top_p: f32,
+        vocab: usize,
+        kv: &mut Option<SeqState>,
+    ) -> Result<Vec<Vec<(u32, f32)>>, String> {
+        self.0.verify_topk(
+            tokens,
+            start,
+            temp,
+            top_p,
+            vocab,
+            kv.as_mut().ok_or(NO_STATE)?,
+        )
     }
 
     /// Rewinds the sequence to `len` positions.
@@ -245,7 +274,16 @@ pub(super) fn decode(
         };
         let (t, lp) = match streamed {
             Some(t) => (t, None),
-            None => m.step_token_with_kv(all, last, all.len(), temp, top_p, top_logprobs, kv)?,
+            None => m.step_token_with_kv(
+                all,
+                last,
+                all.len(),
+                temp,
+                top_p,
+                spec.rng.next_u64(),
+                top_logprobs,
+                kv,
+            )?,
         };
         // While the stream runs ahead, the drafter catches up on the committed tokens; one that
         // [`Drafter::guesses`] also guesses this token (shadow acceptance).
@@ -279,69 +317,114 @@ pub(super) fn decode(
     let mut input = Vec::with_capacity(drafts.len() + 1);
     input.push(last);
     input.extend_from_slice(&drafts);
-    let (logits, ahead) = if spec.drafter.overlaps() {
-        verify_overlapped(m, spec, all, &drafts, &input, kv, (temp, top_p, vocab))?
-    } else {
-        (m.forward_all(&input, start, kv)?, None)
-    };
-    if logits.is_empty() || logits.len() % input.len() != 0 {
-        return Err(format!(
-            "verify returned {} logits for {} positions",
-            logits.len(),
-            input.len()
-        ));
-    }
-    let width = logits.len() / input.len();
-    let mut out = Vec::with_capacity(input.len());
-    let mut logprobs = Vec::new();
-    for (j, row) in logits.chunks_exact(width).enumerate() {
-        let l = &row[..valid(width)];
-        if greedy {
-            let t = m.sample(l, recent(all), temp, top_p);
-            if let Some(k_lp) = top_logprobs {
-                logprobs.push(super::logprob_info(l, t, k_lp));
+    let (mut out, mut logprobs) = (Vec::with_capacity(input.len()), Vec::new());
+    if top_logprobs.is_none() {
+        let (topk_rows, ahead) = if spec.drafter.overlaps() {
+            verify_overlapped_topk(m, spec, all, &drafts, &input, kv, (temp, top_p, vocab))?
+        } else {
+            (m.verify_topk(&input, start, temp, top_p, vocab, kv)?, None)
+        };
+        if topk_rows.len() != input.len() {
+            return Err(format!(
+                "verify_topk returned {} rows for {} positions",
+                topk_rows.len(),
+                input.len()
+            ));
+        }
+        for (j, p) in topk_rows.iter().enumerate() {
+            if greedy {
+                let t = p.first().map_or(0, |e| e.0);
+                out.push(t);
+                if drafts.get(j) != Some(&t) {
+                    break;
+                }
+                continue;
             }
+            let Some(&x) = drafts.get(j) else {
+                out.push(draw(p, spec.rng.uniform()));
+                break;
+            };
+            let (t, ok) = verify_draft(p, &qs[j], x, &mut spec.rng);
             out.push(t);
-            if drafts.get(j) != Some(&t) {
+            if !ok {
                 break;
             }
-            continue;
         }
-        let p = dist(l, temp, top_p);
-        let Some(&x) = drafts.get(j) else {
-            let t = draw(&p, spec.rng.uniform());
+        let kept = ahead.filter(|(d, ..)| {
+            out.len() == drafts.len() + 1 && d.len() > 1 && d.first() == out.last()
+        });
+        spec.prefetched = kept.map(|(d, state, qs)| Prefetch {
+            len: all.len() + out.len(),
+            drafts: d[1..].to_vec(),
+            qs: qs.into_iter().skip(1).collect(),
+            state,
+        });
+        let st = match &mut spec.prefetched {
+            Some(p) => &mut p.state,
+            None => &mut spec.draft,
+        };
+        spec.drafter.observe_topk(st, &out, &topk_rows[..out.len()]);
+    } else {
+        let (logits, ahead) = if spec.drafter.overlaps() {
+            verify_overlapped(m, spec, all, &drafts, &input, kv, (temp, top_p, vocab))?
+        } else {
+            (m.forward_all(&input, start, kv)?, None)
+        };
+        if logits.is_empty() || logits.len() % input.len() != 0 {
+            return Err(format!(
+                "verify returned {} logits for {} positions",
+                logits.len(),
+                input.len()
+            ));
+        }
+        let width = logits.len() / input.len();
+        for (j, row) in logits.chunks_exact(width).enumerate() {
+            let l = &row[..valid(width)];
+            if greedy {
+                let t = m.sample(l, recent(all), temp, top_p, 0);
+                if let Some(k_lp) = top_logprobs {
+                    logprobs.push(super::logprob_info(l, t, k_lp));
+                }
+                out.push(t);
+                if drafts.get(j) != Some(&t) {
+                    break;
+                }
+                continue;
+            }
+            let p = dist(l, temp, top_p);
+            let Some(&x) = drafts.get(j) else {
+                let t = draw(&p, spec.rng.uniform());
+                if let Some(k_lp) = top_logprobs {
+                    logprobs.push(super::logprob_info(l, t, k_lp));
+                }
+                out.push(t);
+                break;
+            };
+            let (t, ok) = verify_draft(&p, &qs[j], x, &mut spec.rng);
             if let Some(k_lp) = top_logprobs {
                 logprobs.push(super::logprob_info(l, t, k_lp));
             }
             out.push(t);
-            break;
+            if !ok {
+                break;
+            }
+        }
+        let kept = ahead.filter(|(d, ..)| {
+            out.len() == drafts.len() + 1 && d.len() > 1 && d.first() == out.last()
+        });
+        spec.prefetched = kept.map(|(d, state, qs)| Prefetch {
+            len: all.len() + out.len(),
+            drafts: d[1..].to_vec(),
+            qs: qs.into_iter().skip(1).collect(),
+            state,
+        });
+        let st = match &mut spec.prefetched {
+            Some(p) => &mut p.state,
+            None => &mut spec.draft,
         };
-        let (t, ok) = verify_draft(&p, &qs[j], x, &mut spec.rng);
-        if let Some(k_lp) = top_logprobs {
-            logprobs.push(super::logprob_info(l, t, k_lp));
-        }
-        out.push(t);
-        if !ok {
-            break;
-        }
+        spec.drafter
+            .observe(st, &out, &logits[..out.len() * width], width);
     }
-    // The drafts proposed during the verify stand when it accepted every draft and its bonus
-    // token is the one they assumed.
-    let kept = ahead
-        .filter(|(d, ..)| out.len() == drafts.len() + 1 && d.len() > 1 && d.first() == out.last());
-    spec.prefetched = kept.map(|(d, state, qs)| Prefetch {
-        len: all.len() + out.len(),
-        drafts: d[1..].to_vec(),
-        qs: qs.into_iter().skip(1).collect(),
-        state,
-    });
-    let st = match &mut spec.prefetched {
-        Some(p) => &mut p.state,
-        None => &mut spec.draft,
-    };
-    spec.drafter
-        .observe(st, &out, &logits[..out.len() * width], width);
-    // The target keeps `last` and the accepted drafts; the final token has not run yet.
     m.truncate(kv, start + out.len())?;
     let taps = m.take_taps(kv);
     let w = taps.len() / input.len();
@@ -396,6 +479,44 @@ fn verify_overlapped(
     Ok((logits?, ahead))
 }
 
+#[allow(clippy::type_complexity)]
+fn verify_overlapped_topk(
+    m: &ExecutableModel,
+    spec: &mut SpecSeq,
+    all: &[u32],
+    drafts: &[u32],
+    input: &[u32],
+    kv: &mut Option<SeqState>,
+    (temp, top_p, vocab): (f32, f32, usize),
+) -> Result<(Vec<Vec<(u32, f32)>>, Option<Ahead>), String> {
+    let seed = spec.rng.next_u64();
+    let mut st = std::mem::replace(&mut spec.draft, Box::new(()));
+    let drafter = &*spec.drafter;
+    let toks = [all, drafts].concat();
+    let (rows, joined) = std::thread::scope(|sc| {
+        let h = sc.spawn(move || {
+            let _ = drafter.propose(&mut st, all, &[], 0, &mut |_| 0);
+            let ahead = drafter.fork_state(&st).and_then(|mut fork| {
+                let (mut rng, mut qs) = (Rng::new(seed), Vec::new());
+                let d = drafter
+                    .propose(&mut fork, &toks, &[], drafts.len() + 1, &mut |l| {
+                        pick(l, temp, top_p, vocab, &mut rng, &mut qs)
+                    })
+                    .ok()?;
+                Some((d, fork, qs))
+            });
+            (st, ahead)
+        });
+        (
+            m.verify_topk(input, all.len() - 1, temp, top_p, vocab, kv),
+            h.join(),
+        )
+    });
+    let (st, ahead) = joined.map_err(|_| "the overlapped drafter panicked".to_string())?;
+    spec.draft = st;
+    Ok((rows?, ahead))
+}
+
 /// Chooses a draft token from `l` the way the scheduler samples (`vocab`: the tokenizer's size, 0 =
 /// all ids); a sampled pick records its distribution `q` in `qs` for rejection sampling.
 fn pick(
@@ -415,7 +536,7 @@ fn pick(
                 l.len()
             }];
             if greedy {
-                return sample_logits(l, &[], temp, super::SAMPLE_TOP_K, top_p);
+                return sample_logits(l, &[], temp, super::SAMPLE_TOP_K, top_p, 0);
             }
             dist(l, temp, top_p)
         }
@@ -431,7 +552,7 @@ fn pick(
                 (true, false) => vec![(0, 1.0)],
                 (false, true) => {
                     return ids
-                        [sample_logits(&logits, &[], temp, super::SAMPLE_TOP_K, top_p) as usize]
+                        [sample_logits(&logits, &[], temp, super::SAMPLE_TOP_K, top_p, 0) as usize]
                 }
                 (false, false) => dist(&logits, temp, top_p)
                     .into_iter()
@@ -1181,7 +1302,7 @@ mod tests {
         while script.len() < 20 {
             let last = *script.last().unwrap();
             let (t, _) = m
-                .step_token_with_kv(&script, last, script.len(), 0.0, 1.0, None, &mut st)
+                .step_token_with_kv(&script, last, script.len(), 0.0, 1.0, 0, None, &mut st)
                 .unwrap();
             script.push(t);
         }
@@ -1284,7 +1405,7 @@ mod tests {
         while want.len() < prompt.len() + n {
             let last = *want.last().unwrap();
             let (t, _) = m
-                .step_token_with_kv(&want, last, want.len(), 0.0, 1.0, None, &mut st)
+                .step_token_with_kv(&want, last, want.len(), 0.0, 1.0, 0, None, &mut st)
                 .unwrap();
             want.push(t);
         }

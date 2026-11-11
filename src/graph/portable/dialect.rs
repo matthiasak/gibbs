@@ -47,6 +47,7 @@ typedef long i64;
 #define floorf(x) floor(x)
 #define ceilf(x) ceil(x)
 #define rintf(x) rint(x)
+#define roundf(x) round(x)
 #define fabsf(x) fabs(x)
 #define fmaxf(a, b) fmax(a, b)
 #define fminf(a, b) fmin(a, b)
@@ -61,6 +62,23 @@ void ATOMIC_ADD_F32(volatile __global float* p, float v) {
         old = atomic_cmpxchg(u, prev, as_uint(as_float(prev) + v));
     } while (old != prev);
 }
+DEVFN i32 gpk_dp4a(u32 a, u32 b, i32 c) {
+    i32 s = c;
+    s += (i32)(i8)(a & 0xffu) * (i32)(i8)(b & 0xffu);
+    s += (i32)(i8)((a >> 8) & 0xffu) * (i32)(i8)((b >> 8) & 0xffu);
+    s += (i32)(i8)((a >> 16) & 0xffu) * (i32)(i8)((b >> 16) & 0xffu);
+    s += (i32)(i8)(a >> 24) * (i32)(i8)(b >> 24);
+    return s;
+}
+#define WARP_SUM_64(acc, t, red) do { \
+    (red)[(t)] = (acc); \
+    BARRIER(); \
+    for (u32 _ws = 32u; _ws > 0u; _ws >>= 1) { \
+        if ((t) < _ws) (red)[(t)] += (red)[(t) + _ws]; \
+        BARRIER(); \
+    } \
+    if ((t) == 0u) (acc) = (red)[0]; \
+} while (0)
 "#;
 
 /// Shared by CUDA and HIP: both compile C++ with `__global__` entry points and `extern "C"` names.
@@ -95,10 +113,57 @@ __device__ __forceinline__ u32 gpk_ngrp(int i) { return i == 0 ? gridDim.x : i =
 #define ATOMIC_ADD_F32(p, v) atomicAdd((p), (v))
 "#;
 
+const CUDA_TAIL: &str = r#"
+DEVFN i32 gpk_dp4a(u32 a, u32 b, i32 c) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 610)
+    return __dp4a((int)a, (int)b, c);
+#else
+    i32 s = c;
+    s += (i32)(i8)(a & 0xffu) * (i32)(i8)(b & 0xffu);
+    s += (i32)(i8)((a >> 8) & 0xffu) * (i32)(i8)((b >> 8) & 0xffu);
+    s += (i32)(i8)((a >> 16) & 0xffu) * (i32)(i8)((b >> 16) & 0xffu);
+    s += (i32)(i8)(a >> 24) * (i32)(i8)(b >> 24);
+    return s;
+#endif
+}
+#define WARP_SUM_64(acc, t, red) do { \
+    (acc) += __shfl_down_sync(0xffffffffu, (acc), 16); \
+    (acc) += __shfl_down_sync(0xffffffffu, (acc), 8); \
+    (acc) += __shfl_down_sync(0xffffffffu, (acc), 4); \
+    (acc) += __shfl_down_sync(0xffffffffu, (acc), 2); \
+    (acc) += __shfl_down_sync(0xffffffffu, (acc), 1); \
+    if (((t) & 31u) == 0u) (red)[(t) >> 5] = (acc); \
+    BARRIER(); \
+    if ((t) == 0u) (acc) = (red)[0] + (red)[1]; \
+} while (0)
+"#;
+
+const HIP_TAIL: &str = r#"
+DEVFN i32 gpk_dp4a(u32 a, u32 b, i32 c) {
+    i32 s = c;
+    s += (i32)(i8)(a & 0xffu) * (i32)(i8)(b & 0xffu);
+    s += (i32)(i8)((a >> 8) & 0xffu) * (i32)(i8)((b >> 8) & 0xffu);
+    s += (i32)(i8)((a >> 16) & 0xffu) * (i32)(i8)((b >> 16) & 0xffu);
+    s += (i32)(i8)(a >> 24) * (i32)(i8)(b >> 24);
+    return s;
+}
+#define WARP_SUM_64(acc, t, red) do { \
+    (acc) += __shfl_down((acc), 16, 32); \
+    (acc) += __shfl_down((acc), 8, 32); \
+    (acc) += __shfl_down((acc), 4, 32); \
+    (acc) += __shfl_down((acc), 2, 32); \
+    (acc) += __shfl_down((acc), 1, 32); \
+    if (((t) & 31u) == 0u) (red)[(t) >> 5] = (acc); \
+    BARRIER(); \
+    if ((t) == 0u) (acc) = (red)[0] + (red)[1]; \
+} while (0)
+"#;
+
 /// The dialect prelude: macros and types every `.gpk` source assumes.
-pub fn prelude(d: Dialect) -> &'static str {
+pub fn prelude(d: Dialect) -> String {
     match d {
-        Dialect::OpenCl => OPENCL,
-        Dialect::Cuda | Dialect::Hip => CUDA_LIKE,
+        Dialect::OpenCl => OPENCL.to_string(),
+        Dialect::Cuda => format!("{CUDA_LIKE}{CUDA_TAIL}"),
+        Dialect::Hip => format!("{CUDA_LIKE}{HIP_TAIL}"),
     }
 }

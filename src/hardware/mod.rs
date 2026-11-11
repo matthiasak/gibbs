@@ -170,32 +170,86 @@ impl std::str::FromStr for PlacementMode {
     }
 }
 
+/// Whether `d` is usable on this host, probing only `d` (never unrelated runtimes).
+pub fn device_available(d: Device) -> bool {
+    match d {
+        Device::Cpu => true,
+        #[cfg(target_os = "macos")]
+        Device::Metal => metal::Device::system_default().is_some(),
+        #[cfg(not(target_os = "macos"))]
+        Device::Metal => false,
+        #[cfg(target_os = "macos")]
+        Device::Ane => match crate::graph::ane::probe() {
+            Ok(info) if info.fp16.is_ok() => true,
+            Ok(info) => {
+                log_ane_once(&format!("fp16 probe failed: {:?}", info.fp16));
+                false
+            }
+            Err(e) => {
+                log_ane_once(&e);
+                false
+            }
+        },
+        #[cfg(not(target_os = "macos"))]
+        Device::Ane => false,
+        Device::Cuda => crate::graph::cuda::is_available(),
+        Device::Rocm => crate::graph::rocm::is_available(),
+        Device::Xla => crate::graph::xla::is_available(),
+        Device::IntelXpu => crate::graph::intel_xpu::is_available(),
+    }
+}
+
+/// Devices needed to resolve `mode`: stops once `Auto`'s winning primary (+ ANE secondary) is
+/// found, and probes all backends only when a pinned device is missing (for the error report).
+pub fn devices_for(mode: PlacementMode) -> Vec<Device> {
+    match mode {
+        PlacementMode::Pin(Device::Cpu) => vec![Device::Cpu],
+        PlacementMode::Pin(Device::Ane) => {
+            if device_available(Device::Metal) && device_available(Device::Ane) {
+                vec![Device::Cpu, Device::Metal, Device::Ane]
+            } else {
+                available_devices()
+            }
+        }
+        PlacementMode::Pin(d) => {
+            if device_available(d) {
+                vec![Device::Cpu, d]
+            } else {
+                available_devices()
+            }
+        }
+        PlacementMode::Auto => {
+            if device_available(Device::Metal) {
+                let mut d = vec![Device::Cpu, Device::Metal];
+                if device_available(Device::Ane) {
+                    d.push(Device::Ane);
+                }
+                return d;
+            }
+            for cand in [Device::Cuda, Device::Rocm, Device::Xla, Device::IntelXpu] {
+                if device_available(cand) {
+                    return vec![Device::Cpu, cand];
+                }
+            }
+            vec![Device::Cpu]
+        }
+    }
+}
+
 /// Returns hardware devices available at runtime.
 pub fn available_devices() -> Vec<Device> {
     let mut devices = vec![Device::Cpu];
-    #[cfg(target_os = "macos")]
-    {
-        if metal::Device::system_default().is_some() {
-            devices.push(Device::Metal);
+    for d in [
+        Device::Metal,
+        Device::Ane,
+        Device::Cuda,
+        Device::Rocm,
+        Device::Xla,
+        Device::IntelXpu,
+    ] {
+        if device_available(d) {
+            devices.push(d);
         }
-        // The ANE counts only once its fp16 probe program compiled and matched the CPU.
-        match crate::graph::ane::probe() {
-            Ok(info) if info.fp16.is_ok() => devices.push(Device::Ane),
-            Ok(info) => log_ane_once(&format!("fp16 probe failed: {:?}", info.fp16)),
-            Err(e) => log_ane_once(&e),
-        }
-    }
-    if crate::graph::cuda::is_available() {
-        devices.push(Device::Cuda);
-    }
-    if crate::graph::rocm::is_available() {
-        devices.push(Device::Rocm);
-    }
-    if crate::graph::xla::is_available() {
-        devices.push(Device::Xla);
-    }
-    if crate::graph::intel_xpu::is_available() {
-        devices.push(Device::IntelXpu);
     }
     devices
 }

@@ -28,24 +28,27 @@
     ["roberta.{r:*}", "{r}"],
   ]},
   config: {
+    gguf_arch: "first(gguf['general.architecture'], '')",
     arch: "first(at(first(cfg.architectures, []), 0), 'BertModel')",
     distil: "arch == 'DistilBertForSequenceClassification'",
-    hidden: "first(cfg.hidden_size, cfg.dim)",
-    // RoBERTa-style positions: from pad_id + 1 (`runtime.position_ids`).
-    pad_positions: "contains(['RobertaForSequenceClassification', 'XLMRobertaForSequenceClassification', 'CamembertForSequenceClassification'], arch)",
+    hidden: "first(gguf.embedding_length, cfg.hidden_size, cfg.dim)",
+    // RoBERTa-style positions: from pad_id + 1 (`runtime.position_ids`), or 0 on converted GGUFs.
+    pad_positions: "gguf_arch == '' && contains(['RobertaForSequenceClassification', 'XLMRobertaForSequenceClassification', 'CamembertForSequenceClassification'], arch)",
+    pos_offset: "gguf_arch != '' ? 0 : pad_id + 1",
     // A fairseq SentencePiece vocabulary (`runtime.tokenizer`).
     fairseq_vocab: "arch == 'CamembertForSequenceClassification'",
-    labels: "shape(fmt('{head_out}.weight'))[0]",
-    layers: "first(cfg.num_hidden_layers, cfg.n_layers)",
-    heads: "first(cfg.num_attention_heads, cfg.n_heads)",
+    labels: "has(fmt('{head_out}.weight')) ? shape(fmt('{head_out}.weight'))[0] : 0",
+    layers: "first(gguf.block_count, cfg.num_hidden_layers, cfg.n_layers)",
+    heads: "first(gguf['attention.head_count'], cfg.num_attention_heads, cfg.n_heads)",
     kv_heads: "heads",
-    max_position_embeddings: "cfg.max_position_embeddings",
-    eps: "distil ? 1e-12 : first(cfg.layer_norm_eps, 1e-12)",
+    head_dim: "hidden // heads",
+    max_position_embeddings: "first(cfg.max_position_embeddings, shape('embeddings.position_embeddings.weight')[0])",
+    eps: "distil ? 1e-12 : first(gguf['attention.layer_norm_epsilon'], cfg.layer_norm_eps, 1e-12)",
     type_vocab: "has('embeddings.token_type_embeddings.weight') ? shape('embeddings.token_type_embeddings.weight')[0] : 0",
     pad_id: "first(cfg.pad_token_id, 1)",
-    // Classification head stems.
-    head_dense: "has('pre_classifier.weight') ? 'pre_classifier' : has('classifier.dense.weight') ? 'classifier.dense' : 'pooler.dense'",
-    head_out: "has('classifier.out_proj.weight') ? 'classifier.out_proj' : 'classifier'",
+    // Classification head stems (`head_dense == ''`: single-projection GGUF head).
+    head_dense: "has('pre_classifier.weight') ? 'pre_classifier' : has('classifier.dense.weight') ? 'classifier.dense' : has('cls.weight') ? 'cls' : gguf_arch != '' ? '' : 'pooler.dense'",
+    head_out: "has('cls.output.weight') ? 'cls.output' : has('classifier.out_proj.weight') ? 'classifier.out_proj' : 'classifier'",
     head_act: "has('pre_classifier.weight') ? 'Relu' : 'Tanh'",
   },
   checks: [
@@ -75,10 +78,13 @@
         {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "emb.add_position"},
         {block: [
           {let: {tt: "type_vocab > 1 ? 'token_types' : 'type_zero'"}},
-          {op: "Embedding", in: ["w:embeddings.token_type_embeddings.weight", "i:{tt}"], out: "te", name: "emb.type"},
+          {op: "Reshape", args: {shape: ["rows"]}, in: ["i:{tt}"], out: "tt_ids", name: "emb.type_flat"},
+          {op: "Embedding", in: ["w:embeddings.token_type_embeddings.weight", "tt_ids"], out: "te", name: "emb.type"},
           {op: "Binary", args: {kind: "Add"}, in: ["x", "te"], out: "x", name: "emb.add_type"},
         ], when: "type_vocab > 0"},
-        {op: "LayerNorm", args: {eps: "eps"}, in: ["x", "w:embeddings.LayerNorm.weight", "w:embeddings.LayerNorm.bias"], out: "x", name: "emb.ln"},
+        {use: "layer_norm", args: {w: "'embeddings.LayerNorm'"}, in: ["x"], out: "x", name: "emb.ln"},
+        {op: "Linear", in: ["x", "w:electra.embeddings_project.weight", "w?:electra.embeddings_project.bias"], out: "x",
+         name: "emb.proj", when: "has('electra.embeddings_project.weight')"},
         {repeat: "i", count: "layers", body: [
           {let: {p: "fmt('encoder.layer.{i}')"}},
           {use: "post_ln_encoder_layer", in: ["x"], out: "x", name: "l{i}", args: {
@@ -86,11 +92,14 @@
             wv: "fmt('{p}.attention.self.value')", wo: "fmt('{p}.attention.output.dense')",
             ln1: "fmt('{p}.attention.output.LayerNorm')", up: "fmt('{p}.intermediate.dense')",
             down: "fmt('{p}.output.dense')", ln2: "fmt('{p}.output.LayerNorm')"}},
+          {tap: "layer.{i}", in: "x"},
         ]},
         {block: [
           {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["x"], out: "c", name: "head.first"},
-          {op: "Linear", in: ["c", "w:{head_dense}.weight", "w?:{head_dense}.bias"], out: "c", name: "head.dense"},
-          {op: "Unary", args: {kind: "head_act"}, in: ["c"], out: "c", name: "head.act"},
+          {block: [
+            {op: "Linear", in: ["c", "w:{head_dense}.weight", "w?:{head_dense}.bias"], out: "c", name: "head.dense"},
+            {op: "Unary", args: {kind: "head_act"}, in: ["c"], out: "c", name: "head.act"},
+          ], when: "head_dense != ''"},
           {op: "Linear", in: ["c", "w:{head_out}.weight", "w?:{head_out}.bias"], out: "c", name: "head.out"},
           {op: "Reshape", args: {shape: ["shape('c')[1]"]}, in: ["c"], out: "logits", name: "head.flat"},
         ], when: "head == 'classify'"},

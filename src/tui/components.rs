@@ -598,7 +598,10 @@ impl TuiApp {
                 th.fg(Token::Gold),
             )));
         }
-        let (kv_hits, kv_misses) = self.scheduler.as_ref().map_or((0, 0), |s| s.radix.metrics());
+        let (kv_hits, kv_misses) = self
+            .scheduler
+            .as_ref()
+            .map_or((0, 0), |s| s.radix.metrics());
         let turns = self.chat_history.len() / 2;
         if turns > 0 || kv_hits > 0 {
             lines.push(Line::from(Span::styled(
@@ -853,6 +856,11 @@ impl TuiApp {
             }
         };
         lines.push(Line::from(Span::styled(trunc(&policy, iw), dim)));
+        if self.hope_policy.is_active() {
+            let saved = crate::graph::passes::hope::last_saved_pct(self.hope_policy);
+            let hope_line = format!("HOPE: {} ({saved:.0}% pruned)", self.hope_policy);
+            lines.push(Line::from(Span::styled(trunc(&hope_line, iw), dim)));
+        }
         let active_drafter = self
             .scheduler
             .as_ref()
@@ -878,8 +886,10 @@ impl TuiApp {
         );
         lines.push(Line::from(Span::styled(trunc(&draft_line, iw), dim)));
         let compact_line = format!(
-            "compact {} (85%→60% ctx) · Paged-Radix KV prefix reuse",
-            self.compact_config.mode.name()
+            "compact {} ({:.0}%→{:.0}% ctx) · Paged-Radix KV prefix reuse",
+            self.compact_config.mode.name(),
+            self.compact_config.trigger_ratio * 100.0,
+            self.compact_config.target_ratio * 100.0
         );
         lines.push(Line::from(Span::styled(trunc(&compact_line, iw), dim)));
         f.render_widget(Paragraph::new(lines), inner);

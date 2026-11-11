@@ -1104,4 +1104,83 @@ mod tests {
             .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
     }
+
+    /// `/v1/messages` (body `compact`, streamed and not) and `/v1/responses` (`x-gibbs-compact`
+    /// header) compact long histories and say so; `previous_response_id` chains onto a stored
+    /// response, and an unknown one is a 400.
+    #[tokio::test]
+    async fn messages_and_responses_compact_and_chain_previous_response() {
+        let dir = tempfile::tempdir().unwrap();
+        // A long tool log in the first turn: Tier 2 alone brings the prompt under the context.
+        let log: String = (0..250)
+            .map(|i| format!("agent build step {i}: ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut history = Vec::new();
+        for i in 0..6 {
+            let user = match i {
+                0 => format!("Here is the log:\n\n{log}"),
+                _ => format!("Turn {i}: explain the second law."),
+            };
+            let answer = format!("<think>agent reasoning {i}</think>Answer {i}: entropy grows.");
+            history.push(serde_json::json!({"role": "user", "content": user}));
+            history.push(serde_json::json!({"role": "assistant", "content": answer}));
+        }
+        history.push(serde_json::json!({"role": "user", "content": "And the third law?"}));
+        let app = create_router(model_state(dir.path()));
+        let post = |uri: &str, header: Option<&str>, body: serde_json::Value| {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(h) = header {
+                req = req.header("x-gibbs-compact", h);
+            }
+            app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap())
+        };
+        let json = |resp: axum::response::Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        // The `x-gibbs-compacted` header and the body (`Null` when streamed) of a 200.
+        let compacted = |resp: axum::response::Response, stream: bool| async move {
+            let (status, header) = (resp.status(), resp.headers().get("x-gibbs-compacted").cloned());
+            let v = if stream { serde_json::Value::Null } else { json(resp).await };
+            assert_eq!(status, StatusCode::OK, "{v}");
+            (header.expect("x-gibbs-compacted").to_str().unwrap().to_string(), v)
+        };
+
+        let mut messages = serde_json::json!({"system": "Be terse.", "messages": history,
+            "max_tokens": 4, "compact": {"mode": "light", "trigger": 0.3}});
+        let resp = post("/v1/messages", None, messages.clone()).await.unwrap();
+        let (header, v) = compacted(resp, false).await;
+        let report = v["usage"]["compaction"].clone();
+        assert_eq!(header, format!("{}->{}", report["before_tokens"], report["after_tokens"]));
+        assert!(report["tier1_chars_elided"].as_u64().unwrap() > 0, "{report}");
+        messages["stream"] = true.into();
+        let resp = post("/v1/messages", None, messages).await.unwrap();
+        assert_eq!(compacted(resp, true).await.0, header);
+
+        let input = serde_json::json!({"instructions": "Be terse.", "input": history,
+            "max_output_tokens": 4});
+        let resp = post("/v1/responses", Some("mode=light,trigger=0.3"), input).await.unwrap();
+        let (h, v) = compacted(resp, false).await;
+        assert_eq!(h, header);
+        assert_eq!(v["usage"]["compaction"]["after_tokens"], report["after_tokens"]);
+        let next = serde_json::json!({"previous_response_id": v["id"], "input": "And the zeroth?",
+            "max_output_tokens": 4});
+        let light = r#"{"mode": "light", "trigger": 0.3}"#;
+        let resp = post("/v1/responses", Some(light), next.clone()).await.unwrap();
+        let (_, v) = compacted(resp, false).await;
+        let chained = v["usage"]["input_tokens"].as_u64().unwrap();
+        // The stored conversation came back: the new input alone is a few dozen tokens.
+        assert!(chained > 200, "{chained}");
+        let mut unknown = next;
+        unknown["previous_response_id"] = "resp_missing".into();
+        let resp = post("/v1/responses", None, unknown).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(json(resp).await.to_string().contains("previous_response_id 'resp_missing' not found"));
+        let bad = post("/v1/responses", Some("mode"), serde_json::json!({"input": "x"})).await.unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    }
 }

@@ -487,11 +487,24 @@ impl Registry {
                             }
                         }
                     }
-                    "overrides" => match serde_json::from_value::<Override>(j) {
-                        Ok(ov) => raw_ovs.push((path.clone(), file.to_string(), ov)),
-                        Err(err) if is_user => tracing::warn!("arch: skipping {path}: {err}"),
-                        Err(err) => return Err(format!("{path}: {err}")),
-                    },
+                    "overrides" => {
+                        let items: Result<Vec<Override>, _> = match j {
+                            J::Array(_) => serde_json::from_value(j),
+                            J::Object(mut m) if m.contains_key("overrides") => {
+                                serde_json::from_value(m.remove("overrides").unwrap())
+                            }
+                            other => serde_json::from_value::<Override>(other).map(|o| vec![o]),
+                        };
+                        match items {
+                            Ok(list) => {
+                                for (idx, ov) in list.into_iter().enumerate() {
+                                    raw_ovs.push((path.clone(), format!("{file}#{idx:02}"), ov));
+                                }
+                            }
+                            Err(err) if is_user => tracing::warn!("arch: skipping {path}: {err}"),
+                            Err(err) => return Err(format!("{path}: {err}")),
+                        }
+                    }
                     "lib" => r.lib.push((file.trim_end_matches(".json5").to_string(), j)),
                     "names" => r
                         .names

@@ -76,7 +76,16 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
     let mut kv = Some(state);
 
     let first_next = exec_model
-        .step_prefill_chunk(&prompt_tokens, 0, true, &prompt_tokens, 0.0, 1.0, &mut kv)
+        .step_prefill_chunk(
+            &prompt_tokens,
+            0,
+            true,
+            &prompt_tokens,
+            0.0,
+            1.0,
+            0,
+            &mut kv,
+        )
         .expect("prefill succeeds");
     let next_tok = first_next.expect("prefill returned next token");
     let mut generated = prompt_tokens.clone();
@@ -92,6 +101,7 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
                 generated.len(),
                 0.0,
                 1.0,
+                0,
                 None,
                 &mut kv,
             )

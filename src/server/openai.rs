@@ -88,6 +88,9 @@ pub fn tool_choice(v: Option<&Value>) -> Result<ToolChoice, ApiError> {
     }
 }
 
+/// Most chat choices (`n`) one request may ask for.
+const MAX_CHOICES: usize = 16;
+
 fn one_choice(n: Option<usize>) -> Result<(), ApiError> {
     match n {
         None | Some(1) => Ok(()),
@@ -111,7 +114,9 @@ fn finish_reason(f: &Finish) -> &'static str {
 
 /// OpenAI usage; `cached` is the prompt prefix reused from the radix KV cache.
 fn usage(prompt: usize, completion: usize, cached: &crate::scheduler::FinishSignal) -> Value {
-    let cached = cached.cached_tokens.load(std::sync::atomic::Ordering::Relaxed);
+    let cached = cached
+        .cached_tokens
+        .load(std::sync::atomic::Ordering::Relaxed);
     json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion,
            "prompt_tokens_details": {"cached_tokens": cached}})
 }
@@ -138,44 +143,75 @@ async fn chat(
     headers: HeaderMap,
     req: ChatCompletionRequest,
 ) -> Result<Response, ApiError> {
-    one_choice(req.n)?;
+    let n = req.n.unwrap_or(1);
+    if !(1..=MAX_CHOICES).contains(&n) {
+        return Err(ApiError::bad(format!(
+            "n must be 1..={MAX_CHOICES}, got {n}"
+        )));
+    }
+    if n > 1 && req.stream.unwrap_or(false) {
+        return Err(ApiError::bad(
+            "stream with n > 1 is not supported; send stream: false",
+        ));
+    }
     if req.messages.is_empty() {
         return Err(ApiError::bad("messages is empty"));
     }
-    match &req.response_format {
-        None | Some(Value::Null) => {}
-        Some(f) if f["type"] == "text" => {}
-        Some(_) => return Err(ApiError::bad(
-            "response_format (JSON mode / json_schema) is not supported; only {\"type\": \"text\"}",
-        )),
-    }
+    let grammar = crate::scheduler::grammar::GrammarConstraint::from_response_format(
+        req.response_format.as_ref(),
+    )
+    .map_err(ApiError::bad)?;
     if let Some(o) = &req.compact {
         o.check_local().map_err(ApiError::bad)?;
     }
     let (messages, media) = prepare_messages(req.messages).await?;
+    let prompt = Prompt::Chat {
+        messages,
+        tools: req.tools.unwrap_or_default(),
+        tool_choice: tool_choice(req.tool_choice.as_ref())?,
+        template_kwargs: req.chat_template_kwargs.unwrap_or_default(),
+    };
+    let params = SamplingParams {
+        top_p: req.top_p,
+        ..SamplingParams::from_request(
+            req.temperature,
+            req.max_completion_tokens.or(req.max_tokens),
+        )
+    };
+    let stop = strings(req.stop.as_ref());
+    // Choices 1.. are sibling sequences of the same prompt (same compaction override, so the
+    // same compacted history); the scheduler decodes them together in one ragged batch.
+    // ponytail: siblings arriving together prefill independently; fork choice 0's prompt pages
+    // (`KvView::fork`) if long prompts with large n matter.
+    let mut siblings = Vec::with_capacity(n - 1);
+    for _ in 1..n {
+        siblings.push(GenRequest {
+            prompt: prompt.clone(),
+            media: media.clone(),
+            params,
+            stop: stop.clone(),
+            label: label("openai", &headers),
+            compact: req.compact.clone(),
+            grammar: grammar.clone(),
+        });
+    }
     let mut gen = core::start(
         &state,
         GenRequest {
-            prompt: Prompt::Chat {
-                messages,
-                tools: req.tools.unwrap_or_default(),
-                tool_choice: tool_choice(req.tool_choice.as_ref())?,
-                template_kwargs: req.chat_template_kwargs.unwrap_or_default(),
-            },
+            prompt,
             media,
-            params: SamplingParams {
-                top_p: req.top_p,
-                ..SamplingParams::from_request(
-                    req.temperature,
-                    req.max_completion_tokens.or(req.max_tokens),
-                )
-            },
-            stop: strings(req.stop.as_ref()),
+            params,
+            stop,
             label: label("openai", &headers),
             compact: req.compact,
+            grammar,
         },
     )
     .await?;
+    let mut sibling_gens = Vec::with_capacity(siblings.len());
+    for r in siblings {
+        sibling_gens.push(core::start(&state, r).await?);
+    }
     let compaction = gen.compaction.take();
     let model = req.model.unwrap_or_else(|| state.scheduler.model_id());
     let id = format!("chatcmpl-{}", gen.id);
@@ -194,24 +230,31 @@ async fn chat(
             cached,
         };
         let mut resp = stream_response(gen, wire, Framing::SseDone);
-        resp.headers_mut().extend(compaction.as_ref().map(|c| c.header()));
+        resp.headers_mut()
+            .extend(compaction.as_ref().map(|c| c.header()));
         return Ok(resp);
     }
-    let out = collect(gen).await?;
-    let mut message = json!({"role": "assistant", "content": out.text});
-    if !out.calls.is_empty() {
-        if out.text.is_empty() {
-            message["content"] = Value::Null;
+    let mut choices = Vec::with_capacity(n);
+    let mut completion_tokens = 0;
+    for (index, g) in std::iter::once(gen).chain(sibling_gens).enumerate() {
+        let out = collect(g).await?;
+        let mut message = json!({"role": "assistant", "content": out.text});
+        if !out.calls.is_empty() {
+            if out.text.is_empty() {
+                message["content"] = Value::Null;
+            }
+            message["tool_calls"] = out.calls.iter().map(call_json).collect();
         }
-        message["tool_calls"] = out.calls.iter().map(call_json).collect();
+        completion_tokens += out.completion_tokens;
+        choices.push(json!({"index": index, "message": message, "finish_reason": finish_reason(&out.finish)}));
     }
     let mut body = json!({
         "id": id,
         "object": "chat.completion",
         "created": unix_now(),
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(&out.finish)}],
-        "usage": usage(prompt_tokens, out.completion_tokens, &cached),
+        "choices": choices,
+        "usage": usage(prompt_tokens, completion_tokens, &cached),
     });
     if let Some(c) = &compaction {
         body["usage"]["compaction"] = json!(c.report);
@@ -220,7 +263,8 @@ async fn chat(
         }
     }
     let mut resp = Json(body).into_response();
-    resp.headers_mut().extend(compaction.as_ref().map(|c| c.header()));
+    resp.headers_mut()
+        .extend(compaction.as_ref().map(|c| c.header()));
     Ok(resp)
 }
 
@@ -380,6 +424,7 @@ async fn completion(
             stop: strings(req.stop.as_ref()),
             label: label("openai", &headers),
             compact: None,
+            grammar: None,
         },
     )
     .await?;

@@ -2,7 +2,7 @@
 # Short paired A/B, one model per process, each well under a minute.
 #   scripts/quick_abba.sh ab LABEL "BASE_CMD" "CAND_CMD" ROW...
 #       Per bench/loop.json row, one scheduled job runs base, cand, cand, base `--bench` legs at 64 decode
-#       tokens (warm-up + 2 timed runs). CMDs are prefixes: "target/ab-base/gibbs",
+#       tokens (warm-up + 5 timed runs). CMDs are prefixes: "target/ab-base/gibbs",
 #       "env GIBBS_DISABLE=pipeline target/release/gibbs". Output: target/quick/LABEL/summary.txt.
 #   scripts/quick_abba.sh parity ROW...
 #       `target/release/gibbs --bench-parity` on each row alone (marked reference).
@@ -21,9 +21,9 @@ d = dict(s.get("defaults") or {})
 if ref: m["reference"] = True
 else:
     if src == "bench/loop.json":
-        d.update(decode_tokens=64, runs=2)
+        d.update(decode_tokens=64, runs=5)
     else:
-        d.setdefault("runs", 2)
+        d.setdefault("runs", 5)
 json.dump({"defaults": d, "models": [m]}, open(out, "w"))
 # ABBA_PLACEMENT: candidate legs load under this placement; the base binary predates the field.
 if os.environ.get("ABBA_PLACEMENT"):

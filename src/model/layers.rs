@@ -604,12 +604,34 @@ pub fn quantize_k_rows(
         cols % 256 == 0 && weights.len() % cols == 0,
         "K-quant rows need cols % 256 == 0, got {cols}"
     );
-    let mut out = vec![0u8; weights.len() / 256 * block_bytes];
-    for (x, y) in weights
-        .chunks_exact(256)
-        .zip(out.chunks_exact_mut(block_bytes))
-    {
-        row(x, y);
+    let n_blocks = weights.len() / 256;
+    let mut out = vec![0u8; n_blocks * block_bytes];
+    if n_blocks >= 64 {
+        let out_addr = out.as_mut_ptr() as usize;
+        let chunk = n_blocks.div_ceil(16).max(16);
+        let tasks = n_blocks.div_ceil(chunk);
+        crate::model::par::par_for(tasks, &|t| {
+            let b0 = t * chunk;
+            let b1 = (b0 + chunk).min(n_blocks);
+            for b in b0..b1 {
+                let x = &weights[b * 256..(b + 1) * 256];
+                // SAFETY: each task writes disjoint `[b * block_bytes .. (b + 1) * block_bytes]`.
+                let y = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (out_addr as *mut u8).add(b * block_bytes),
+                        block_bytes,
+                    )
+                };
+                row(x, y);
+            }
+        });
+    } else {
+        for (x, y) in weights
+            .chunks_exact(256)
+            .zip(out.chunks_exact_mut(block_bytes))
+        {
+            row(x, y);
+        }
     }
     out
 }
@@ -968,11 +990,9 @@ pub fn dequantize_mxfp4_block(b: &[u8], y: &mut [f32]) {
     }
 }
 
-
 /// NVFP4 (E2M1) lookup table representing 16 values for nibbles 0x0..=0xF.
 pub const NVFP4_E2M1_LUT: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 /// ggml NVFP4 (36 B / 64; `block_nvfp4`, `dequantize_row_nvfp4`): four UE4M3 scale bytes, one per
 /// 16-element sub-block, then 32 nibble bytes; within a sub-block's 8 bytes the low nibbles are
@@ -993,7 +1013,6 @@ pub fn dequantize_nvfp4_block(b: &[u8], y: &mut [f32]) {
         }
     }
 }
-
 
 /// The UE4M3 scale byte's value as [`dequantize_nvfp4_block`] reads it (`0` and `0x7F`: 0).
 fn nvfp4_scale(x: u32) -> f32 {
@@ -1020,14 +1039,18 @@ pub fn quantize_f32_to_gguf_nvfp4(weights: &[f32]) -> Vec<u8> {
             if amax == 0.0 {
                 continue;
             }
-            let i = scales.partition_point(|&d| d * 12.0 < amax).min(scales.len() - 1);
+            let i = scales
+                .partition_point(|&d| d * 12.0 < amax)
+                .min(scales.len() - 1);
             head[s] = i as u8 + 1;
             let id = 1.0 / scales[i];
             for (j, &w) in sub.iter().enumerate() {
                 let x = w * id;
                 let k = (0..16)
                     .min_by(|&a, &b| {
-                        (KVALUES_FP4[a] as f32 - x).abs().total_cmp(&(KVALUES_FP4[b] as f32 - x).abs())
+                        (KVALUES_FP4[a] as f32 - x)
+                            .abs()
+                            .total_cmp(&(KVALUES_FP4[b] as f32 - x).abs())
                     })
                     .unwrap() as u8;
                 // Values 0..8 in the low nibbles of bytes 4+8s.., 8..16 in the high nibbles.
@@ -1115,7 +1138,9 @@ mod tests {
     /// sub-block's scale, keeps zeros and the sign, and never clips the sub-block maximum.
     #[test]
     fn gguf_nvfp4_encode_round_trips() {
-        let w: Vec<f32> = (0..256).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013 * (1 + i / 64) as f32).collect();
+        let w: Vec<f32> = (0..256)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013 * (1 + i / 64) as f32)
+            .collect();
         let raw = quantize_f32_to_gguf_nvfp4(&w);
         assert_eq!(raw.len(), 4 * 36);
         let mut y = vec![0.0f32; 256];
@@ -1128,7 +1153,10 @@ mod tests {
             let tol = amax / 12.0 * 1.125 * 2.0 + 1e-6;
             for (x, z) in a.iter().zip(b) {
                 assert!((x - z).abs() <= tol, "sub {sub}: {x} -> {z} (tol {tol})");
-                assert!(*x == 0.0 || z.signum() == x.signum() || *z == 0.0, "sub {sub}: sign of {x} -> {z}");
+                assert!(
+                    *x == 0.0 || z.signum() == x.signum() || *z == 0.0,
+                    "sub {sub}: sign of {x} -> {z}"
+                );
             }
         }
     }
@@ -1153,7 +1181,11 @@ mod tests {
         }
         assert_eq!(&y[..64], &w[..64], "on-grid values");
         assert!(raw_data[36..40].iter().all(|&c| c == 0) && y[64..128].iter().all(|&v| v == 0.0));
-        assert!(raw_data[72..76].iter().all(|&c| c == 0x7E), "{:x?}", &raw_data[72..76]);
+        assert!(
+            raw_data[72..76].iter().all(|&c| c == 0x7E),
+            "{:x?}",
+            &raw_data[72..76]
+        );
         assert!(y[128..].iter().all(|v| v.is_finite() && *v != 0.0));
     }
     use crate::hardware::QuantFormat;

@@ -126,6 +126,27 @@ pub fn sgemm_32x32(a: &[f32], b: &[f32], c: &mut [f32], k: usize, ldc: usize, ac
     }
 }
 
+/// Packs up to 32 rows (`rows <= 32`) of row-major `src[row * stride + p0 .. + kc]` into
+/// `dst[p * 32 + row]` (`32 * kc` floats, zero-padded past `rows`) for [`sgemm_32x32`].
+#[inline]
+pub fn pack_panel_32(
+    src: &[f32],
+    rows: usize,
+    stride: usize,
+    p0: usize,
+    kc: usize,
+    dst: &mut [f32],
+) {
+    debug_assert!(rows <= 32 && dst.len() >= 32 * kc);
+    dst[..32 * kc].fill(0.0);
+    for r in 0..rows {
+        let row = &src[r * stride + p0..r * stride + p0 + kc];
+        for (p, &v) in row.iter().enumerate() {
+            dst[p * 32 + r] = v;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

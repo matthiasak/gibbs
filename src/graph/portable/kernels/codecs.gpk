@@ -369,3 +369,118 @@ DEVFN void dec_MLX_AFFINE4_G128(GLOBAL const u8* blk, u32 sub, float* out8) { cd
 DEVFN void dec_INT4_G32(GLOBAL const u8* blk, u32 sub, float* out8) { cd_int4(blk, 16u, sub, out8); }
 DEVFN void dec_INT4_G64(GLOBAL const u8* blk, u32 sub, float* out8) { cd_int4(blk, 32u, sub, out8); }
 DEVFN void dec_INT4_G128(GLOBAL const u8* blk, u32 sub, float* out8) { cd_int4(blk, 64u, sub, out8); }
+
+// ---- DP4A int8-activation GEMV kernels for GGUF_Q8_0 & GGUF_Q4_0 ----
+// Each 32-element activation block packs into 10 u32 words:
+//   word 0 = AS_UINT(d), word 1 = AS_UINT(sum_q * d), words 2..10 = 8 x i8x4 packed words.
+KERNEL quantize_x_q8(GLOBAL const float* x, u32 xo, GLOBAL u32* qx, u32 qxo, u32 total_blocks) {
+    u32 b = GID(0);
+    if (b >= total_blocks) return;
+    GLOBAL const float* src = x + xo + b * 32u;
+    float amax = 0.0f;
+    for (u32 i = 0; i < 32u; i++) {
+        float v = fabsf(src[i]);
+        if (v > amax) amax = v;
+    }
+    float d = amax / 127.0f;
+    float id = amax > 0.0f ? (127.0f / amax) : 0.0f;
+    i32 qsum = 0;
+    GLOBAL u32* dst = qx + qxo + b * 10u;
+    for (u32 w = 0; w < 8u; w++) {
+        u32 packed = 0u;
+        for (u32 j = 0; j < 4u; j++) {
+            float scaled = roundf(src[w * 4u + j] * id);
+            i32 qi = scaled < -127.0f ? -127 : (scaled > 127.0f ? 127 : (i32)scaled);
+            qsum += qi;
+            packed |= ((u32)(u8)(i8)qi) << (j * 8u);
+        }
+        dst[2u + w] = packed;
+    }
+    dst[0] = AS_UINT(d);
+    dst[1] = AS_UINT(d * (float)qsum);
+}
+
+KERNEL gemv_dp4a_GGUF_Q8_0(GLOBAL const u32* qx, u32 qxo, GLOBAL const u8* w, u64 row_bytes,
+                           GLOBAL const float* bias, u32 bo, u32 has_bias, GLOBAL float* y, u32 yo,
+                           u32 rows, u32 n_blocks, u32 out_f, u32 s1, u32 s2, u32 s3) {
+    LOCAL float red[8 * 64];
+    u32 j = GRP(0), t = LID(0);
+    float acc[8];
+    for (u32 r = 0; r < 8u; r++) acc[r] = 0.0f;
+    GLOBAL const u8* wr = w + (u64)j * row_bytes;
+    for (u32 b = t; b < n_blocks; b += 64u) {
+        GLOBAL const u8* blk = wr + (u64)b * 34u;
+        float wd = ld_f16(blk);
+        u32 wq[8];
+        for (u32 k = 0; k < 8u; k++) wq[k] = ld_u32(blk + 2u + k * 4u);
+        for (u32 r = 0; r < rows; r++) {
+            GLOBAL const u32* xb = qx + qxo + (r * n_blocks + b) * 10u;
+            float xd = AS_FLOAT(xb[0]);
+            i32 sumi = 0;
+            for (u32 k = 0; k < 8u; k++) sumi = gpk_dp4a(wq[k], xb[2u + k], sumi);
+            acc[r] += (wd * xd) * (float)sumi;
+        }
+    }
+    if (rows == 1u) {
+        float a0 = acc[0];
+        WARP_SUM_64(a0, t, red);
+        if (t == 0u) y[yo + j] = a0 + (has_bias ? bias[bo + j] : 0.0f);
+        return;
+    }
+    for (u32 r = 0; r < 8u; r++) red[r * 64u + t] = acc[r];
+    BARRIER();
+    for (u32 s = 32u; s > 0u; s >>= 1) {
+        if (t < s)
+            for (u32 r = 0; r < rows; r++) red[r * 64u + t] += red[r * 64u + t + s];
+        BARRIER();
+    }
+    if (t < rows) {
+        float bv = has_bias ? bias[bo + j] : 0.0f;
+        y[yo + out_index(t, j, out_f, rows, s1, s2, s3)] = red[t * 64u] + bv;
+    }
+}
+
+KERNEL gemv_dp4a_GGUF_Q4_0(GLOBAL const u32* qx, u32 qxo, GLOBAL const u8* w, u64 row_bytes,
+                           GLOBAL const float* bias, u32 bo, u32 has_bias, GLOBAL float* y, u32 yo,
+                           u32 rows, u32 n_blocks, u32 out_f, u32 s1, u32 s2, u32 s3) {
+    LOCAL float red[8 * 64];
+    u32 j = GRP(0), t = LID(0);
+    float acc[8];
+    for (u32 r = 0; r < 8u; r++) acc[r] = 0.0f;
+    GLOBAL const u8* wr = w + (u64)j * row_bytes;
+    for (u32 b = t; b < n_blocks; b += 64u) {
+        GLOBAL const u8* blk = wr + (u64)b * 18u;
+        float wd = ld_f16(blk);
+        u32 wq[8];
+        for (u32 k = 0; k < 4u; k++) {
+            u32 raw = ld_u32(blk + 2u + k * 4u);
+            wq[k] = raw & 0x0f0f0f0fu;
+            wq[4u + k] = (raw >> 4) & 0x0f0f0f0fu;
+        }
+        for (u32 r = 0; r < rows; r++) {
+            GLOBAL const u32* xb = qx + qxo + (r * n_blocks + b) * 10u;
+            float xd = AS_FLOAT(xb[0]);
+            float xsum = AS_FLOAT(xb[1]);
+            i32 sumi = 0;
+            for (u32 k = 0; k < 8u; k++) sumi = gpk_dp4a(wq[k], xb[2u + k], sumi);
+            acc[r] += wd * (xd * (float)sumi - 8.0f * xsum);
+        }
+    }
+    if (rows == 1u) {
+        float a0 = acc[0];
+        WARP_SUM_64(a0, t, red);
+        if (t == 0u) y[yo + j] = a0 + (has_bias ? bias[bo + j] : 0.0f);
+        return;
+    }
+    for (u32 r = 0; r < 8u; r++) red[r * 64u + t] = acc[r];
+    BARRIER();
+    for (u32 s = 32u; s > 0u; s >>= 1) {
+        if (t < s)
+            for (u32 r = 0; r < rows; r++) red[r * 64u + t] += red[r * 64u + t + s];
+        BARRIER();
+    }
+    if (t < rows) {
+        float bv = has_bias ? bias[bo + j] : 0.0f;
+        y[yo + out_index(t, j, out_f, rows, s1, s2, s3)] = red[t * 64u] + bv;
+    }
+}

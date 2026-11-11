@@ -1,3 +1,4 @@
+pub mod grammar;
 pub mod spec;
 
 use crate::hardware::Device;
@@ -41,6 +42,14 @@ fn recent(tokens: &[u32]) -> &[u32] {
 
 const NO_STATE: &str = "sequence has no model state (it was not prepared by this model)";
 
+/// The sampling seed of sequence `id`: sequences of equal history (`n > 1` choices) draw apart.
+fn seed_of(id: u64) -> u64 {
+    id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Most sequences one ragged decode pass batches ([`ExecutableModel::step_batch`]).
+const MAX_RAGGED: usize = 16;
+
 impl ExecutableModel {
     pub fn new(lm: Arc<dyn NativeLm>) -> Self {
         Self(lm)
@@ -68,7 +77,8 @@ impl ExecutableModel {
     pub fn embed_row(&self, id: u32, out: &mut [f32]) -> bool {
         self.0.embed_row(id, out)
     }
-    /// Decodes `last_token` against the sequence's state and samples the next token.
+    /// Decodes `last_token` against the sequence's state and samples the next token (`seed`
+    /// varies the draw per sequence, see [`sample_logits`]).
     /// `logprobs: Some(k)` also reports the chosen token's probability, the top `k` candidates
     /// and the entropy.
     #[allow(clippy::too_many_arguments)]
@@ -79,12 +89,13 @@ impl ExecutableModel {
         pos: usize,
         temp: f32,
         top_p: f32,
+        seed: u64,
         logprobs: Option<usize>,
         state: &mut Option<SeqState>,
     ) -> Result<(u32, Option<TokenLogprobInfo>), String> {
         let state = state.as_mut().ok_or(NO_STATE)?;
         let logits = self.0.forward(&[last_token], pos - 1, state)?;
-        let chosen = self.sample(&logits, recent(all_tokens), temp, top_p);
+        let chosen = self.sample(&logits, recent(all_tokens), temp, top_p, seed);
         Ok((chosen, logprobs.map(|k| logprob_info(&logits, chosen, k))))
     }
 
@@ -141,13 +152,15 @@ impl ExecutableModel {
         all_prompt_tokens: &[u32],
         temp: f32,
         top_p: f32,
+        seed: u64,
         state: &mut Option<SeqState>,
     ) -> Result<Option<u32>, String> {
         if chunk_tokens.is_empty() {
             return Ok(None);
         }
         let logits = self.prefill_logits(chunk_tokens, start_pos, state)?;
-        Ok(is_last_chunk.then(|| self.sample(&logits, recent(all_prompt_tokens), temp, top_p)))
+        Ok(is_last_chunk
+            .then(|| self.sample(&logits, recent(all_prompt_tokens), temp, top_p, seed)))
     }
 
     /// Logits at the last position of `chunk_tokens` (non-empty), advancing `state`.
@@ -170,15 +183,83 @@ impl ExecutableModel {
         self.prefill_logits(&ids, 0, &mut st)
     }
 
-    /// Top-[`SAMPLE_TOP_K`] / top-p sampling without repetition penalty; `temp <= 0` is greedy argmax.
-    fn sample(&self, logits: &[f32], recent: &[u32], temp: f32, top_p: f32) -> u32 {
+    /// Top-[`SAMPLE_TOP_K`] / top-p sampling without repetition penalty; `temp <= 0` is greedy
+    /// argmax; `seed` varies the draw between sequences of equal history.
+    fn sample(&self, logits: &[f32], recent: &[u32], temp: f32, top_p: f32, seed: u64) -> u32 {
         let vocab = self.0.tokenizer().vocab_size();
         let valid = if vocab > 0 {
             logits.len().min(vocab)
         } else {
             logits.len()
         };
-        sample_logits(&logits[..valid], recent, temp, SAMPLE_TOP_K, top_p)
+        sample_logits(&logits[..valid], recent, temp, SAMPLE_TOP_K, top_p, seed)
+    }
+
+    /// One sampled decode step of several sequences ([`NativeLm::step_batch`]): `items[b]` is
+    /// `(history, temperature, top_p, seed, state)`, the history's last token at `len - 1`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn step_batch(
+        &self,
+        items: &mut [(&[u32], f32, f32, u64, &mut Option<SeqState>)],
+    ) -> Result<Vec<u32>, String> {
+        let knobs: Vec<(&[u32], f32, f32, u64)> = items
+            .iter()
+            .map(|&(all, temp, top_p, seed, _)| (recent(all), temp, top_p, seed))
+            .collect();
+        let mut batch = items
+            .iter_mut()
+            .map(|(all, .., st)| {
+                let last = all
+                    .last()
+                    .copied()
+                    .ok_or("an empty sequence cannot decode")?;
+                Ok((last, all.len() - 1, st.as_mut().ok_or(NO_STATE)?))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let logits = self.0.step_batch(&mut batch)?;
+        let width = logits.len() / knobs.len().max(1);
+        let picks: Vec<AtomicU32> = knobs.iter().map(|_| AtomicU32::new(0)).collect();
+        // Rows sample independently (a top-k scan of the vocabulary each): one pool task per row.
+        crate::model::par::par_for(knobs.len(), &|b| {
+            let (recent, temp, top_p, seed) = knobs[b];
+            let l = &logits[b * width..(b + 1) * width];
+            picks[b].store(self.sample(l, recent, temp, top_p, seed), Ordering::Relaxed);
+        });
+        Ok(picks.into_iter().map(AtomicU32::into_inner).collect())
+    }
+
+    /// Samples the token at position `pos` from `logits` under `g`, then jump-forwards over the
+    /// grammar's forced run: returns the sampled token plus forced tokens, all but the last of
+    /// them ingested into `state` in one pass (the last is the next step's input, as always).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn grammar_pick(
+        &self,
+        mut logits: Vec<f32>,
+        history: &[u32],
+        pos: usize,
+        temp: f32,
+        top_p: f32,
+        seed: u64,
+        g: &mut grammar::GrammarConstraint,
+        state: &mut Option<SeqState>,
+    ) -> Result<Vec<u32>, String> {
+        let tok = self.0.tokenizer();
+        g.mask_logits(&mut logits, tok);
+        let t = self.sample(&logits, recent(history), temp, top_p, seed);
+        g.advance_token(t, tok);
+        let mut out = vec![t];
+        if tok.ends_generation(t) {
+            return Ok(out);
+        }
+        let forced = g.jump_forward(tok);
+        if let Some((_, feed)) = forced.split_last() {
+            let mut ingest = vec![t];
+            ingest.extend_from_slice(feed);
+            self.0
+                .forward(&ingest, pos, state.as_mut().ok_or(NO_STATE)?)?;
+            out.extend(forced);
+        }
+        Ok(out)
     }
 
     /// One-shot generation through a private [`ContinuousBatchScheduler`]: (text, decode-step
@@ -546,6 +627,8 @@ pub struct Sequence {
     /// EOS or a clipped speculative batch; `output_tokens.len() - 1` when the final token was just
     /// sampled).
     pub committed_out: usize,
+    /// JSON grammar every sampled token must keep valid (`response_format` / `format`).
+    pub grammar: Option<grammar::GrammarConstraint>,
 }
 
 impl Sequence {
@@ -567,6 +650,7 @@ impl Sequence {
             spec: None,
             evicted: 0,
             committed_out: 0,
+            grammar: None,
         }
     }
 
@@ -997,16 +1081,18 @@ impl ContinuousBatchScheduler {
         ),
         String,
     > {
-        self.submit_cancellable(params, media, None, encode)
+        self.submit_cancellable(params, media, None, None, encode)
     }
 
     /// [`Self::submit_with_media`]; `cancel` (set when the client goes away) stops a model that
-    /// decodes inside `prepare` (seq2seq beam search).
+    /// decodes inside `prepare` (seq2seq beam search); `grammar` constrains every sampled token
+    /// (JSON mode / schema, with jump-forward over forced runs).
     pub fn submit_cancellable(
         &self,
         mut params: SamplingParams,
         media: &[MediaInput],
         cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+        grammar: Option<grammar::GrammarConstraint>,
         encode: impl FnOnce(&Tokenizer) -> Vec<u32>,
     ) -> Result<
         (
@@ -1042,6 +1128,7 @@ impl ContinuousBatchScheduler {
         let (tx, rx) = unbounded_channel();
         let mut seq = Sequence::new(id, ids);
         seq.params = params;
+        seq.grammar = grammar;
         seq.token_sender = Some(tx);
         seq.state = SequenceState::Waiting;
         seq.kv_cache = kv_cache;
@@ -1245,18 +1332,39 @@ impl ContinuousBatchScheduler {
             waiting.extend(vec);
         }
         let pool = model.as_ref().and_then(ExecutableModel::kv_pool);
-        // A restored prefix has no tap rows.
-        let reuse = drafter.as_ref().is_none_or(|d| d.tap_layers().is_empty());
         while let Some(mut seq) = waiting.pop_front() {
             let max_reusable = seq.prompt_tokens.len().saturating_sub(1);
             if let (Some(m), true) = (&model, seq.key.is_empty()) {
                 seq.key = m.radix_key(&seq.kv_cache, &seq.prompt_tokens);
             }
-            if let (Some(m), true, 0, None) = (&model, reuse, seq.prefilled_tokens, &seq.prefix) {
+            if let (Some(m), 0, None) = (&model, seq.prefilled_tokens, &seq.prefix) {
                 if max_reusable > 0 {
                     let hit = self.radix.match_prefix(&seq.key[..max_reusable]);
                     if hit.len > 0 {
+                        // Ensure tap layers are configured before `kv_restore` checks `Boundary.last_taps`.
+                        if seq.spec.is_none() {
+                            if let Some(d) = drafter.as_ref().filter(|d| !d.tap_layers().is_empty())
+                            {
+                                let nanos = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |t| t.as_nanos() as u64);
+                                let seed = nanos ^ seq.id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                                if let Ok(s) = SpecSeq::start(m, d.clone(), &mut seq.kv_cache, seed)
+                                {
+                                    let model_id = self.model_id.read().clone();
+                                    self.k_tuner.lock().bind(&model_id, &d.label());
+                                    seq.spec = Some(s);
+                                }
+                            }
+                        }
                         if let Some(n) = m.kv_restore(&mut seq.kv_cache, &hit) {
+                            if let Some(sp) = seq
+                                .spec
+                                .as_mut()
+                                .filter(|sp| !sp.drafter().tap_layers().is_empty())
+                            {
+                                sp.skip_prefix(n.saturating_sub(1));
+                            }
                             seq.prefilled_tokens = n;
                             seq.finish.cached_tokens.store(n, Ordering::Relaxed);
                             seq.prefix = Some(hit);
@@ -1319,6 +1427,55 @@ impl ContinuousBatchScheduler {
         let (mut prefill_time, mut prefill_tokens) = (Duration::ZERO, 0);
         let (mut decode_time, mut decoded, mut decode_emitted) = (Duration::ZERO, 0, 0);
 
+        // Plain decoding sequences (no drafter, no logprobs, no eviction due) share one ragged
+        // forward that reads the weights once ([`NativeLm::step_batch`]); the loop below emits.
+        let mut batched: std::collections::HashMap<u64, Result<u32, String>> = Default::default();
+        if let Some(m) = &model {
+            let mut group: Vec<(u64, Vec<u32>, f32, f32, &mut Option<SeqState>)> = active
+                .iter_mut()
+                .filter(|s| {
+                    s.state == SequenceState::Decoding
+                        && s.spec.is_none()
+                        && s.grammar.is_none()
+                        && s.params.top_logprobs.is_none()
+                        && !s.token_sender.as_ref().is_some_and(|tx| tx.is_closed())
+                        && s.total_tokens() < context_len.saturating_add(s.evicted)
+                        && s.total_tokens() < pos_limit
+                })
+                .map(|s| {
+                    let mut all = s.prompt_tokens.clone();
+                    all.extend_from_slice(&s.output_tokens);
+                    let temp = s.params.temperature.unwrap_or(DEFAULT_TEMPERATURE);
+                    let top_p = s.params.top_p.unwrap_or(DEFAULT_TOP_P);
+                    (s.id, all, temp, top_p, &mut s.kv_cache)
+                })
+                .collect();
+            let room = pool
+                .as_ref()
+                .is_none_or(|p| p.ensure_free(group.len(), false).is_ok());
+            if group.len() >= 2 && room {
+                // Power-of-two batches (largest first, at most `MAX_RAGGED`): a few instance shapes
+                // stay compiled instead of one per batch size; a leftover single sequence streams.
+                let mut rest = &mut group[..];
+                while rest.len() >= 2 {
+                    let k = (1usize << rest.len().ilog2()).min(MAX_RAGGED);
+                    let (chunk, tail) = rest.split_at_mut(k);
+                    rest = tail;
+                    let started = Instant::now();
+                    let mut items: Vec<_> = chunk
+                        .iter_mut()
+                        .map(|(id, all, t, p, st)| {
+                            (all.as_slice(), *t, *p, seed_of(*id), &mut **st)
+                        })
+                        .collect();
+                    let res = m.step_batch(&mut items);
+                    decode_time += started.elapsed();
+                    for (b, (id, ..)) in chunk.iter().enumerate() {
+                        batched.insert(*id, res.as_ref().map(|t| t[b]).map_err(Clone::clone));
+                    }
+                }
+            }
+        }
         for seq in active.iter_mut() {
             if seq.state == SequenceState::Finished {
                 continue;
@@ -1352,7 +1509,7 @@ impl ContinuousBatchScheduler {
                 if chunk_len == 0 {
                     seq.state = SequenceState::Decoding;
                 } else {
-                    if seq.spec.is_none() {
+                    if seq.spec.is_none() && seq.grammar.is_none() {
                         if let Some(d) = &drafter {
                             let nanos = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1375,15 +1532,39 @@ impl ContinuousBatchScheduler {
                     let chunk =
                         &seq.prompt_tokens[seq.prefilled_tokens..seq.prefilled_tokens + chunk_len];
                     let started = Instant::now();
-                    let next_tok_opt = match m.step_prefill_chunk(
-                        chunk,
-                        seq.prefilled_tokens,
-                        is_last,
-                        &seq.prompt_tokens,
-                        seq.params.temperature.unwrap_or(DEFAULT_TEMPERATURE),
-                        seq.params.top_p.unwrap_or(DEFAULT_TOP_P),
-                        &mut seq.kv_cache,
-                    ) {
+                    let temp = seq.params.temperature.unwrap_or(DEFAULT_TEMPERATURE);
+                    let top_p = seq.params.top_p.unwrap_or(DEFAULT_TOP_P);
+                    let picked = match (is_last, seq.grammar.as_mut()) {
+                        (true, Some(g)) => m
+                            .prefill_logits(chunk, seq.prefilled_tokens, &mut seq.kv_cache)
+                            .and_then(|l| {
+                                let pos = seq.prompt_tokens.len();
+                                m.grammar_pick(
+                                    l,
+                                    &seq.prompt_tokens,
+                                    pos,
+                                    temp,
+                                    top_p,
+                                    seed_of(seq.id),
+                                    g,
+                                    &mut seq.kv_cache,
+                                )
+                            })
+                            .map(Some),
+                        _ => m
+                            .step_prefill_chunk(
+                                chunk,
+                                seq.prefilled_tokens,
+                                is_last,
+                                &seq.prompt_tokens,
+                                temp,
+                                top_p,
+                                seed_of(seq.id),
+                                &mut seq.kv_cache,
+                            )
+                            .map(|t| t.map(|t| vec![t])),
+                    };
+                    let next_toks = match picked {
                         Ok(t) => t,
                         Err(e) => {
                             self.telemetry
@@ -1402,24 +1583,45 @@ impl ContinuousBatchScheduler {
 
                     if is_last {
                         seq.state = SequenceState::Decoding;
+                        if drafter.as_ref().is_some_and(|d| !d.tap_layers().is_empty())
+                            && !m.0.recurrent()
+                            && seq.prompt_tokens.len() >= 2
+                        {
+                            let n1 = seq.prompt_tokens.len() - 1;
+                            if let Some(e1) = m.kv_export(&seq.kv_cache, n1) {
+                                self.radix.insert(&seq.key[..n1], e1);
+                            }
+                        }
                         if let Some(e) = m.kv_export(&seq.kv_cache, seq.prompt_tokens.len()) {
                             self.radix.insert(&seq.key, e);
                         }
                         if seq.params.max_new_tokens == 0 {
                             let _ = seq.finish.set(FinishReason::Length);
                             seq.state = SequenceState::Finished;
-                        } else if let Some(next_tok) = next_tok_opt {
-                            if tokenizer.ends_generation(next_tok) {
-                                seq.state = SequenceState::Finished;
+                        } else if let Some(toks) = next_toks {
+                            // A grammar's jump-forward may add forced tokens after the sampled one.
+                            let room = seq
+                                .params
+                                .max_new_tokens
+                                .min(pos_limit.saturating_sub(seq.total_tokens()));
+                            let eos = toks.iter().position(|&t| tokenizer.ends_generation(t));
+                            let n = eos.unwrap_or(toks.len()).min(room);
+                            if n > 0 {
+                                seq.emit(&toks[..n], &self.telemetry);
+                                tokens_gen += n;
+                            }
+                            seq.committed_out = if n < toks.len() {
+                                seq.output_tokens.len()
                             } else {
-                                seq.emit(&[next_tok], &self.telemetry);
-                                tokens_gen += 1;
-                                if seq.total_tokens() >= pos_limit
-                                    || seq.output_tokens.len() >= seq.params.max_new_tokens
-                                {
-                                    let _ = seq.finish.set(FinishReason::Length);
-                                    seq.state = SequenceState::Finished;
-                                }
+                                seq.output_tokens.len().saturating_sub(1)
+                            };
+                            if eos == Some(n) {
+                                seq.state = SequenceState::Finished;
+                            } else if seq.total_tokens() >= pos_limit
+                                || seq.output_tokens.len() >= seq.params.max_new_tokens
+                            {
+                                let _ = seq.finish.set(FinishReason::Length);
+                                seq.state = SequenceState::Finished;
                             }
                         }
                     }
@@ -1492,87 +1694,112 @@ impl ContinuousBatchScheduler {
                 // The first decode step also starts the stream and the drafter's catch-up on the
                 // prompt: its time stands for no `k`.
                 let first_step = seq.output_tokens.len() <= 1;
-                let result = match (spec_k, seq.spec.as_mut()) {
-                    (Some(k), Some(sp)) => {
-                        let vocab = tokenizer.vocab_size();
-                        spec::decode(
-                            m,
-                            sp,
-                            &all,
-                            &mut seq.kv_cache,
-                            temp,
-                            top_p,
-                            vocab,
-                            k,
-                            stream_max,
-                            logprobs,
-                        )
-                        .map(|s| {
-                            if let Some(hit) = s.shadow {
-                                self.k_tuner.lock().record_shadow(hit);
-                            }
-                            if s.synced && !first_step {
-                                let msg = self.k_tuner.lock().record_with_knobs(
-                                    k,
-                                    s.tokens.len(),
-                                    s.drafted,
-                                    s.accepted,
-                                    started.elapsed(),
-                                    &knobs_snap,
-                                );
-                                if let Some(msg) = msg {
-                                    self.telemetry.log_info(&msg);
-                                }
-                            }
-                            if s.drafted > 0 {
-                                self.telemetry
-                                    .record_spec(s.drafted, s.accepted, s.tokens.len());
-                            }
-                            if !s.logprobs.is_empty() {
-                                if let Some(tx) = self.logprob_tx.read().as_ref() {
-                                    for info in s.logprobs {
-                                        let _ = tx.send(info);
-                                    }
-                                }
-                            }
-                            s.tokens
-                        })
-                    }
-                    _ => {
-                        let last = all.last().copied().unwrap_or(1);
-                        let streamed = if logprobs.is_none() {
-                            m.stream_token(
-                                last,
+                let batched_step = batched.contains_key(&seq.id);
+                let result = if let Some(r) = batched.remove(&seq.id) {
+                    r.map(|t| vec![t])
+                } else if let Some(g) = seq.grammar.as_mut() {
+                    let last = all.last().copied().unwrap_or(1);
+                    m.prefill_logits(&[last], all.len() - 1, &mut seq.kv_cache)
+                        .and_then(|l| {
+                            let seed = seed_of(seq.id);
+                            m.grammar_pick(
+                                l,
+                                &all,
                                 all.len(),
-                                stream_max,
                                 temp,
                                 top_p,
+                                seed,
+                                g,
                                 &mut seq.kv_cache,
                             )
-                        } else {
-                            Ok(None)
-                        };
-                        match streamed {
-                            Ok(Some(t)) => Ok(vec![t]),
-                            Ok(None) => m
-                                .step_token_with_kv(
-                                    &all,
+                        })
+                } else {
+                    match (spec_k, seq.spec.as_mut()) {
+                        (Some(k), Some(sp)) => {
+                            let vocab = tokenizer.vocab_size();
+                            spec::decode(
+                                m,
+                                sp,
+                                &all,
+                                &mut seq.kv_cache,
+                                temp,
+                                top_p,
+                                vocab,
+                                k,
+                                stream_max,
+                                logprobs,
+                            )
+                            .map(|s| {
+                                if let Some(hit) = s.shadow {
+                                    self.k_tuner.lock().record_shadow(hit);
+                                }
+                                if s.synced && !first_step {
+                                    let msg = self.k_tuner.lock().record_with_knobs(
+                                        k,
+                                        s.tokens.len(),
+                                        s.drafted,
+                                        s.accepted,
+                                        started.elapsed(),
+                                        &knobs_snap,
+                                    );
+                                    if let Some(msg) = msg {
+                                        self.telemetry.log_info(&msg);
+                                    }
+                                }
+                                if s.drafted > 0 {
+                                    self.telemetry.record_spec(
+                                        s.drafted,
+                                        s.accepted,
+                                        s.tokens.len(),
+                                    );
+                                }
+                                if !s.logprobs.is_empty() {
+                                    if let Some(tx) = self.logprob_tx.read().as_ref() {
+                                        for info in s.logprobs {
+                                            let _ = tx.send(info);
+                                        }
+                                    }
+                                }
+                                s.tokens
+                            })
+                        }
+                        _ => {
+                            let last = all.last().copied().unwrap_or(1);
+                            let streamed = if logprobs.is_none() {
+                                m.stream_token(
                                     last,
                                     all.len(),
+                                    stream_max,
                                     temp,
                                     top_p,
-                                    logprobs,
                                     &mut seq.kv_cache,
                                 )
-                                .map(|(tok, info)| {
-                                    if let (Some(info), Some(tx)) =
-                                        (info, self.logprob_tx.read().as_ref())
-                                    {
-                                        let _ = tx.send(info);
-                                    }
-                                    vec![tok]
-                                }),
-                            Err(e) => Err(e),
+                            } else {
+                                Ok(None)
+                            };
+                            match streamed {
+                                Ok(Some(t)) => Ok(vec![t]),
+                                Ok(None) => m
+                                    .step_token_with_kv(
+                                        &all,
+                                        last,
+                                        all.len(),
+                                        temp,
+                                        top_p,
+                                        seed_of(seq.id),
+                                        logprobs,
+                                        &mut seq.kv_cache,
+                                    )
+                                    .map(|(tok, info)| {
+                                        if let (Some(info), Some(tx)) =
+                                            (info, self.logprob_tx.read().as_ref())
+                                        {
+                                            let _ = tx.send(info);
+                                        }
+                                        vec![tok]
+                                    }),
+                                Err(e) => Err(e),
+                            }
                         }
                     }
                 };
@@ -1588,7 +1815,9 @@ impl ContinuousBatchScheduler {
                         continue;
                     }
                 };
-                decode_time += started.elapsed();
+                if !batched_step {
+                    decode_time += started.elapsed();
+                }
                 decoded += 1;
 
                 // Emit up to EOS, max_new_tokens or the last position, whichever comes first (a
@@ -2074,24 +2303,33 @@ mod tests {
                 .1,
         );
         assert_eq!(
-            m.step_prefill_chunk(&prompt[..2], 0, false, &prompt, 0.0, 1.0, &mut st)
+            m.step_prefill_chunk(&prompt[..2], 0, false, &prompt, 0.0, 1.0, 0, &mut st)
                 .unwrap(),
             None
         );
         let t = m
-            .step_prefill_chunk(&prompt[2..], 2, true, &prompt, 0.0, 1.0, &mut st)
+            .step_prefill_chunk(&prompt[2..], 2, true, &prompt, 0.0, 1.0, 0, &mut st)
             .unwrap()
             .unwrap();
         tied("chunked prefill", t, &want);
         // Prefill all but the last token, then the greedy step on it.
         m.prefill_logits(&prompt[..3], 0, &mut st2).unwrap();
         let (next, _) = m
-            .step_token_with_kv(&prompt, prompt[3], prompt.len(), 0.0, 1.0, None, &mut st2)
+            .step_token_with_kv(
+                &prompt,
+                prompt[3],
+                prompt.len(),
+                0.0,
+                1.0,
+                0,
+                None,
+                &mut st2,
+            )
             .unwrap();
         tied("greedy step", next, &want);
         let full = [&prompt[..], &[next]].concat();
         let (dec, _) = m
-            .step_token_with_kv(&full, next, full.len(), 0.0, 1.0, None, &mut st2)
+            .step_token_with_kv(&full, next, full.len(), 0.0, 1.0, 0, None, &mut st2)
             .unwrap();
         tied(
             "decode step",
@@ -2208,5 +2446,79 @@ mod tests {
             "idle prefill budget must never collapse below INITIAL_PREFILL_CHUNK after a short turn"
         );
         assert_eq!(tuner.budget(false, true), MAX_PREFILL_CHUNK);
+    }
+
+    #[test]
+    fn radix_prefix_cache_reuses_prefix_with_tap_drafter() {
+        struct TapDummyDrafter;
+        impl Drafter for TapDummyDrafter {
+            fn label(&self) -> String {
+                "tap-dummy".into()
+            }
+            fn tap_layers(&self) -> Vec<usize> {
+                vec![0]
+            }
+            fn new_state(&self) -> spec::DraftState {
+                Box::new(0usize)
+            }
+            fn skip_prefix(&self, st: &mut spec::DraftState, skipped: usize) {
+                if let Some(seen) = st.downcast_mut::<usize>() {
+                    *seen = skipped;
+                }
+            }
+            fn propose(
+                &self,
+                st: &mut spec::DraftState,
+                tokens: &[u32],
+                hidden: &[f32],
+                k: usize,
+                pick: &mut dyn FnMut(spec::DraftLogits<'_>) -> u32,
+            ) -> Result<Vec<u32>, String> {
+                let seen = st.downcast_mut::<usize>().unwrap();
+                // Synthetic model (`cpu_exec`) has hidden=64 and 1 tap layer -> 64 floats/row.
+                let rows = hidden.len() / 64;
+                assert_eq!(
+                    *seen + rows + 1,
+                    tokens.len(),
+                    "tap row alignment after prefix skip"
+                );
+                *seen += rows;
+                let mut out = Vec::new();
+                for _ in 0..k.min(2) {
+                    out.push(pick(spec::DraftLogits::Sparse {
+                        ids: &[7],
+                        logits: &[1.0],
+                    }));
+                }
+                Ok(out)
+            }
+        }
+
+        let params = SamplingParams {
+            temperature: Some(0.0),
+            top_p: None,
+            max_new_tokens: 6,
+            top_logprobs: None,
+        };
+        let turn1: Vec<u32> = (0..64).map(|i| 5 + (i % 30) as u32).collect();
+        let mut turn2 = turn1.clone();
+        turn2.extend([41, 42, 43, 44, 45]);
+
+        let fresh = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
+        let (_, rx_fresh, ..) = fresh.submit_with_params(params, |_| turn2.clone());
+        let want = run_to_completion(&fresh, rx_fresh);
+
+        let cached = ContinuousBatchScheduler::new("", Some(cpu_exec(SHORT)));
+        cached.set_drafter(Some(Arc::new(TapDummyDrafter)));
+        let (_, rx1, ..) = cached.submit_with_params(params, |_| turn1.clone());
+        let _ = run_to_completion(&cached, rx1);
+
+        let (_, rx2, _, _, finish2) = cached.submit_with_params(params, |_| turn2.clone());
+        let got = run_to_completion(&cached, rx2);
+        assert_eq!(finish2.cached_tokens.load(Ordering::Relaxed), turn1.len());
+        assert_eq!(
+            got, want,
+            "tap-drafter prefix reuse must match fresh greedy decode"
+        );
     }
 }

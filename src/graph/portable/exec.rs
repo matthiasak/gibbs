@@ -121,7 +121,28 @@ fn module(api: &dyn GpuApi) -> Result<Module, String> {
     if let Some((_, m)) = mods.iter().find(|(k, _)| *k == key) {
         return Ok(*m);
     }
-    let m = api.compile(&super::source(api.dialect()))?;
+    let src = super::source(api.dialect());
+    let clean: String = format!("{:?}-{}", api.dialect(), api.device_name())
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let hash = src
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+        });
+    let t = std::time::Instant::now();
+    let m = match crate::hardware::default_cache_dir() {
+        Ok(dir) => {
+            let file = dir
+                .join("portable")
+                .join(format!("{clean}-{hash:016x}.bin"));
+            api.compile_cached(&src, &file)?
+        }
+        Err(_) => api.compile(&src)?,
+    };
+    crate::graph::phase_time("portable.module", t, &key);
     mods.push((key, m));
     Ok(m)
 }
@@ -227,8 +248,8 @@ struct Plan {
     last_sig: Option<Vec<u64>>,
 }
 
-/// Compiled portable program: weights on the device, the compiled graph's plan and up to four
-/// plans of other instance shapes.
+/// Compiled portable program: weights on the device, the compiled graph's plan and up to
+/// [`crate::graph::program::INSTANCE_SHAPES`] plans of other instance shapes.
 pub struct PortableSession {
     api: Arc<dyn GpuApi>,
     module: Module,
@@ -364,6 +385,7 @@ impl PortableSession {
             kv_tab: None,
         };
         s.main = Some(s.plan(graph)?);
+        s.api.sync()?;
         Ok(s)
     }
 
@@ -523,12 +545,12 @@ impl PortableSession {
         let mem = match t {
             Tensor::U32(v) => {
                 let m = DevBuf::new(&self.api, v.len() * 4)?;
-                self.api.upload(m.buf, 0, as_bytes(v))?;
+                self.api.upload_async(m.buf, 0, as_bytes(v))?;
                 m
             }
             Tensor::F32(v) => {
                 let m = DevBuf::new(&self.api, v.len() * 4)?;
-                self.api.upload(m.buf, 0, as_bytes(v))?;
+                self.api.upload_async(m.buf, 0, as_bytes(v))?;
                 m
             }
             other => {
@@ -589,42 +611,84 @@ impl PortableSession {
             }
             (out, enc, padded * esize)
         };
+        // Borrow directly from `self.weights` when layout needs no host row padding so OpenCL/LevelZero
+        // can enqueue non-blocking DMA (`upload_async`) without copying the mmap to a temporary Vec.
+        enum Bytes<'w> {
+            Borrowed(&'w [u8]),
+            Owned(Vec<u8>),
+        }
+        fn dense_ref<'w>(
+            rows: usize,
+            cols: usize,
+            enc_name: &str,
+            esize: usize,
+            raw: &'w [u8],
+        ) -> (Bytes<'w>, &'static Encoding, usize) {
+            let enc = super::encodings()
+                .iter()
+                .find(|e| e.name == enc_name)
+                .expect("dense encoding");
+            let padded = cols.next_multiple_of(8);
+            if padded == cols {
+                return (Bytes::Borrowed(raw), enc, cols * esize);
+            }
+            let mut out = vec![0u8; rows * padded * esize];
+            for r in 0..rows {
+                out[r * padded * esize..][..cols * esize]
+                    .copy_from_slice(&raw[r * cols * esize..][..cols * esize]);
+            }
+            (Bytes::Owned(out), enc, padded * esize)
+        }
+        let _ = dense;
         let (bytes, enc, row_bytes) = match t {
-            Tensor::F32(v) => dense("F32", 4, as_bytes(v)),
-            Tensor::F16(v) => dense("F16", 2, as_bytes(v)),
-            Tensor::BF16(v) => dense("BF16", 2, as_bytes(v)),
+            Tensor::F32(v) => dense_ref(rows, cols, "F32", 4, as_bytes(v)),
+            Tensor::F16(v) => dense_ref(rows, cols, "F16", 2, as_bytes(v)),
+            Tensor::BF16(v) => dense_ref(rows, cols, "BF16", 2, as_bytes(v)),
             Tensor::U32(_) => return Err(format!("weight '{name}' is u32, not a matrix")),
             Tensor::Mat(m) => match m.packed() {
-                None => dense("BF16", 2, as_bytes(m.data())),
+                None => dense_ref(rows, cols, "BF16", 2, as_bytes(m.data())),
                 Some(p) => {
                     let len = p.format.tensor_bytes(rows * cols);
                     let raw = &p.map[p.off..p.off + len];
                     match (super::encoding(p.format), p.format) {
-                        (Some(e), crate::hardware::QuantFormat::FP32) => {
-                            let _ = e;
-                            dense("F32", 4, raw)
+                        (Some(_), crate::hardware::QuantFormat::FP32) => {
+                            dense_ref(rows, cols, "F32", 4, raw)
                         }
-                        (Some(_), crate::hardware::QuantFormat::FP16) => dense("F16", 2, raw),
-                        (Some(_), crate::hardware::QuantFormat::BF16) => dense("BF16", 2, raw),
+                        (Some(_), crate::hardware::QuantFormat::FP16) => {
+                            dense_ref(rows, cols, "F16", 2, raw)
+                        }
+                        (Some(_), crate::hardware::QuantFormat::BF16) => {
+                            dense_ref(rows, cols, "BF16", 2, raw)
+                        }
                         (Some(e), f) => {
                             if cols % e.block_elems != 0 {
                                 return Err(format!(
                                     "weight '{name}': {cols} columns are not whole {f:?} blocks"
                                 ));
                             }
-                            (raw.to_vec(), e, f.tensor_bytes(cols))
+                            (Bytes::Borrowed(raw), e, f.tensor_bytes(cols))
                         }
-                        // A format without a kernel decodes once at load (placement retyped it).
                         (None, _) => {
                             let v = m.to_f32();
-                            dense("F32", 4, as_bytes(&v))
+                            let (b, e, rb) = dense("F32", 4, as_bytes(&v));
+                            (Bytes::Owned(b), e, rb)
                         }
                     }
                 }
             },
         };
-        let mem = DevBuf::new(&self.api, bytes.len())?;
-        self.api.upload(mem.buf, 0, &bytes)?;
+        let mem = match &bytes {
+            Bytes::Borrowed(raw) => {
+                let m = DevBuf::new(&self.api, raw.len())?;
+                self.api.upload_async(m.buf, 0, raw)?;
+                m
+            }
+            Bytes::Owned(vec) => {
+                let m = DevBuf::new(&self.api, vec.len())?;
+                self.api.upload(m.buf, 0, vec)?;
+                m
+            }
+        };
         let buf = mem.buf;
         self.dev.insert(
             key,
@@ -648,7 +712,95 @@ impl PortableSession {
                 ));
             }
         }
-        let arena = SharedArenaPlan::build(&g, DEFAULT_ARENA_ALIGNMENT);
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); g.values.len()];
+        for (ni, node) in g.nodes.iter().enumerate() {
+            for &inp in &node.inputs {
+                if !readers[inp.0 as usize].contains(&ni) {
+                    readers[inp.0 as usize].push(ni);
+                }
+            }
+        }
+        let graph_outs: std::collections::HashSet<ValueId> = g.outputs.iter().copied().collect();
+        let mut segmented: HashMap<ValueId, (usize, Vec<usize>)> = HashMap::new();
+        let mut slice_aliases: HashMap<ValueId, (ValueId, usize)> = HashMap::new();
+        for node in &g.nodes {
+            if !matches!(node.op, Op::Linear) || node.inputs.len() < 2 || node.outputs.is_empty() {
+                continue;
+            }
+            let out = node.outputs[0];
+            let [out_f, in_f] = g.value(node.inputs[1]).shape[..] else {
+                continue;
+            };
+            let rows = numel(&g.value(node.inputs[0]).shape) / in_f.max(1);
+            let oshape = &g.value(out).shape;
+            if rows <= 1
+                || graph_outs.contains(&out)
+                || oshape.is_empty()
+                || oshape[oshape.len() - 1] != out_f
+                || numel(&oshape[..oshape.len() - 1]) != rows
+            {
+                continue;
+            }
+            let rds = &readers[out.0 as usize];
+            if rds.is_empty() {
+                continue;
+            }
+            let last_ax = (oshape.len() - 1) as isize;
+            let dim = out_f as i64;
+            let clampi = |v: i64| {
+                if v < 0 {
+                    (dim + v).max(0) as usize
+                } else {
+                    (v as usize).min(out_f)
+                }
+            };
+            let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(rds.len());
+            let mut slice_starts: Vec<(ValueId, usize)> = Vec::with_capacity(rds.len());
+            let mut ok = true;
+            for &ri in rds {
+                let rnode = &g.nodes[ri];
+                let Op::Slice { axis, start, end } = rnode.op else {
+                    ok = false;
+                    break;
+                };
+                let ax = if axis < 0 {
+                    oshape.len() as isize + axis
+                } else {
+                    axis
+                };
+                if rnode.inputs.as_slice() != [out] || ax != last_ax {
+                    ok = false;
+                    break;
+                }
+                let (s, e) = (clampi(start), clampi(end));
+                if s >= e {
+                    ok = false;
+                    break;
+                }
+                if !ranges.contains(&(s, e)) {
+                    ranges.push((s, e));
+                }
+                slice_starts.push((rnode.outputs[0], s));
+            }
+            if !ok {
+                continue;
+            }
+            ranges.sort_unstable();
+            if !(2..=4).contains(&ranges.len())
+                || ranges[0].0 != 0
+                || ranges.last().unwrap().1 != out_f
+                || !ranges.windows(2).all(|w| w[0].1 == w[1].0)
+            {
+                continue;
+            }
+            let split: Vec<usize> = ranges[1..].iter().map(|&(s, _)| s).collect();
+            segmented.insert(out, (rows, split));
+            for (sv, s) in slice_starts {
+                slice_aliases.insert(sv, (out, rows * s * 4));
+            }
+        }
+        let arena =
+            SharedArenaPlan::build_with_aliases(&g, DEFAULT_ARENA_ALIGNMENT, &slice_aliases);
         let mut loc = vec![Loc::None; g.values.len()];
         for (&v, span) in &arena.spans {
             loc[v.0 as usize] = Loc::Arena((span.offset / 4) as u32);
@@ -668,6 +820,7 @@ impl PortableSession {
             states: Vec::new(),
             state_ix: HashMap::new(),
             needs: Vec::new(),
+            segmented,
         };
         for i in 0..g.nodes.len() {
             b.lower(i)?;
@@ -918,6 +1071,7 @@ struct Builder<'a> {
     states: Vec<StateSlot>,
     state_ix: HashMap<String, usize>,
     needs: Vec<Need>,
+    segmented: HashMap<ValueId, (usize, Vec<usize>)>,
 }
 
 impl Builder<'_> {
@@ -1012,6 +1166,7 @@ impl Builder<'_> {
         rows: usize,
         in_f: usize,
         out_f: usize,
+        split: &[usize],
     ) -> Result<(), String> {
         let (w, enc, row_bytes) = self.s.weight_mat(name, in_f)?;
         let bias = bias.unwrap_or(P::Buf(w));
@@ -1023,14 +1178,65 @@ impl Builder<'_> {
         };
         let mut args = vec![x, P::Buf(w), P::U64(row_bytes as u64)];
         args.extend(bias);
+        let [s1, s2, s3] = if split.is_empty() {
+            [0u32, 0, 0]
+        } else {
+            let n32 = out_f as u32;
+            let at = |i: usize| split.get(i).map_or(n32, |&v| v as u32);
+            [at(0), at(1), at(2)]
+        };
         args.extend([
             P::U32(has_bias as u32),
             y,
             P::U32(rows as u32),
             P::U32(in_f as u32),
             P::U32(out_f as u32),
+            P::U32(s1),
+            P::U32(s2),
+            P::U32(s3),
         ]);
         if rows <= 8 {
+            let use_dp4a = in_f >= 256
+                && in_f % 32 == 0
+                && matches!(enc.name.as_str(), "GGUF_Q8_0" | "GGUF_Q4_0")
+                && !matches!(
+                    std::env::var("GIBBS_PORTABLE_DP4A").as_deref(),
+                    Ok("0" | "off" | "false")
+                )
+                && std::env::var("GIBBS_PORTABLE_EXACT").as_deref() != Ok("1");
+            if use_dp4a {
+                let n_blocks = in_f / 32;
+                let total_blocks = rows * n_blocks;
+                let qx = P::Scratch(self.scratch(total_blocks * 10));
+                self.launch(
+                    "quantize_x_q8",
+                    [groups(total_blocks, 256), 1, 1],
+                    W,
+                    vec![x, qx, P::U32(total_blocks as u32)],
+                )?;
+                let mut qargs = vec![qx, P::Buf(w), P::U64(row_bytes as u64)];
+                if has_bias {
+                    qargs.extend(args[3..4].iter().copied());
+                } else {
+                    qargs.extend([P::Buf(w), P::U32(0)]);
+                }
+                qargs.extend([
+                    P::U32(has_bias as u32),
+                    y,
+                    P::U32(rows as u32),
+                    P::U32(n_blocks as u32),
+                    P::U32(out_f as u32),
+                    P::U32(s1),
+                    P::U32(s2),
+                    P::U32(s3),
+                ]);
+                return self.launch(
+                    &format!("gemv_dp4a_{}", enc.name),
+                    [out_f as u32, 1, 1],
+                    [64, 1, 1],
+                    qargs,
+                );
+            }
             self.launch(
                 &format!("gemv_{}", enc.name),
                 [out_f as u32, 1, 1],
@@ -1113,7 +1319,12 @@ impl Builder<'_> {
                     None => None,
                 };
                 let wname = g.value(ins[1]).name.clone();
-                self.linear(x, &wname, bias, y, rows, in_f, out_f)?;
+                let split = self
+                    .segmented
+                    .get(&out)
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_default();
+                self.linear(x, &wname, bias, y, rows, in_f, out_f, &split)?;
             }
             Op::Megakernel(desc) => {
                 let MegakernelKind::Mlp {
@@ -1128,46 +1339,88 @@ impl Builder<'_> {
                 let rows = n_of(0) / d.max(1);
                 let normed = P::Scratch(self.scratch(rows * d));
                 let gate = P::Scratch(self.scratch(rows * inter));
-                let up = P::Scratch(self.scratch(rows * inter));
-                let down = P::Scratch(self.scratch(rows * d));
                 self.rmsnorm(x, Some(norm), normed, rows, d, eps)?;
-                let (gw, uw, dw) = (
+                let (gw_name, uw_name, dw_name) = (
                     g.value(operand(2)?).name.clone(),
                     g.value(operand(3)?).name.clone(),
                     g.value(operand(4)?).name.clone(),
                 );
-                self.linear(normed, &gw, None, gate, rows, d, inter)?;
-                self.linear(normed, &uw, None, up, rows, d, inter)?;
-                let n = rows * inter;
-                self.launch(
-                    "glu",
-                    [groups(n, 256), 1, 1],
-                    W,
-                    vec![gate, up, gate, P::U32(n as u32), P::U32(is_geglu as u32)],
-                )?;
-                self.linear(gate, &dw, None, down, rows, inter, d)?;
-                if has_post_norm {
-                    let post = self.bind(operand(5)?)?;
-                    self.rmsnorm(down, Some(post), normed, rows, d, eps)?;
-                    self.binary(
-                        BinaryKind::Add,
-                        x,
-                        normed,
-                        y,
-                        rows * d,
-                        (rows * d, rows * d),
-                        None,
+                let (gbuf, genc, grb) = self.s.weight_mat(&gw_name, d)?;
+                let (ubuf, uenc, urb) = self.s.weight_mat(&uw_name, d)?;
+                if rows <= 8 && genc.name == uenc.name && grb == urb {
+                    // Fused Dispatch 2: Gate+Up GEMV + SwiGLU/GeGLU in one launch!
+                    self.launch(
+                        &format!("mlp_dual_glu_{}", genc.name),
+                        [inter as u32, 1, 1],
+                        [64, 1, 1],
+                        vec![
+                            normed,
+                            P::Buf(gbuf),
+                            P::Buf(ubuf),
+                            P::U64(grb as u64),
+                            gate,
+                            P::U32(rows as u32),
+                            P::U32(d as u32),
+                            P::U32(inter as u32),
+                            P::U32(is_geglu as u32),
+                        ],
                     )?;
                 } else {
-                    self.binary(
-                        BinaryKind::Add,
-                        x,
-                        down,
-                        y,
-                        rows * d,
-                        (rows * d, rows * d),
-                        None,
+                    let up = P::Scratch(self.scratch(rows * inter));
+                    self.linear(normed, &gw_name, None, gate, rows, d, inter, &[])?;
+                    self.linear(normed, &uw_name, None, up, rows, d, inter, &[])?;
+                    let n = rows * inter;
+                    self.launch(
+                        "glu",
+                        [groups(n, 256), 1, 1],
+                        W,
+                        vec![gate, up, gate, P::U32(n as u32), P::U32(is_geglu as u32)],
                     )?;
+                }
+                if !has_post_norm && rows <= 8 {
+                    // Fused Dispatch 3: Down GEMV + residual `x` add in one launch (3 dispatches total)!
+                    let (dbuf, denc, drb) = self.s.weight_mat(&dw_name, inter)?;
+                    self.launch(
+                        &format!("gemv_res_{}", denc.name),
+                        [d as u32, 1, 1],
+                        [64, 1, 1],
+                        vec![
+                            gate,
+                            P::Buf(dbuf),
+                            P::U64(drb as u64),
+                            x,
+                            y,
+                            P::U32(rows as u32),
+                            P::U32(inter as u32),
+                            P::U32(d as u32),
+                        ],
+                    )?;
+                } else {
+                    let down = P::Scratch(self.scratch(rows * d));
+                    self.linear(gate, &dw_name, None, down, rows, inter, d, &[])?;
+                    if has_post_norm {
+                        let post = self.bind(operand(5)?)?;
+                        self.rmsnorm(down, Some(post), normed, rows, d, eps)?;
+                        self.binary(
+                            BinaryKind::Add,
+                            x,
+                            normed,
+                            y,
+                            rows * d,
+                            (rows * d, rows * d),
+                            None,
+                        )?;
+                    } else {
+                        self.binary(
+                            BinaryKind::Add,
+                            x,
+                            down,
+                            y,
+                            rows * d,
+                            (rows * d, rows * d),
+                            None,
+                        )?;
+                    }
                 }
             }
             Op::MatMul {
@@ -1979,6 +2232,22 @@ impl Builder<'_> {
                 };
                 let (s, e) = (clampi(*start), clampi(*end));
                 let len = e.saturating_sub(s);
+                if let Some((seg_m, split)) = self.segmented.get(&ins[0]) {
+                    let mut bounds = Vec::with_capacity(split.len() + 2);
+                    bounds.push(0);
+                    bounds.extend_from_slice(split);
+                    bounds.push(dim);
+                    if ax + 1 == xs.len()
+                        && outer == *seg_m
+                        && bounds.windows(2).any(|w| w[0] == s && w[1] == e)
+                    {
+                        let _ = self.bind(ins[0])?;
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "node '{name}': slice {s}..{e} on axis {ax} does not match segmented layout {split:?}"
+                    ));
+                }
                 let x = self.bind(ins[0])?;
                 let n = outer * len * inner;
                 self.launch(

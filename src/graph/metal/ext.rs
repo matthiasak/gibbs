@@ -82,8 +82,9 @@ pub(super) fn plan(
     g: &Graph,
     node: &Node,
     aliases: &mut HashMap<ValueId, (ValueId, usize)>,
+    segmented: &HashMap<ValueId, (usize, Vec<usize>)>,
 ) -> Option<Result<PlanOut<ExtStep>, String>> {
-    if let Some(r) = movement::plan(g, node, aliases) {
+    if let Some(r) = movement::plan(g, node, aliases, segmented) {
         return Some(r.map(|p| match p {
             PlanOut::Step(s, n) => PlanOut::Step(ExtStep::Movement(s), n),
             PlanOut::Alias => PlanOut::Alias,

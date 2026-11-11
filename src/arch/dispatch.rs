@@ -6,11 +6,11 @@ use super::Pipeline;
 use crate::hardware::{Device, HardwareCapability, PlacementMode};
 use crate::model::classifier::{self, SequenceClassifier};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
-use crate::runtime::encoder::system1::JevSystem1Model;
 use crate::model::weight_format::{
     reencode_override, set_reencode_override, ReencodeConfig, ReencodePolicy,
 };
 use crate::runtime::diffusion::{Extras, ImageGenerator, SpecDiffusion};
+use crate::runtime::encoder::system1::JevSystem1Model;
 use crate::scheduler::ExecutableModel;
 use serde_json::{json, Map, Value as J};
 use std::collections::HashSet;
@@ -85,8 +85,7 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
             let mode = match device(o.placement) {
                 // The CLI runs the System 1 encoder on Metal wherever it exists.
                 Device::Cpu
-                    if o.system1_first
-                        && crate::hardware::available_devices().contains(&Device::Metal) =>
+                    if o.system1_first && crate::hardware::device_available(Device::Metal) =>
                 {
                     PlacementMode::Pin(Device::Metal)
                 }
@@ -119,7 +118,11 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
     (o.stage)("reading weights, choosing weight format");
     // Image repos are recognised by their files; `--arch` of a diffusion family loads as that one.
     match o.family {
-        Some(f) if super::registry()?.spec(f, &Default::default()).is_ok_and(|s| s.pipeline == Pipeline::Diffusion) => {
+        Some(f)
+            if super::registry()?
+                .spec(f, &Default::default())
+                .is_ok_and(|s| s.pipeline == Pipeline::Diffusion) =>
+        {
             let p = SpecDiffusion::load(&artifacts, hub, o.placement, Some(f), &Extras::default())?;
             return Ok(Loaded::Image(Arc::new(p)));
         }
@@ -149,7 +152,10 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<ExecutableModel, String> {
     let family = match o.family {
         Some(f) => f.to_string(),
         None => reg.detect(&ck.sig).ok_or_else(|| {
-            format!("{}: no architecture spec matches this checkpoint", a.model_id)
+            format!(
+                "{}: no architecture spec matches this checkpoint",
+                a.model_id
+            )
         })?,
     };
     (o.stage)("compiling + tuning kernels");

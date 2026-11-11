@@ -1,13 +1,27 @@
 // Reasoning / thinking-model runtime metadata (DeepSeek-R1, QwQ, Qwen3 thinking variants):
 // marks standard `<think>...</think>` blocks for automatic multi-turn elision and TUI rendering.
 {
-  applies_to: {
-    hub_id: ["*DeepSeek-R1*", "*QwQ*", "*Thinking*", "*thinking*"],
-    family: ["llama", "qwen3", "qwen3_5", "qwen3_vl"],
-  },
-  patch: {
-    runtime: {
-      thinking_delimiters: ["<think>", "</think>"],
+  overrides: [
+    {
+      applies_to: {
+        hub_id: ["*DeepSeek-R1*", "*QwQ*", "*Thinking*", "*thinking*"],
+        family: ["llama", "qwen3", "qwen3_5", "qwen3_vl", "qwen4_exp", "glm", "hunyuan"],
+      },
+      patch: {
+        runtime: {
+          thinking_delimiters: ["<think>", "</think>"],
+        },
+      },
     },
-  },
+    {
+      applies_to: {
+        family: ["gemma4", "gemma4_unified"],
+      },
+      patch: {
+        runtime: {
+          thinking_delimiters: ["<|thought|>", "<|end_thought|>", "<thought>", "</thought>"],
+        },
+      },
+    },
+  ],
 }

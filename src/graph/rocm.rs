@@ -291,6 +291,29 @@ impl HipApi {
         self.hip
             .check("hipSetDevice", unsafe { (self.hip.set_device)(0) })
     }
+
+    fn compile_code(&self, src: &str) -> Result<Vec<u8>, String> {
+        // No fma contraction: codec math must round like the reference decoders.
+        let mut opts = [c"-ffp-contract=off".as_ptr(), null()];
+        let n = match &self.arch {
+            Some(a) => {
+                opts[1] = a.as_ptr();
+                2
+            }
+            None => 1,
+        };
+        self.rtc.code(src, &opts[..n])
+    }
+
+    fn load_code(&self, code: &[u8]) -> Result<Module, String> {
+        self.current()?;
+        let mut m = null_mut();
+        // SAFETY: `code` is a complete code object.
+        self.hip.check("hipModuleLoadData", unsafe {
+            (self.hip.module_load_data)(&mut m, code.as_ptr().cast())
+        })?;
+        Ok(Module(m as u64))
+    }
 }
 
 impl GpuApi for HipApi {
@@ -364,23 +387,22 @@ impl GpuApi for HipApi {
     }
 
     fn compile(&self, src: &str) -> Result<Module, String> {
-        // No fma contraction: codec math must round like the reference decoders.
-        let mut opts = [c"-ffp-contract=off".as_ptr(), null()];
-        let n = match &self.arch {
-            Some(a) => {
-                opts[1] = a.as_ptr();
-                2
+        let code = self.compile_code(src)?;
+        self.load_code(&code)
+    }
+
+    fn compile_cached(&self, src: &str, file: &std::path::Path) -> Result<Module, String> {
+        let (code, hit) = crate::graph::portable::cached_bytes(file, || self.compile_code(src))?;
+        match self.load_code(&code) {
+            Ok(m) => Ok(m),
+            Err(_) if hit => {
+                let _ = std::fs::remove_file(file);
+                let fresh = self.compile_code(src)?;
+                let _ = crate::graph::portable::cached_bytes(file, || Ok(fresh.clone()));
+                self.load_code(&fresh)
             }
-            None => 1,
-        };
-        let code = self.rtc.code(src, &opts[..n])?;
-        self.current()?;
-        let mut m = null_mut();
-        // SAFETY: `code` is a complete code object.
-        self.hip.check("hipModuleLoadData", unsafe {
-            (self.hip.module_load_data)(&mut m, code.as_ptr().cast())
-        })?;
-        Ok(Module(m as u64))
+            Err(e) => Err(e),
+        }
     }
 
     fn kernel(&self, module: &Module, name: &str) -> Result<Kernel, String> {

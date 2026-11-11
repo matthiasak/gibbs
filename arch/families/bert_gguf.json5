@@ -6,9 +6,8 @@
 // writer drops trailing unit dims (ggml_n_dims): 1-label heads come in as [in], reshaped back.
 {
   family: "bert_gguf",
+  extends: "bert",
   match: {gguf_arch: ["bert"]},
-  pipeline: "encoder",
-  use_lib: ["transformer"],
   names: {rules: [
     ["token_embd.weight", "embeddings.word_embeddings.weight"],
     ["position_embd.weight", "embeddings.position_embeddings.weight"],
@@ -23,57 +22,12 @@
     ["blk.{i}.ffn_down.{r:*}", "encoder.layer.{i}.output.dense.{r}"],
     ["blk.{i}.layer_output_norm.{r:*}", "encoder.layer.{i}.output.LayerNorm.{r}"],
   ]},
-  config: {
-    hidden: "gguf.embedding_length",
-    layers: "gguf.block_count",
-    heads: "gguf['attention.head_count']",
-    kv_heads: "heads",
-    head_dim: "hidden // heads",
-    eps: "gguf['attention.layer_norm_epsilon']",
-    types: "len(shape('embeddings.token_type_embeddings.weight')) == 1 ? 1 : shape('embeddings.token_type_embeddings.weight')[0]",
-    labels: "has('cls.output.weight') ? shape('cls.output.weight')[0] : 0",
-    max_position_embeddings: "shape('embeddings.position_embeddings.weight')[0]",
-  },
   checks: [{expr: "!has('cls.output.weight')", error: "GGUF has no classification head"}],
   transforms: [
+    {tensor: "embeddings.token_type_embeddings.weight", op: "reshape",
+     args: {shape: [1, "shape('embeddings.token_type_embeddings.weight')[0]"]},
+     when: "has('embeddings.token_type_embeddings.weight') && len(shape('embeddings.token_type_embeddings.weight')) == 1"},
     {tensor: "cls.output.weight", op: "reshape", args: {shape: [1, "shape('cls.output.weight')[0]"]},
      when: "has('cls.output.weight') && len(shape('cls.output.weight')) == 1"},
   ],
-  components: {
-    encoder: {
-      vars: ["rows", "head"],
-      inputs: [
-        {name: "token_ids", dtype: "u32", shape: ["rows"]},
-        {name: "positions", dtype: "u32", shape: ["rows"]},
-        {name: "token_types", dtype: "u32", shape: ["rows"], when: "types > 1"},
-      ],
-      body: [
-        {op: "Embedding", in: ["w:embeddings.word_embeddings.weight", "i:token_ids"], out: "x", name: "emb.word"},
-        {op: "Embedding", in: ["w:embeddings.position_embeddings.weight", "i:positions"], out: "pe", name: "emb.pos"},
-        {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "emb.add_pos"},
-        {op: "Embedding", in: ["w:embeddings.token_type_embeddings.weight", "i:token_types"], out: "te", name: "emb.type", when: "types > 1"},
-        {op: "Binary", args: {kind: "Add"}, in: ["x", "te"], out: "x", name: "emb.add_type", when: "types > 1"},
-        {op: "Binary", args: {kind: "Add"}, in: ["x", "w:embeddings.token_type_embeddings.weight"], out: "x", name: "emb.add_type", when: "types == 1"},
-        {use: "layer_norm", args: {w: "'embeddings.LayerNorm'"}, in: ["x"], out: "x", name: "emb.ln"},
-        {repeat: "i", count: "layers", body: [
-          {let: {p: "fmt('encoder.layer.{i}')"}},
-          {use: "post_ln_encoder_layer", in: ["x"], out: "x", name: "l{i}", args: {
-            wq: "fmt('{p}.attention.self.query')", wk: "fmt('{p}.attention.self.key')",
-            wv: "fmt('{p}.attention.self.value')", wo: "fmt('{p}.attention.output.dense')",
-            ln1: "fmt('{p}.attention.output.LayerNorm')", up: "fmt('{p}.intermediate.dense')",
-            down: "fmt('{p}.output.dense')", ln2: "fmt('{p}.output.LayerNorm')"}},
-          {tap: "layer.{i}", in: "x"},
-        ]},
-        {block: [
-          {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["x"], out: "c", name: "cls.first"},
-          {block: [
-            {op: "Linear", in: ["c", "w:cls.weight", "w?:cls.bias"], out: "c", name: "cls.dense"},
-            {op: "Unary", args: {kind: "Tanh"}, in: ["c"], out: "c", name: "cls.act"},
-          ], when: "has('cls.weight')"},
-          {op: "Linear", in: ["c", "w:cls.output.weight", "w?:cls.output.bias"], out: "logits", name: "cls.out"},
-        ], when: "head == 'classify'"},
-      ],
-      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", value: "x", when: "head == 'hidden'"}],
-    },
-  },
 }

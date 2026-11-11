@@ -1,4 +1,5 @@
-//! OpenAI Responses API `/v1/responses` (Codex CLI's wire API), stateless, on the shared core.
+//! OpenAI Responses API `/v1/responses` (Codex CLI's wire API) on the shared core;
+//! `previous_response_id` chains onto the last [`MAX_HISTORY`] responses kept in memory.
 
 use super::core::{
     self, collect, label, prepare_messages, stream_response, unix_now, ApiError, Event, Finish,
@@ -13,8 +14,11 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Json, Response};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
+use std::sync::LazyLock;
 
 #[derive(Debug, Deserialize)]
 pub struct ResponsesRequest {
@@ -30,6 +34,27 @@ pub struct ResponsesRequest {
     pub top_p: Option<f32>,
     pub stream: Option<bool>,
     pub previous_response_id: Option<String>,
+    /// Compaction settings over the saved ones ([`core::compact_override`]).
+    #[serde(default)]
+    pub compact: Option<crate::compact::CompactionOverride>,
+}
+
+/// Conversations (input items without `instructions`, then the output) of finished responses by
+/// id, for `previous_response_id`; the oldest go first.
+// ponytail: process-wide like the Requests panel labels, not on `AppState` (whose literal
+// constructors live in main.rs and the integration tests); per-state if one process serves twice.
+static HISTORY: LazyLock<Mutex<VecDeque<(String, Vec<ChatMessage>)>>> =
+    LazyLock::new(Default::default);
+const MAX_HISTORY: usize = 256;
+
+fn recall(id: &str) -> Result<Vec<ChatMessage>, ApiError> {
+    HISTORY
+        .lock()
+        .iter()
+        .rev()
+        .find(|(i, _)| i == id)
+        .map(|(_, m)| m.clone())
+        .ok_or_else(|| ApiError::bad(format!("previous_response_id '{id}' not found")))
 }
 
 /// `instructions` + `input` (a string, or message / function_call / function_call_output items)
@@ -123,18 +148,24 @@ pub async fn responses(
 async fn respond(
     state: AppState,
     headers: HeaderMap,
-    req: ResponsesRequest,
+    mut req: ResponsesRequest,
 ) -> Result<Response, ApiError> {
-    if req.previous_response_id.is_some() {
-        return Err(ApiError::bad(
-            "previous_response_id is not supported: this server is stateless; send the full input",
-        ));
-    }
-    let (messages, media) = prepare_messages(input_messages(req.instructions, req.input)?).await?;
+    let compact = core::compact_override(req.compact.take(), &headers)?;
+    let mut conversation = match &req.previous_response_id {
+        Some(id) => recall(id)?,
+        None => Vec::new(),
+    };
+    conversation.extend(input_messages(None, req.input)?);
+    let system = req.instructions.map(|i| ChatMessage::new("system", i));
+    let all = system
+        .into_iter()
+        .chain(conversation.iter().cloned())
+        .collect();
+    let (messages, media) = prepare_messages(all).await?;
     let (tools, skipped) = chat_tools(req.tools);
     let choice = tool_choice(req.tool_choice.as_ref())?;
     core::skip_builtin_tools(&state, "responses", &skipped, &choice)?;
-    let gen = core::start(
+    let mut gen = core::start(
         &state,
         GenRequest {
             prompt: Prompt::Chat {
@@ -150,31 +181,43 @@ async fn respond(
             },
             stop: Vec::new(),
             label: label("responses", &headers),
-            compact: None,
+            compact,
+            grammar: None,
         },
     )
     .await?;
+    let compaction = gen.compaction.take();
     let mut wire = ResponsesWire::new(
         gen.id,
         req.model.unwrap_or_else(|| state.scheduler.model_id()),
         gen.prompt_tokens,
     );
-    if req.stream.unwrap_or(false) {
-        return Ok(stream_response(gen, wire, Framing::SseNamed));
-    }
-    let out = collect(gen).await?;
-    let status = if out.finish == Finish::Length {
-        "incomplete"
+    wire.conversation = Some(conversation);
+    let mut resp = if req.stream.unwrap_or(false) {
+        stream_response(gen, wire, Framing::SseNamed)
     } else {
-        "completed"
-    };
-    if !out.text.is_empty() {
+        let out = collect(gen).await?;
+        let status = if out.finish == Finish::Length {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        if !out.text.is_empty() {
+            wire.output
+                .push(message_item(&wire.msg_id(), &out.text, status));
+        }
         wire.output
-            .push(message_item(&wire.msg_id(), &out.text, status));
-    }
-    wire.output
-        .extend(out.calls.iter().map(|c| call_item(c, "completed")));
-    Ok(Json(wire.response(Some((&out.finish, out.completion_tokens)))).into_response())
+            .extend(out.calls.iter().map(|c| call_item(c, "completed")));
+        wire.remember();
+        let mut r = wire.response(Some((&out.finish, out.completion_tokens)));
+        if let Some(c) = &compaction {
+            r["usage"]["compaction"] = json!(c.report);
+        }
+        Json(r).into_response()
+    };
+    resp.headers_mut()
+        .extend(compaction.as_ref().map(|c| c.header()));
+    Ok(resp)
 }
 
 /// A message output item; only an item just opened for streaming has no content yet.
@@ -208,6 +251,8 @@ pub struct ResponsesWire {
     /// Text of the message item being streamed, if one is open.
     text: Option<String>,
     msgs: usize,
+    /// The conversation so far; stored with the output under `id` once the response finishes.
+    conversation: Option<Vec<ChatMessage>>,
 }
 
 impl ResponsesWire {
@@ -221,11 +266,26 @@ impl ResponsesWire {
             output: Vec::new(),
             text: None,
             msgs: 0,
+            conversation: None,
         }
     }
 
     fn msg_id(&self) -> String {
         format!("msg_{}_{}", &self.id[5..], self.msgs)
+    }
+
+    /// Keeps the conversation plus the output for a later `previous_response_id`.
+    fn remember(&mut self) {
+        let Some(mut conversation) = self.conversation.take() else {
+            return;
+        };
+        let output = Value::Array(self.output.clone());
+        conversation.extend(input_messages(None, output).unwrap_or_default());
+        let mut h = HISTORY.lock();
+        h.push_back((self.id.clone(), conversation));
+        if h.len() > MAX_HISTORY {
+            h.pop_front();
+        }
     }
 
     /// The response object; `None` while in progress.
@@ -325,6 +385,7 @@ impl Wire for ResponsesWire {
                     "completed"
                 };
                 self.close_text(&mut out, status);
+                self.remember();
                 let r = self.response(Some((&finish, completion_tokens)));
                 let kind = if finish == Finish::Length {
                     "response.incomplete"

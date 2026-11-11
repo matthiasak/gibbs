@@ -112,6 +112,7 @@ args!(BufferToHost { src: Raw, host_layout: Raw, dst: *mut c_void, dst_size: usi
 /// `PJRT_Buffer_Type` element types this client moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ElemType {
+    S8 = 2,
     S32 = 4,
     F32 = 11,
     BF16 = 13,
@@ -265,7 +266,10 @@ impl Drop for Client {
     fn drop(&mut self) {
         let mut a = ClientRef::new();
         a.client = self.client;
-        if let Err(e) = self.api.call(field::CLIENT_DESTROY, "Client_Destroy", &mut a) {
+        if let Err(e) = self
+            .api
+            .call(field::CLIENT_DESTROY, "Client_Destroy", &mut a)
+        {
             eprintln!("warning: {e}");
         }
     }
@@ -289,10 +293,7 @@ impl Client {
         let (size, version) = unsafe {
             (
                 *(base as *const usize),
-                (
-                    *(base.add(32) as *const i32),
-                    *(base.add(36) as *const i32),
-                ),
+                (*(base.add(32) as *const i32), *(base.add(36) as *const i32)),
             )
         };
         let api = Api { base, size };
@@ -405,8 +406,11 @@ impl Client {
         a.num_devices = 1;
         a.num_args = raw_args.len();
         a.output_lists = out_list.as_ptr();
-        self.api
-            .call(field::LOADED_EXECUTABLE_EXECUTE, "LoadedExecutable_Execute", &mut a)?;
+        self.api.call(
+            field::LOADED_EXECUTABLE_EXECUTE,
+            "LoadedExecutable_Execute",
+            &mut a,
+        )?;
         Ok(outs
             .into_iter()
             .zip(result_bytes)

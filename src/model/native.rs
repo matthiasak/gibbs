@@ -92,6 +92,13 @@ pub trait NativeLm: Send + Sync {
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String>;
 
+    /// One decode step of several sequences: `items[b]` is `(token, position, state)`; returns
+    /// their next-token logits as `[B, vocab]` rows. Models that batch (see `SpecLm`) run every
+    /// sequence in one pass that reads the weights once; the default runs them one by one.
+    fn step_batch(&self, items: &mut [(u32, usize, &mut SeqState)]) -> Result<Vec<f32>, String> {
+        step_each(self, items)
+    }
+
     /// The next token of a greedy device decode stream (see
     /// [`crate::graph::program::GraphProgram::stream_next`]): `last` at `start_pos`, at most
     /// `max_new` tokens queued. `None` when this model or state cannot stream.
@@ -144,6 +151,57 @@ pub trait NativeLm: Send + Sync {
         _state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
         Err("this model cannot verify draft tokens".into())
+    }
+
+    /// Speculative verification returning each row's normalized `(token_id, prob)` nucleus
+    /// distribution (`[(argmax, 1.0)]` when `temp <= 1e-4`), avoiding multi-MB host logit copies
+    /// on GPU backends.
+    fn verify_topk(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        temp: f32,
+        top_p: f32,
+        vocab: usize,
+        state: &mut SeqState,
+    ) -> Result<Vec<Vec<(u32, f32)>>, String> {
+        let logits = self.forward_all(tokens, start_pos, state)?;
+        if logits.is_empty() || logits.len() % tokens.len() != 0 {
+            return Err(format!(
+                "verify returned {} logits for {} positions",
+                logits.len(),
+                tokens.len()
+            ));
+        }
+        let width = logits.len() / tokens.len();
+        let valid = if vocab > 0 { width.min(vocab) } else { width };
+        let greedy = temp <= 1e-4;
+        Ok(logits
+            .chunks_exact(width)
+            .map(|row| {
+                let l = &row[..valid];
+                if greedy {
+                    let t = crate::runtime::lm::sample_logits(
+                        l,
+                        &[],
+                        temp,
+                        crate::scheduler::SAMPLE_TOP_K,
+                        top_p,
+                        0,
+                    );
+                    vec![(t, 1.0)]
+                } else {
+                    let (cands, probs, n) =
+                        crate::runtime::lm::nucleus(l, temp, crate::scheduler::SAMPLE_TOP_K, top_p);
+                    let sum: f32 = probs[..n].iter().sum::<f32>().max(1e-30);
+                    cands[..n]
+                        .iter()
+                        .zip(&probs[..n])
+                        .map(|(&(t, _), &p)| (t as u32, p / sum))
+                        .collect()
+                }
+            })
+            .collect())
     }
 
     /// Drops positions `len..` from `state`, exactly as if they had never run. Recurrent models
@@ -237,4 +295,16 @@ pub trait NativeLm: Send + Sync {
     fn has_vision(&self) -> bool {
         false
     }
+}
+
+/// [`NativeLm::step_batch`] one sequence at a time.
+pub fn step_each(
+    lm: &(impl NativeLm + ?Sized),
+    items: &mut [(u32, usize, &mut SeqState)],
+) -> Result<Vec<f32>, String> {
+    let mut out = Vec::new();
+    for (tok, pos, st) in items.iter_mut() {
+        out.extend(lm.forward(&[*tok], *pos, st)?);
+    }
+    Ok(out)
 }

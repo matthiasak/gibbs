@@ -1,0 +1,28 @@
+// Shared Gemma 2 / Gemma 3 building blocks: `(1 + w)` load-time RMSNorm gain shift (HF checkpoints;
+// llama.cpp GGUFs store `1 + w` directly), `gemma_rms_1p`, and `gemma_softcap_head`.
+{
+  config: {
+    rotary_dim: "head_dim",
+    rope_variant: "'HalfSplit'",
+    act: "'GeluTanh'",
+  },
+  transforms: [
+    {tensor: "model.norm.weight", op: "to_f32", when: "!first(gg, false)"},
+    {tensor: "model.norm.weight", op: "add", args: {value: 1}, when: "!first(gg, false)"},
+    {tensor: "model.layers.{i}.{n:*}layernorm.weight", op: "to_f32", when: "!first(gg, false)"},
+    {tensor: "model.layers.{i}.{n:*}layernorm.weight", op: "add", args: {value: 1}, when: "!first(gg, false)"},
+    {tensor: "model.layers.{i}.self_attn.{n:*}_norm.weight", op: "to_f32", when: "!first(gg, false)"},
+    {tensor: "model.layers.{i}.self_attn.{n:*}_norm.weight", op: "add", args: {value: 1}, when: "!first(gg, false)"},
+  ],
+  macros: {
+    // RMSNorm over a `(1 + w)`-shifted Gemma gain `{w}.weight`.
+    gemma_rms_1p: {params: ["x"], body: [
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{w}.weight"], out: "out"},
+    ]},
+    // Causal-LM / seq-cls output tail with Gemma `(1 + w)` final norm and optional logit soft-cap.
+    gemma_softcap_head: {params: ["x"], returns: ["v?:logits", "x"], body: [
+      {use: "decoder_tail", name: "", args: {norm: "norm", w: "w", softcap: "softcap",
+        skip_last_single: "first(skip_last_single, true)"}, in: ["x"], out: ["logits", "x"]},
+    ]},
+  },
+}

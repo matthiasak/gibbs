@@ -10,7 +10,7 @@ DEVFN void ld8_CODEC(GLOBAL const u8* row, u32 c, float* out8) {
 // y[r, j] = x[r, :] . w[j, :] (+ bias[j]) for rows <= 8: one 64-thread workgroup per column j.
 KERNEL gemv_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_bytes,
                   GLOBAL const float* bias, u32 bo, u32 has_bias, GLOBAL float* y, u32 yo,
-                  u32 rows, u32 in_f, u32 out_f) {
+                  u32 rows, u32 in_f, u32 out_f, u32 s1, u32 s2, u32 s3) {
     LOCAL float red[8 * 64];
     u32 j = GRP(0), t = LID(0);
     float acc[8];
@@ -27,23 +27,120 @@ KERNEL gemv_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_byt
             acc[r] += s;
         }
     }
+    if (rows == 1u) {
+        float a0 = acc[0];
+        WARP_SUM_64(a0, t, red);
+        if (t == 0u) {
+            float b = has_bias ? bias[bo + j] : 0.0f;
+            y[yo + j] = a0 + b;
+        }
+        return;
+    }
     for (u32 r = 0; r < 8u; r++) red[r * 64u + t] = acc[r];
     BARRIER();
     for (u32 s = 32u; s > 0u; s >>= 1) {
         if (t < s)
-            for (u32 r = 0; r < 8u; r++) red[r * 64u + t] += red[r * 64u + t + s];
+            for (u32 r = 0; r < rows; r++) red[r * 64u + t] += red[r * 64u + t + s];
         BARRIER();
     }
     if (t < rows) {
         float b = has_bias ? bias[bo + j] : 0.0f;
-        y[yo + t * out_f + j] = red[t * 64u] + b;
+        y[yo + out_index(t, j, out_f, rows, s1, s2, s3)] = red[t * 64u] + b;
+    }
+}
+
+// Fused Gate+Up GEMV + SwiGLU/GeGLU (`rows <= 8`, single read of `x`).
+KERNEL mlp_dual_glu_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* gw, GLOBAL const u8* uw,
+                          u64 row_bytes, GLOBAL float* y, u32 yo, u32 rows, u32 in_f, u32 inter,
+                          u32 is_geglu) {
+    LOCAL float red[16 * 64];
+    u32 j = GRP(0), t = LID(0);
+    float ga[8], ua[8];
+    for (u32 r = 0; r < 8u; r++) { ga[r] = 0.0f; ua[r] = 0.0f; }
+    GLOBAL const u8* gwr = gw + (u64)j * row_bytes;
+    GLOBAL const u8* uwr = uw + (u64)j * row_bytes;
+    GLOBAL const float* xr = x + xo;
+    for (u32 c = t * 8u; c < in_f; c += 64u * 8u) {
+        float gv[8], uv[8];
+        ld8_CODEC(gwr, c, gv);
+        ld8_CODEC(uwr, c, uv);
+        u32 nv = in_f - c < 8u ? in_f - c : 8u;
+        for (u32 r = 0; r < rows; r++) {
+            float gs = 0.0f, us = 0.0f;
+            for (u32 i = 0; i < nv; i++) {
+                float xv = xr[r * in_f + c + i];
+                gs += gv[i] * xv;
+                us += uv[i] * xv;
+            }
+            ga[r] += gs;
+            ua[r] += us;
+        }
+    }
+    for (u32 r = 0; r < rows; r++) {
+        red[r * 64u + t] = ga[r];
+        red[(8u + r) * 64u + t] = ua[r];
+    }
+    BARRIER();
+    for (u32 s = 32u; s > 0u; s >>= 1) {
+        if (t < s) {
+            for (u32 r = 0; r < rows; r++) {
+                red[r * 64u + t] += red[r * 64u + t + s];
+                red[(8u + r) * 64u + t] += red[(8u + r) * 64u + t + s];
+            }
+        }
+        BARRIER();
+    }
+    if (t < rows) {
+        float g = red[t * 64u], u = red[(8u + t) * 64u];
+        float act = is_geglu
+            ? 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)))
+            : (g / (1.0f + expf(-g)));
+        y[yo + t * inter + j] = act * u;
+    }
+}
+
+// Fused Down GEMV + residual `res` add (`rows <= 8`).
+KERNEL gemv_res_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_bytes,
+                      GLOBAL const float* res, u32 ro, GLOBAL float* y, u32 yo,
+                      u32 rows, u32 in_f, u32 out_f) {
+    LOCAL float red[8 * 64];
+    u32 j = GRP(0), t = LID(0);
+    float acc[8];
+    for (u32 r = 0; r < 8u; r++) acc[r] = 0.0f;
+    GLOBAL const u8* wr = w + (u64)j * row_bytes;
+    GLOBAL const float* xr = x + xo;
+    for (u32 c = t * 8u; c < in_f; c += 64u * 8u) {
+        float wv[8];
+        ld8_CODEC(wr, c, wv);
+        u32 nv = in_f - c < 8u ? in_f - c : 8u;
+        for (u32 r = 0; r < rows; r++) {
+            float s = 0.0f;
+            for (u32 i = 0; i < nv; i++) s += wv[i] * xr[r * in_f + c + i];
+            acc[r] += s;
+        }
+    }
+    if (rows == 1u) {
+        float a0 = acc[0];
+        WARP_SUM_64(a0, t, red);
+        if (t == 0u) y[yo + j] = a0 + res[ro + j];
+        return;
+    }
+    for (u32 r = 0; r < rows; r++) red[r * 64u + t] = acc[r];
+    BARRIER();
+    for (u32 s = 32u; s > 0u; s >>= 1) {
+        if (t < s)
+            for (u32 r = 0; r < rows; r++) red[r * 64u + t] += red[r * 64u + t + s];
+        BARRIER();
+    }
+    if (t < rows) {
+        y[yo + t * out_f + j] = red[t * 64u] + res[ro + t * out_f + j];
     }
 }
 
 // The same product for any rows: 32x32 output tiles, 256 threads, 2x2 outputs each.
 KERNEL gemm_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_bytes,
                   GLOBAL const float* bias, u32 bo, u32 has_bias, GLOBAL float* y, u32 yo,
-                  u32 rows, u32 in_f, u32 out_f) {
+                  u32 rows, u32 in_f, u32 out_f, u32 s1, u32 s2, u32 s3) {
     LOCAL float xs[32 * 33];
     LOCAL float ws[32 * 33];
     u32 t = LID(0), tx = t % 16u, ty = t / 16u;
@@ -76,10 +173,10 @@ KERNEL gemm_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_byt
     u32 r = r0 + ty * 2u, j = j0 + tx * 2u;
     float b0 = (has_bias && j < out_f) ? bias[bo + j] : 0.0f;
     float b1 = (has_bias && j + 1u < out_f) ? bias[bo + j + 1u] : 0.0f;
-    if (r < rows && j < out_f) y[yo + r * out_f + j] = a00 + b0;
-    if (r < rows && j + 1u < out_f) y[yo + r * out_f + j + 1u] = a01 + b1;
-    if (r + 1u < rows && j < out_f) y[yo + (r + 1u) * out_f + j] = a10 + b0;
-    if (r + 1u < rows && j + 1u < out_f) y[yo + (r + 1u) * out_f + j + 1u] = a11 + b1;
+    if (r < rows && j < out_f) y[yo + out_index(r, j, out_f, rows, s1, s2, s3)] = a00 + b0;
+    if (r < rows && j + 1u < out_f) y[yo + out_index(r, j + 1u, out_f, rows, s1, s2, s3)] = a01 + b1;
+    if (r + 1u < rows && j < out_f) y[yo + out_index(r + 1u, j, out_f, rows, s1, s2, s3)] = a10 + b0;
+    if (r + 1u < rows && j + 1u < out_f) y[yo + out_index(r + 1u, j + 1u, out_f, rows, s1, s2, s3)] = a11 + b1;
 }
 
 // y[r, :] = table[ids[r], :d]: one thread per 8 columns of a row; ids out of range give zeros.
@@ -113,11 +210,6 @@ KERNEL moe_CODEC(GLOBAL const float* x, u32 xo, GLOBAL const u8* w, u64 row_byte
             for (u32 i = 0; i < nv; i++) acc += wv[i] * xr[c + i];
         }
     }
-    red[t] = acc;
-    BARRIER();
-    for (u32 k = 32u; k > 0u; k >>= 1) {
-        if (t < k) red[t] += red[t + k];
-        BARRIER();
-    }
-    if (t == 0u) y[yo + s * out_f + j] = red[0];
+    WARP_SUM_64(acc, t, red);
+    if (t == 0u) y[yo + s * out_f + j] = acc;
 }

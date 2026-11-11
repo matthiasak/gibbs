@@ -38,9 +38,18 @@ pub trait GpuApi: Send + Sync {
     fn alloc(&self, bytes: usize) -> Result<Buf, String>;
     fn free(&self, buf: Buf);
     fn upload(&self, buf: Buf, offset: usize, data: &[u8]) -> Result<(), String>;
+    /// Enqueues an ordered host-to-device copy when `data` outlives the next [`Self::sync`] or
+    /// blocking [`Self::download`]. Defaults to [`Self::upload`].
+    fn upload_async(&self, buf: Buf, offset: usize, data: &[u8]) -> Result<(), String> {
+        self.upload(buf, offset, data)
+    }
     fn download(&self, buf: Buf, offset: usize, out: &mut [u8]) -> Result<(), String>;
     /// Compiles one complete translation unit (the dialect prelude included).
     fn compile(&self, src: &str) -> Result<Module, String>;
+    /// Compiles one complete translation unit, serving from or recording into `file` when supported.
+    fn compile_cached(&self, src: &str, _file: &std::path::Path) -> Result<Module, String> {
+        self.compile(src)
+    }
     fn kernel(&self, module: &Module, name: &str) -> Result<Kernel, String>;
     /// Launches `grid` workgroups of `block` threads each.
     fn launch(

@@ -737,19 +737,31 @@ impl Tokenizer {
         }
         ids
     }
+    /// Encodes a mid-stream continuation fragment without prepending BOS or SentencePiece leading `▁`.
+    pub fn encode_fragment(&self, text: &str) -> Vec<u32> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        if !self.add_space_prefix {
+            if let Some(Ok(enc)) = self.hf.as_ref().map(|hf| hf.encode_fast(text, false)) {
+                return enc.get_ids().to_vec();
+            }
+        }
+        self.encode_greedy_opts(text, false)
+    }
 
     /// Greedy longest-match encoding against vocabulary, falling back to raw byte tokens
     /// (GGUF / synthetic vocabs). SentencePiece vocabs see spaces as '▁' (plus the declared
     /// dummy prefix), like HF `Metaspace`.
     fn encode_greedy(&self, text: &str) -> Vec<u32> {
+        self.encode_greedy_opts(text, self.add_space_prefix)
+    }
+
+    fn encode_greedy_opts(&self, text: &str, add_prefix: bool) -> Vec<u32> {
         let mut tokens: Vec<u32> = Vec::new();
         let spm_text;
         let text = if self.spm && !text.is_empty() {
-            let prefix = if self.add_space_prefix {
-                "\u{2581}"
-            } else {
-                ""
-            };
+            let prefix = if add_prefix { "\u{2581}" } else { "" };
             spm_text = format!("{prefix}{}", text.replace(' ', "\u{2581}"));
             spm_text.as_str()
         } else {
@@ -1428,7 +1440,7 @@ pub fn byte_bpe_from_vocab_merges(dir: &std::path::Path) -> Result<tokenizers::T
 mod byte_bpe_tests {
     use super::*;
 
-#[test]
+    #[test]
     fn tokenizer_is_built_from_vocab_and_merges_and_splits_out_special_tokens() {
         let dir = std::env::temp_dir().join(format!("gibbs-qwen1-tok-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1446,27 +1458,31 @@ mod byte_bpe_tests {
         assert_eq!(ids("<|im_start|>hi<|im_end|>"), [4, 3, 5]);
         // As the diffusion runtime loads it: serialized, then read as a tokenizer.json.
         let json = tok.to_string(false).unwrap();
-        let t = crate::model::hf_loader::tokenizer_from_files(&json, &|n| std::fs::read(dir.join(n)).ok()).unwrap();
+        let t = crate::model::hf_loader::tokenizer_from_files(&json, &|n| {
+            std::fs::read(dir.join(n)).ok()
+        })
+        .unwrap();
         assert_eq!(t.encode("<|im_start|>hi hi<|im_end|>"), [4, 3, 2, 3, 5]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
 
     /// `GIBBS_QWEN1_TOKENIZER`: Qwen-Image's `tokenizer/` files (vocab.json, merges.txt,
     /// added_tokens.json) next to `ref_tokenizer.json` (Qwen2.5-VL's tokenizer.json): the tokenizer
     /// built from the former must give the latter's ids, and the template head must be 34 tokens.
     #[test]
     fn real_tokenizer_matches_the_reference_tokenizer_json() {
-        let Some(dir) = std::env::var_os("GIBBS_QWEN1_TOKENIZER").map(std::path::PathBuf::from) else {
+        let Some(dir) = std::env::var_os("GIBBS_QWEN1_TOKENIZER").map(std::path::PathBuf::from)
+        else {
             eprintln!("SKIP: GIBBS_QWEN1_TOKENIZER not set");
             return;
         };
         let built = byte_bpe_from_vocab_merges(&dir).unwrap();
         let reference = tokenizers::Tokenizer::from_file(dir.join("ref_tokenizer.json")).unwrap();
-        let rt = crate::model::hf_loader::tokenizer_from_files(&built.to_string(false).unwrap(), &|n| {
-            std::fs::read(dir.join(n)).ok()
-        })
-        .unwrap();
+        let rt =
+            crate::model::hf_loader::tokenizer_from_files(&built.to_string(false).unwrap(), &|n| {
+                std::fs::read(dir.join(n)).ok()
+            })
+            .unwrap();
         let ids =
             |t: &tokenizers::Tokenizer, s: &str| t.encode(s, false).unwrap().get_ids().to_vec();
         for s in [

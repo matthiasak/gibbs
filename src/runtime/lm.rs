@@ -88,6 +88,8 @@ pub struct Seq {
     rows: Vec<(String, usize, Vec<f32>)>,
     taps: Vec<usize>,
     tapped: Vec<f32>,
+    /// Last 2 committed `(pos, tap_row)` pairs for `Boundary.last_taps` prefix-cache export.
+    last_tap_rows: Vec<(usize, Vec<f32>)>,
     /// Recurrent-state snapshots after each position from `ckpt_from` (the last `forward_all`).
     ckpt: Vec<HashMap<String, Tensor>>,
     ckpt_from: usize,
@@ -108,6 +110,7 @@ impl Seq {
             rows,
             taps: Vec::new(),
             tapped: Vec::new(),
+            last_tap_rows: Vec::new(),
             ckpt: Vec::new(),
             ckpt_from: 0,
             recurrent_ahead: false,
@@ -151,6 +154,9 @@ pub struct SpecLm {
     /// The decode instance takes exactly `[token_ids, positions]`, outputs `logits` first and
     /// holds no recurrent state: greedy decode may stream on the device.
     streams: bool,
+    /// Plain decode steps of several sequences may share one ragged pass
+    /// ([`GraphProgram::run_ragged`]): streams, paged KV only. Cleared when a pass fails.
+    ragged: std::sync::atomic::AtomicBool,
     weights: usize,
     mode: PlacementMode,
     /// The spec's own drafter (`runtime.drafter`), compiled at the first ask.
@@ -390,7 +396,10 @@ impl SpecLm {
         let shapes = ShapeCache::new(TEXT);
         let v = vars(1, "last", &[], 0);
         let decode = shapes.get(&v, || {
-            build(&model.spec, TEXT, &model.env, &model.store, &v)
+            let t = std::time::Instant::now();
+            let r = build(&model.spec, TEXT, &model.env, &model.store, &v);
+            crate::graph::phase_time("arch.build", t, "rows=1 head=last");
+            r
         })?;
         let media = match &rt.media {
             Some(raw) => media::resolve(raw, &model.env).map_err(|e| format!("{fam}: {e}"))?,
@@ -460,6 +469,7 @@ impl SpecLm {
                 .iter()
                 .map(|i| i.name.as_str())
                 .eq(["token_ids", "positions"]);
+        let ragged = streams && recurrent.is_empty() && contiguous.is_empty() && kv_pool.is_some();
         Ok(Self {
             rt,
             media,
@@ -474,6 +484,7 @@ impl SpecLm {
             contiguous,
             kv_pool,
             streams,
+            ragged: ragged.into(),
             weights: decode.weights.len(),
             mode,
             drafter: Default::default(),
@@ -507,8 +518,81 @@ impl SpecLm {
     ) -> Result<Arc<Instance>, String> {
         let v = vars(rows, head, taps, media);
         let m = &self.model;
-        self.shapes
-            .get(&v, || build(&m.spec, TEXT, &m.env, &m.store, &v))
+        self.shapes.get(&v, || {
+            let t = std::time::Instant::now();
+            let r = build(&m.spec, TEXT, &m.env, &m.store, &v);
+            crate::graph::phase_time("arch.build", t, &format!("rows={rows} head={head}"));
+            r
+        })
+    }
+
+    /// One ragged decode pass: `items[b]`'s token at its position, every sequence's own KV pages,
+    /// the weights read once. `None` when a sequence cannot join (mid-block, tapped, at its end)
+    /// or the program is not one Metal segment.
+    fn ragged_step(
+        &self,
+        items: &mut [(u32, usize, &mut SeqState)],
+    ) -> Result<Option<Vec<f32>>, String> {
+        let n = items.len();
+        let mut seqs = Vec::with_capacity(n);
+        let (mut toks, mut pos) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for (tok, start, st) in items.iter_mut() {
+            let seq = Self::seq(st)?;
+            self.drain_stream(seq)?;
+            let stored = *start + 1 - seq.state.kv.as_ref().map_or(0, |kv| kv.evicted);
+            if seq.recurrent_ahead
+                || *start != seq.asked
+                || *start != seq.len
+                || !seq.taps.is_empty()
+                || *start >= self.max_positions
+                || stored > self.ctx
+            {
+                return Ok(None);
+            }
+            toks.push(*tok);
+            pos.push(*start as u32);
+            seqs.push(seq);
+        }
+        let inst = self.instance(n, "all", &[], 0)?;
+        let li = inst
+            .output_index("logits")
+            .ok_or("the text component has no `logits` output")?;
+        let inputs = inst
+            .inputs
+            .iter()
+            .map(|d| match (&d.gen, d.name.as_str()) {
+                (None, "token_ids") => Ok(Tensor::U32(toks.clone())),
+                (None, "positions") => Ok(Tensor::U32(pos.clone())),
+                _ => Err(format!("ragged decode cannot fill input `{}`", d.name)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut states: Vec<&mut StateStore> = seqs.iter_mut().map(|s| &mut s.state).collect();
+        let out = self
+            .program
+            .lock()
+            .run_ragged(&inst.graph, &mut states, inputs)?;
+        let Some(mut out) = out else {
+            return Ok(None);
+        };
+        let Some(Tensor::F32(logits)) = out
+            .get_mut(li)
+            .map(|t| std::mem::replace(t, Tensor::U32(Vec::new())))
+        else {
+            return Err("the text component returned no f32 logits".into());
+        };
+        if logits.len() % n != 0 {
+            return Err(format!(
+                "{} logits do not split into {n} rows",
+                logits.len()
+            ));
+        }
+        for (seq, &tok) in seqs.iter_mut().zip(&toks) {
+            seq.ids.truncate(seq.len);
+            seq.ids.push(tok);
+            seq.len += 1;
+            seq.asked = seq.len;
+        }
+        Ok(Some(logits))
     }
 
     /// `ids` with `media` laid out by the spec: each item measured (`encode`: also preprocessed
@@ -712,6 +796,11 @@ impl SpecLm {
         let mut at = from;
         while at < stop {
             let mut e = (at + cap).min(stop);
+            if p.primary_device() == crate::hardware::Device::Xla && e - at > 1 && blocks.is_empty()
+            {
+                let rem = e - at;
+                e = at + (1usize << rem.ilog2());
+            }
             if let Some(b) = blocks.iter().find(|b| b.start < e && e < b.end) {
                 e = b.end;
             }
@@ -773,10 +862,16 @@ impl SpecLm {
                     })
                     .collect::<Result<Vec<&[f32]>, String>>()?;
                 for r in 0..rows {
+                    let mut row_vec = Vec::new();
                     for t in &taps {
                         let h = t.len() / rows;
-                        seq.tapped.extend_from_slice(&t[r * h..(r + 1) * h]);
+                        row_vec.extend_from_slice(&t[r * h..(r + 1) * h]);
                     }
+                    seq.tapped.extend_from_slice(&row_vec);
+                    if seq.last_tap_rows.len() >= 18 {
+                        seq.last_tap_rows.remove(0);
+                    }
+                    seq.last_tap_rows.push((at + r, row_vec));
                 }
             }
             if ckpt {
@@ -946,6 +1041,23 @@ impl NativeLm for SpecLm {
         logits_of(self.run(tokens, start_pos, state, Mode::Last)?)
     }
 
+    fn step_batch(&self, items: &mut [(u32, usize, &mut SeqState)]) -> Result<Vec<f32>, String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if items.len() >= 2 && self.ragged.load(Relaxed) {
+            // A failed pass leaves at most reserved pages and rewritten rows at the new positions,
+            // which the per-sequence forwards below write again.
+            match self.ragged_step(items) {
+                Ok(Some(logits)) => return Ok(logits),
+                Ok(None) => {}
+                Err(e) => {
+                    self.ragged.store(false, Relaxed);
+                    tracing::warn!("ragged batched decode disabled: {e}");
+                }
+            }
+        }
+        crate::model::native::step_each(self, items)
+    }
+
     fn stream_greedy_token(
         &self,
         last: u32,
@@ -1034,6 +1146,135 @@ impl NativeLm for SpecLm {
         logits_of(self.run(tokens, start_pos, state, Mode::All)?)
     }
 
+    fn verify_topk(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        temp: f32,
+        top_p: f32,
+        vocab: usize,
+        state: &mut SeqState,
+    ) -> Result<Vec<Vec<(u32, f32)>>, String> {
+        let can_gpu = {
+            let seq = Self::seq(state)?;
+            self.recurrent.is_empty()
+                && !seq.recurrent_ahead
+                && !tokens.is_empty()
+                && tokens.len() <= self.rt.prefill_rows.max(1)
+                && start_pos == seq.asked
+                && seq.len == seq.asked
+                && start_pos + tokens.len() <= self.max_positions
+                && (start_pos + tokens.len() - seq.state.kv.as_ref().map_or(0, |kv| kv.evicted))
+                    <= self.ctx
+                && (!self.rt.bidir_media_blocks || seq.blocks.is_empty())
+                && seq.media_in(start_pos, start_pos + tokens.len()).is_empty()
+        };
+        if can_gpu {
+            let seq = Self::seq(state)?;
+            self.drain_stream(seq)?;
+            let rows = tokens.len();
+            let end = start_pos + rows;
+            let inst = self.instance(rows, "all", &seq.taps, 0)?;
+            if let Some(li) = inst.output_index("logits") {
+                let prev_len = seq.len;
+                seq.ckpt.clear();
+                seq.ckpt_from = prev_len;
+                seq.ids.truncate(prev_len);
+                seq.ids.extend_from_slice(tokens);
+                let pass = Pass {
+                    hist: &seq.ids[..end],
+                    pos0: prev_len,
+                    blocks: &[],
+                    seq,
+                };
+                let inputs = inst
+                    .inputs
+                    .iter()
+                    .map(|d| input(d, &pass))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut p = self.program.lock();
+                std::mem::swap(&mut p.state, &mut seq.state);
+                let gpu_res = p.run_reshaped_topk_rows(
+                    &inst.graph,
+                    inputs,
+                    li,
+                    crate::scheduler::SAMPLE_TOP_K,
+                    temp,
+                    top_p,
+                    vocab,
+                );
+                std::mem::swap(&mut p.state, &mut seq.state);
+                match gpu_res {
+                    Ok(Some((dists, out))) => {
+                        if !seq.taps.is_empty() {
+                            let taps = seq
+                                .taps
+                                .iter()
+                                .map(|l| {
+                                    let i = inst
+                                        .output_index(&format!("layer.{l}"))
+                                        .ok_or_else(|| format!("tap `layer.{l}` missing"))?;
+                                    out[i].as_f32()
+                                })
+                                .collect::<Result<Vec<&[f32]>, String>>()?;
+                            for r in 0..rows {
+                                let mut row_vec = Vec::new();
+                                for t in &taps {
+                                    let h = t.len() / rows;
+                                    row_vec.extend_from_slice(&t[r * h..(r + 1) * h]);
+                                }
+                                seq.tapped.extend_from_slice(&row_vec);
+                                if seq.last_tap_rows.len() >= 18 {
+                                    seq.last_tap_rows.remove(0);
+                                }
+                                seq.last_tap_rows.push((prev_len + r, row_vec));
+                            }
+                        }
+                        seq.len = end;
+                        seq.asked = end;
+                        return Ok(dists);
+                    }
+                    Ok(None) => {
+                        seq.ids.truncate(prev_len);
+                    }
+                    Err(e) => {
+                        seq.ids.truncate(prev_len);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let logits = self.forward_all(tokens, start_pos, state)?;
+        if logits.is_empty() || logits.len() % tokens.len() != 0 {
+            return Err(format!(
+                "verify returned {} logits for {} positions",
+                logits.len(),
+                tokens.len()
+            ));
+        }
+        let width = logits.len() / tokens.len();
+        let valid = if vocab > 0 { width.min(vocab) } else { width };
+        let greedy = temp <= 1e-4;
+        Ok(logits
+            .chunks_exact(width)
+            .map(|row| {
+                let l = &row[..valid];
+                if greedy {
+                    let t = sample_logits(l, &[], temp, crate::scheduler::SAMPLE_TOP_K, top_p, 0);
+                    vec![(t, 1.0)]
+                } else {
+                    let (cands, probs, n) = nucleus(l, temp, crate::scheduler::SAMPLE_TOP_K, top_p);
+                    let sum: f32 = probs[..n].iter().sum::<f32>().max(1e-30);
+                    cands[..n]
+                        .iter()
+                        .zip(&probs[..n])
+                        .map(|(&(t, _), &p)| (t as u32, p / sum))
+                        .collect()
+                }
+            })
+            .collect())
+    }
+
     fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {
         let seq = Self::seq(state)?;
         self.drain_stream(seq)?;
@@ -1064,6 +1305,7 @@ impl NativeLm for SpecLm {
         seq.ahead.clear();
         (seq.len, seq.asked) = (len, len);
         seq.ids.truncate(len);
+        seq.last_tap_rows.retain(|(p, _)| *p < len);
         if let Some(kv) = seq.state.kv.as_mut() {
             kv.release_from(len);
         }
@@ -1086,7 +1328,9 @@ impl NativeLm for SpecLm {
             .get_or_init(|| {
                 let embed = self.embed.clone();
                 let rows: crate::runtime::draft::EmbedRows = Arc::new(move |table, id, out| {
-                    embed.as_ref().is_some_and(|t| t.name == table && t.row(id, out))
+                    embed
+                        .as_ref()
+                        .is_some_and(|t| t.name == table && t.row(id, out))
                 });
                 crate::runtime::draft::spec_drafter(&self.model, self.mode, rows)
                     .map_err(|e| tracing::warn!("drafter: {e}"))
@@ -1113,7 +1357,8 @@ impl NativeLm for SpecLm {
 
     fn fork_state(&self, state: &SeqState) -> Option<SeqState> {
         let s = state.downcast_ref::<Seq>()?;
-        let plain = s.state.stream.0.is_none() && s.media.media_index.is_empty() && s.taps.is_empty();
+        let plain =
+            s.state.stream.0.is_none() && s.media.media_index.is_empty() && s.taps.is_empty();
         if !plain || !self.recurrent.is_empty() || s.asked != s.len {
             return None;
         }
@@ -1152,21 +1397,32 @@ impl NativeLm for SpecLm {
 
     fn kv_export(&self, state: &SeqState, len: usize) -> Option<crate::kv::KvExport> {
         let seq = state.downcast_ref::<Seq>()?;
-        if len == 0 || seq.len < len || seq.recurrent_ahead || !seq.taps.is_empty() {
+        if len == 0 || seq.len < len || seq.recurrent_ahead {
             return None;
         }
-        let boundary = self.needs_boundary();
-        if boundary && seq.len != len {
+        let last_taps = if !seq.taps.is_empty() {
+            Some(
+                seq.last_tap_rows
+                    .iter()
+                    .find(|(p, _)| *p + 1 == len)?
+                    .1
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let boundary = self.needs_boundary() || last_taps.is_some();
+        if self.needs_boundary() && seq.len != len {
             return None;
         }
         let recurrent = boundary.then(|| {
             let names: Vec<&str> = self.contiguous.iter().map(String::as_str).collect();
             seq.state.snapshot(&names)
         });
-        match &seq.state.kv {
-            Some(v) if v.evicted == 0 => v.export(len, recurrent).ok(),
-            Some(_) => None,
-            None if self.kv_pool.is_none() => Some(crate::kv::KvExport {
+        let mut exp = match &seq.state.kv {
+            Some(v) if v.evicted == 0 => v.export(len, recurrent).ok()?,
+            Some(_) => return None,
+            None if self.kv_pool.is_none() => crate::kv::KvExport {
                 pool: None,
                 pages: Vec::new(),
                 boundary: recurrent.map(|recurrent| crate::kv::Boundary {
@@ -1174,15 +1430,20 @@ impl NativeLm for SpecLm {
                     rings: Vec::new(),
                     recurrent,
                     pool: None,
+                    last_taps: None,
                 }),
-            }),
-            None => None,
+            },
+            None => return None,
+        };
+        if let (Some(b), Some(t)) = (exp.boundary.as_mut(), last_taps) {
+            b.last_taps = Some(t);
         }
+        Some(exp)
     }
 
     fn kv_restore(&self, state: &mut SeqState, m: &crate::kv::Match) -> Option<usize> {
         let seq = Self::seq(state).ok()?;
-        if seq.len != 0 || !seq.taps.is_empty() {
+        if seq.len != 0 {
             return None;
         }
         let same_pool = match (&self.kv_pool, &m.pool) {
@@ -1190,10 +1451,18 @@ impl NativeLm for SpecLm {
             (a, b) => a.is_none() && b.is_none(),
         };
         let b = m.boundary.as_deref();
-        let mut len = if self.needs_boundary() { b?.len } else { m.len };
+        let need_tap = !seq.taps.is_empty();
+        if need_tap && b.and_then(|x| x.last_taps.as_ref()).is_none() {
+            return None;
+        }
+        let mut len = if self.needs_boundary() || need_tap {
+            b?.len
+        } else {
+            m.len
+        };
         // Never resume inside a bidirectional block: its rows saw the whole block.
         if let Some(blk) = seq.blocks.iter().find(|r| r.start < len && len < r.end) {
-            if self.needs_boundary() {
+            if self.needs_boundary() || need_tap {
                 return None;
             }
             len = blk.start;
@@ -1208,6 +1477,13 @@ impl NativeLm for SpecLm {
         }
         if self.needs_boundary() {
             seq.state.restore(b?.recurrent.clone());
+        }
+        seq.tapped.clear();
+        seq.last_tap_rows.clear();
+        if need_tap {
+            let taps = b?.last_taps.as_ref()?.clone();
+            seq.tapped = taps.clone();
+            seq.last_tap_rows.push((len - 1, taps));
         }
         seq.len = len;
         seq.asked = len;
@@ -1293,14 +1569,15 @@ fn argmax_first(slice: &[f32]) -> usize {
 }
 
 /// Samples a token id from `slice` (logits over the tokenizer's vocabulary) with top-k and nucleus
-/// top-p, the draw seeded by `recent_tokens`; `temperature <= 1e-4` is greedy argmax. Shared by
-/// every causal LM the scheduler runs.
+/// top-p, the draw seeded by `recent_tokens` and `seed` (sequences of equal history draw apart);
+/// `temperature <= 1e-4` is greedy argmax. Shared by every causal LM the scheduler runs.
 pub fn sample_logits(
     slice: &[f32],
     recent_tokens: &[u32],
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    seed: u64,
 ) -> u32 {
     if slice.is_empty() {
         return 0;
@@ -1315,8 +1592,10 @@ pub fn sample_logits(
     let active_sum: f32 = active_probs.iter().sum();
 
     // 3. Step-varying seeded PRNG mixing token history and active distribution
-    let mut hash =
-        0x811c9dc5u32.wrapping_add((recent_tokens.len() as u32).wrapping_mul(0x9e3779b9));
+    let mut hash = 0x811c9dc5u32
+        .wrapping_add((recent_tokens.len() as u32).wrapping_mul(0x9e3779b9))
+        ^ (seed as u32)
+        ^ ((seed >> 32) as u32);
     for (pos, &tok) in recent_tokens.iter().enumerate() {
         hash ^= tok.wrapping_mul(0x5bd1e995).wrapping_add(pos as u32);
         hash = hash.rotate_left(13).wrapping_mul(0x01000193);
@@ -1540,7 +1819,7 @@ mod tests {
             let temp = temps[i % temps.len()];
             let top_p = top_ps[(i / 3) % top_ps.len()];
             let top_k = [1usize, 10, 50, 64][i % 4];
-            let got = sample_logits(&logits, &recent, temp, top_k, top_p);
+            let got = sample_logits(&logits, &recent, temp, top_k, top_p, 0);
             let want = brute_force(&logits, &recent, temp, top_k, top_p);
             assert_eq!(
                 got, want,
@@ -1660,6 +1939,68 @@ mod tests {
         assert!(d <= tol * scale, "max diff {d} (scale {scale})");
     }
 
+    /// Ragged batched decode of sequences at different positions matches each sequence decoded
+    /// alone (logits and greedy tokens), and leaves every sequence able to continue on its own.
+    #[test]
+    fn ragged_batch_matches_single_sequence_decode() {
+        if !crate::hardware::available_devices().contains(&Device::Metal) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let a = crate::arch::testing::synthetic_llama(dir.path(), serde_json::json!({}));
+        let exact = ReencodeConfig {
+            policy: ReencodePolicy::BitExact,
+            ..Default::default()
+        };
+        let reg = crate::arch::registry().unwrap();
+        let m = crate::arch::load::load_with(&a, reg, Some("llama"), exact).unwrap();
+        let lm = SpecLm::with_ctx(m, PlacementMode::Pin(Device::Metal), Some(256)).unwrap();
+        assert!(lm.ragged.load(std::sync::atomic::Ordering::Relaxed));
+        // Prompts straddle a 64-row page so sequences hold different page counts.
+        let prompts: Vec<Vec<u32>> = [5usize, 70, 23]
+            .iter()
+            .map(|&n| (0..n as u32).map(|i| 3 + (i * 7) % 200).collect())
+            .collect();
+        let argmax =
+            |l: &[f32]| (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
+        let start = |p: &[u32]| {
+            let mut s = fresh(&lm, p);
+            let l = lm.forward(p, 0, &mut s).unwrap();
+            (s, argmax(&l))
+        };
+        let (mut solo, mut batch): (Vec<_>, Vec<_>) =
+            prompts.iter().map(|p| (start(p), start(p))).unzip();
+        for step in 0..4 {
+            let mut items: Vec<(u32, usize, &mut SeqState)> = batch
+                .iter_mut()
+                .zip(&prompts)
+                .map(|((s, t), p)| (*t, p.len() + step, s))
+                .collect();
+            let got = lm
+                .ragged_step(&mut items)
+                .unwrap()
+                .expect("every sequence joins");
+            drop(items);
+            for (b, ((s, t), p)) in solo.iter_mut().zip(&prompts).enumerate() {
+                let want = lm.forward(&[*t], p.len() + step, s).unwrap();
+                let w = got.len() / prompts.len();
+                close(&got[b * w..(b + 1) * w], &want, tol(Device::Metal));
+                // Both continue from the solo pick (synthetic logits may tie within an ulp).
+                *t = argmax(&want);
+                batch[b].1 = *t;
+            }
+        }
+        // Each batched sequence continues alone exactly where the batch left it.
+        for (((s, t), (s_ref, t_ref)), p) in batch.iter_mut().zip(solo.iter_mut()).zip(&prompts) {
+            let got = lm.forward(&[*t], p.len() + 4, s).unwrap();
+            close(
+                &got,
+                &lm.forward(&[*t_ref], p.len() + 4, s_ref).unwrap(),
+                tol(Device::Metal),
+            );
+        }
+    }
+
     /// Logits of `PROMPT` prefilled in 4-row passes equal one 64-row pass; decoding the tail one
     /// token at a time equals `forward_all`'s rows; the greedy pick is the logits' argmax.
     #[test]
@@ -1686,8 +2027,8 @@ mod tests {
             let mut s = fresh(&chunked, &PROMPT);
             chunked.forward(&PROMPT[..11], 0, &mut s).unwrap();
             let l = chunked.forward(&PROMPT[11..], 11, &mut s).unwrap();
-            let t = sample_logits(&l, &[], 0.0, 50, 1.0);
-            assert_eq!(t, sample_logits(&b, &[], 0.0, 50, 1.0), "{dev:?}");
+            let t = sample_logits(&l, &[], 0.0, 50, 1.0, 0);
+            assert_eq!(t, sample_logits(&b, &[], 0.0, 50, 1.0, 0), "{dev:?}");
             assert!(chunked.forward(&PROMPT[..1], 3, &mut s).is_err());
         }
     }

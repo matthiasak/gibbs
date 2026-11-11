@@ -197,6 +197,10 @@ struct Cli {
     #[arg(long)]
     reencode_max_kl: Option<f32>,
 
+    /// On-the-fly HOPE progressive weight compression (arXiv:2607.21366): off [default], light (90%), balanced (80%), aggressive (70%), or density 0.50..0.99.
+    #[arg(long)]
+    hope: Option<String>,
+
     /// Variant policy of the model picker and downloads: fastest | fastest-4bit | best-quality
     /// (default: settings.json, else fastest).
     #[arg(long)]
@@ -238,7 +242,7 @@ struct Cli {
 
 /// `--draft` values that select the built-in online drafter rather than a drafter repo.
 fn is_online_draft(d: &str) -> bool {
-    matches!(d, "noise" | "online-noise" | "suffix")
+    matches!(d, "noise" | "online-noise" | "noise-dflash" | "suffix")
 }
 
 fn clock_seed() -> u64 {
@@ -327,10 +331,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(v) = &cli.variant {
         gibbs_engine::model::variant::set_policy_override(Some(v.parse()?));
     }
-    if cli.reencode.is_some() || cli.reencode_max_kl.is_some() {
+    if cli.reencode.is_some() || cli.reencode_max_kl.is_some() || cli.hope.is_some() {
         gibbs_engine::model::weight_format::set_reencode_override(Some(ReencodeConfig::resolve(
             cli.reencode.as_deref(),
             cli.reencode_max_kl,
+            cli.hope.as_deref(),
         )?));
     }
     // The one-shot Metal tools (--bench, --bench-parity, --probe-top5, --explain-placement) exit before the
@@ -487,7 +492,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Checking model source: '{}' (storage: {:?})",
         cli.model, hub.storage
     ));
-    let mut reencode = ReencodeConfig::resolve(cli.reencode.as_deref(), cli.reencode_max_kl)?;
+    let mut reencode = ReencodeConfig::resolve(
+        cli.reencode.as_deref(),
+        cli.reencode_max_kl,
+        cli.hope.as_deref(),
+    )?;
     reencode.force = quant_override;
     let t = telemetry.clone();
     reencode.log = Some(Arc::new(move |m: &str| t.log_info(m)));
@@ -715,7 +724,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The roofline basis follows the policy the load applied (the gate may have fallen back).
             let applied = gibbs_engine::bench::applied_policy();
             if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, &applied) {
-                telemetry.set_model_size_bytes(b);
+                let scaled = (b as f64 * gibbs_engine::graph::passes::hope::last_byte_ratio())
+                    .round() as u64;
+                telemetry.set_model_size_bytes(scaled);
             }
             let resident = artifacts
                 .weights_path

@@ -19,7 +19,26 @@ pub enum Ty {
     F32,
     BF16,
     I32,
+    I8,
     I1,
+}
+
+/// How a weight is stored on the XLA device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightSpec {
+    Plain(usize, Ty),
+    /// On-device packed `GGUF_Q8_0` (`n` elements, `n % 32 == 0`): `i8[n]` quants + `bf16[n/32]` scales.
+    Q8_0(usize),
+    /// On-device packed `GGUF_Q4_0` (`n` elements, `n % 32 == 0`): `i8[n/2]` nibble pairs + `bf16[n/32]` scales.
+    Q4_0(usize),
+}
+
+impl WeightSpec {
+    pub fn len(self) -> usize {
+        match self {
+            Self::Plain(n, _) | Self::Q8_0(n) | Self::Q4_0(n) => n,
+        }
+    }
 }
 
 impl Ty {
@@ -28,6 +47,7 @@ impl Ty {
             Ty::F32 => "f32",
             Ty::BF16 => "bf16",
             Ty::I32 => "i32",
+            Ty::I8 => "i8",
             Ty::I1 => "i1",
         }
     }
@@ -81,6 +101,8 @@ pub struct Module {
     pub outputs: Vec<(usize, Ty)>,
     /// Element count and type of every parameter, in order.
     pub params: Vec<(usize, Ty)>,
+    /// Compact `(state_name, nq, row_width)` slices of newly written paged KV rows appended after `written`.
+    pub paged_deltas: Vec<(String, usize, usize)>,
 }
 
 /// One page class of the graph's paged KV states, bound as page windows: each named state's
@@ -100,7 +122,7 @@ pub struct PagedClass {
 /// page classes whose states are bound as windows.
 pub fn emit(
     g: &Graph,
-    weight: &dyn Fn(&str) -> Option<(usize, Ty)>,
+    weight: &dyn Fn(&str) -> Option<WeightSpec>,
     states: &HashMap<String, Vec<usize>>,
     paged: &[PagedClass],
 ) -> Result<Module, String> {
@@ -155,14 +177,52 @@ pub fn emit(
         }
     }
     for (i, name) in weights.iter().enumerate() {
-        let (n, ty) = weight(name).ok_or_else(|| format!("weight '{name}' is missing"))?;
-        let p = V {
-            name: format!("%w{i}"),
-            shape: vec![n],
-            ty,
-        };
-        params.push((p.name.clone(), p.t()));
-        layout.push((n, ty));
+        let spec = weight(name).ok_or_else(|| format!("weight '{name}' is missing"))?;
+        match spec {
+            WeightSpec::Plain(n, ty) => {
+                let p = V {
+                    name: format!("%w{i}"),
+                    shape: vec![n],
+                    ty,
+                };
+                params.push((p.name.clone(), p.t()));
+                layout.push((n, ty));
+            }
+            WeightSpec::Q8_0(n) => {
+                let b = n / 32;
+                let pq = V {
+                    name: format!("%w{i}"),
+                    shape: vec![n],
+                    ty: Ty::I8,
+                };
+                let ps = V {
+                    name: format!("%ws{i}"),
+                    shape: vec![b],
+                    ty: Ty::BF16,
+                };
+                params.push((pq.name.clone(), pq.t()));
+                layout.push((n, Ty::I8));
+                params.push((ps.name.clone(), ps.t()));
+                layout.push((b, Ty::BF16));
+            }
+            WeightSpec::Q4_0(n) => {
+                let b = n / 32;
+                let pq = V {
+                    name: format!("%w{i}"),
+                    shape: vec![b * 16],
+                    ty: Ty::I8,
+                };
+                let ps = V {
+                    name: format!("%ws{i}"),
+                    shape: vec![b],
+                    ty: Ty::BF16,
+                };
+                params.push((pq.name.clone(), pq.t()));
+                layout.push((b * 16, Ty::I8));
+                params.push((ps.name.clone(), ps.t()));
+                layout.push((b, Ty::BF16));
+            }
+        }
     }
     let first_state_param = params.len();
     for (i, name) in state_names.iter().enumerate() {
@@ -192,7 +252,8 @@ pub fn emit(
             vals.push(p);
         }
         let base = e.reshape(&vals[2], &[]);
-        e.classes.push((vals[0].clone(), vals[1].clone(), base, pc.ring));
+        e.classes
+            .push((vals[0].clone(), vals[1].clone(), base, pc.ring));
         for name in &pc.names {
             e.paged.insert(name.clone(), c);
         }
@@ -200,21 +261,81 @@ pub fn emit(
     // Weight values: flat param -> declared shape, f32 unless integer.
     for (i, v) in g.values.iter().enumerate() {
         if let (ValueKind::Weight, Some(&w)) = (&v.kind, weight_ids.get(&v.name)) {
-            let (n, ty) = weight(&v.name).expect("checked above");
-            let shape = if v.shape.is_empty() { vec![n] } else { v.shape.clone() };
+            let spec = weight(&v.name).expect("checked above");
+            let n = spec.len();
+            let shape = if v.shape.is_empty() {
+                vec![n]
+            } else {
+                v.shape.clone()
+            };
             if numel(&shape) != n {
                 return Err(format!(
                     "weight '{}' holds {n} elements, graph declares {:?}",
                     v.name, v.shape
                 ));
             }
-            let p = V {
-                name: format!("%w{w}"),
-                shape: vec![n],
-                ty,
+            let decoded = match spec {
+                WeightSpec::Plain(_, ty) => {
+                    let p = V {
+                        name: format!("%w{w}"),
+                        shape: vec![n],
+                        ty,
+                    };
+                    if ty == Ty::BF16 {
+                        e.convert(&p, Ty::F32)
+                    } else {
+                        p
+                    }
+                }
+                WeightSpec::Q8_0(_) => {
+                    let b = n / 32;
+                    let pq = V {
+                        name: format!("%w{w}"),
+                        shape: vec![n],
+                        ty: Ty::I8,
+                    };
+                    let ps = V {
+                        name: format!("%ws{w}"),
+                        shape: vec![b],
+                        ty: Ty::BF16,
+                    };
+                    let q2 = e.reshape(&pq, &[b, 32]);
+                    let qf = e.convert(&q2, Ty::F32);
+                    let sf = e.convert(&ps, Ty::F32);
+                    let sb = e.bcast(&sf, &[b, 32], &[0]);
+                    e.mul(&qf, &sb)
+                }
+                WeightSpec::Q4_0(_) => {
+                    let b = n / 32;
+                    let pq = V {
+                        name: format!("%w{w}"),
+                        shape: vec![b * 16],
+                        ty: Ty::I8,
+                    };
+                    let ps = V {
+                        name: format!("%ws{w}"),
+                        shape: vec![b],
+                        ty: Ty::BF16,
+                    };
+                    let q2 = e.reshape(&pq, &[b, 16]);
+                    let qi = e.convert(&q2, Ty::I32);
+                    let m255 = e.ki(255, &[b, 16]);
+                    let qu = e.and(&qi, &m255);
+                    let m15 = e.ki(15, &[b, 16]);
+                    let lo = e.and(&qu, &m15);
+                    let c4 = e.ki(4, &[b, 16]);
+                    let sh = e.bin("shift_right_logical", &qu, &c4);
+                    let hi = e.and(&sh, &m15);
+                    let nibs = e.concat(&[lo, hi], 1);
+                    let c8 = e.ki(8, &[b, 32]);
+                    let centered = e.sub(&nibs, &c8);
+                    let qf = e.convert(&centered, Ty::F32);
+                    let sf = e.convert(&ps, Ty::F32);
+                    let sb = e.bcast(&sf, &[b, 32], &[0]);
+                    e.mul(&qf, &sb)
+                }
             };
-            let p = if ty == Ty::BF16 { e.convert(&p, Ty::F32) } else { p };
-            e.vals[i] = Some(e.reshape(&p, &shape));
+            e.vals[i] = Some(e.reshape(&decoded, &shape));
         }
     }
     for node in &g.nodes {
@@ -223,7 +344,11 @@ pub fn emit(
         let v = e
             .node(node)
             .map_err(|err| format!("node '{}' ({}): {err}", node.name, node.op.name()))?;
-        let ty = if decl.dtype == DType::U32 { Ty::I32 } else { Ty::F32 };
+        let ty = if decl.dtype == DType::U32 {
+            Ty::I32
+        } else {
+            Ty::F32
+        };
         let v = e.cast(&v, ty);
         let v = if decl.shape.is_empty() {
             v
@@ -249,6 +374,7 @@ pub fn emit(
         rets.push(flat);
     }
     let written = e.written.clone();
+    let mut paged_deltas = Vec::new();
     for (j, name) in written.iter().enumerate() {
         let v = e.cur[name].clone();
         let flat = e.reshape(&v, &[numel(&v.shape)]);
@@ -259,6 +385,20 @@ pub fn emit(
                 .expect("written states are read states");
         params[p].1 += &format!(" {{tf.aliasing_output = {} : i32}}", outputs.len() + j);
         rets.push(flat);
+    }
+    for name in &written {
+        if let Some(&c) = e.paged.get(name) {
+            let v = e.cur[name].clone();
+            if v.shape.len() == 2 {
+                let w = v.shape[1];
+                let wslot = e.classes[c].1.clone();
+                let nq = wslot.shape[0];
+                let delta = e.gather_rows(&v, &wslot);
+                let flat = e.reshape(&delta, &[nq * w]);
+                rets.push(flat);
+                paged_deltas.push((name.clone(), nq, w));
+            }
+        }
     }
     let mut text = String::with_capacity(e.body.len() + 4096);
     let sig: Vec<String> = params.iter().map(|(n, t)| format!("{n}: {t}")).collect();
@@ -271,7 +411,12 @@ pub fn emit(
     );
     text += &e.body;
     let rn: Vec<&str> = rets.iter().map(|v| v.name.as_str()).collect();
-    let _ = writeln!(text, "    return {} : {}\n  }}\n}}", rn.join(", "), rty.join(", "));
+    let _ = writeln!(
+        text,
+        "    return {} : {}\n  }}\n}}",
+        rn.join(", "),
+        rty.join(", ")
+    );
     Ok(Module {
         text,
         weights,
@@ -279,6 +424,7 @@ pub fn emit(
         written,
         outputs,
         params: layout,
+        paged_deltas,
     })
 }
 
@@ -401,7 +547,10 @@ impl<'g> Em<'g> {
     fn sel(&mut self, p: &V, a: &V, b: &V) -> V {
         let (pt, at) = (p.t(), a.t());
         self.op(a.shape.clone(), a.ty, |_| {
-            format!("stablehlo.select {}, {}, {} : {pt}, {at}", p.name, a.name, b.name)
+            format!(
+                "stablehlo.select {}, {}, {} : {pt}, {at}",
+                p.name, a.name, b.name
+            )
         })
     }
 
@@ -576,7 +725,13 @@ impl<'g> Em<'g> {
     }
 
     /// `dot_general`: result dims are batch, lhs free, rhs free.
-    fn dot(&mut self, a: &V, b: &V, batch: (&[usize], &[usize]), contract: (&[usize], &[usize])) -> V {
+    fn dot(
+        &mut self,
+        a: &V,
+        b: &V,
+        batch: (&[usize], &[usize]),
+        contract: (&[usize], &[usize]),
+    ) -> V {
         let mut shape: Vec<usize> = batch.0.iter().map(|&d| a.shape[d]).collect();
         for (d, &n) in a.shape.iter().enumerate() {
             if !batch.0.contains(&d) && !contract.0.contains(&d) {
@@ -678,7 +833,11 @@ impl<'g> Em<'g> {
         let tag = self.n;
         let (kt, vt) = (keys.t(), vals.t());
         let (ks, vs) = (tstr(&[], keys.ty), tstr(&[], vals.ty));
-        let kind = if keys.ty == Ty::I32 { "SIGNED" } else { "FLOAT" };
+        let kind = if keys.ty == Ty::I32 {
+            "SIGNED"
+        } else {
+            "FLOAT"
+        };
         let _ = write!(
             self.body,
             "    {r}:2 = \"stablehlo.sort\"({}, {}) ({{\n    ^bb0(%q{tag}a: {ks}, %q{tag}b: {ks}, %q{tag}c: {vs}, %q{tag}d: {vs}):\n      %q{tag}p = stablehlo.compare {dir}, %q{tag}a, %q{tag}b, {kind} : ({ks}, {ks}) -> tensor<i1>\n      stablehlo.return %q{tag}p : tensor<i1>\n    }}) {{dimension = {dim} : i64, is_stable = true}} : ({kt}, {vt}) -> ({kt}, {vt})\n",
@@ -877,7 +1036,10 @@ impl<'g> Em<'g> {
     /// `x [rows, in] · w [out, in]ᵀ (+ bias)`.
     fn linear(&mut self, x: &V, w: &V, bias: Option<&V>) -> Result<V, String> {
         if w.shape.len() != 2 || w.shape[1] != x.shape[1] {
-            return Err(format!("x {:?} does not match weight {:?}", x.shape, w.shape));
+            return Err(format!(
+                "x {:?} does not match weight {:?}",
+                x.shape, w.shape
+            ));
         }
         let y = self.dot(x, w, (&[], &[]), (&[1], &[1]));
         Ok(match bias {
@@ -1021,7 +1183,11 @@ impl<'g> Em<'g> {
                     match (pa[i], pb[i]) {
                         (x, y) if x == y || y == 1 => ob.push(x),
                         (1, y) => ob.push(y),
-                        _ => return Err(format!("MatMul batch dims {sa:?} and {sb:?} do not broadcast")),
+                        _ => {
+                            return Err(format!(
+                                "MatMul batch dims {sa:?} and {sb:?} do not broadcast"
+                            ))
+                        }
                     }
                 }
                 let nb = numel(&ob);
@@ -1337,7 +1503,10 @@ impl<'g> Em<'g> {
                     let r = self.reshape(&r, &[n, heads, half, 2]);
                     let a = self.slice(&r, &[0, 0, 0, 0], &[n, heads, half, 1]);
                     let b = self.slice(&r, &[0, 0, 0, 1], &[n, heads, half, 2]);
-                    (self.reshape(&a, &[n, heads, half]), self.reshape(&b, &[n, heads, half]))
+                    (
+                        self.reshape(&a, &[n, heads, half]),
+                        self.reshape(&b, &[n, heads, half]),
+                    )
                 } else {
                     (
                         self.slice(&x3, &[0, 0, 0], &[n, heads, half]),
@@ -1368,7 +1537,11 @@ impl<'g> Em<'g> {
                 let table = self.flt(ins[0])?;
                 let (qp, kp) = (self.idx(ins[1])?, self.idx(ins[2])?);
                 let (n, m, h) = (numel(&qp.shape), numel(&kp.shape), *heads);
-                let nb = if *bidirectional { buckets / 2 } else { *buckets };
+                let nb = if *bidirectional {
+                    buckets / 2
+                } else {
+                    *buckets
+                };
                 if nb < 2 || *max_distance <= nb / 2 || numel(&table.shape) != buckets * h {
                     return Err("RelPosBias table/buckets/max_distance mismatch".into());
                 }
@@ -1493,7 +1666,10 @@ impl<'g> Em<'g> {
                     let tbk = self.k(tb as f64, &blocks);
                     let few = self.cmp("LE", &blocks, &tbk);
                     let few = self.bcast(&few, &[n, kk], &[0]);
-                    (self.sel(&few, &j, &keys), self.sel(&few, &simple_ok, &valid))
+                    (
+                        self.sel(&few, &j, &keys),
+                        self.sel(&few, &simple_ok, &valid),
+                    )
                 };
                 if matches!(node.op, Op::QsaSelect { .. }) {
                     let z = self.k(0.0, &ids);
@@ -1707,7 +1883,10 @@ impl<'g> Em<'g> {
                         } else if bn == h * nq * nk {
                             self.reshape(&b, &[h, nq, nk])
                         } else {
-                            return Err(format!("bias {:?} does not fit [{h}, {nq}, {nk}]", b.shape));
+                            return Err(format!(
+                                "bias {:?} does not fit [{h}, {nq}, {nk}]",
+                                b.shape
+                            ));
                         })
                     }
                     None => None,
@@ -1798,11 +1977,7 @@ impl<'g> Em<'g> {
                 let ids = self.reshape(&ids, &[ni]);
                 let xs = x.shape.clone();
                 let ax = Self::norm_axis(*axis, xs.len())?;
-                let (outer, dim, inner) = (
-                    numel(&xs[..ax]),
-                    xs[ax],
-                    numel(&xs[ax + 1..]),
-                );
+                let (outer, dim, inner) = (numel(&xs[..ax]), xs[ax], numel(&xs[ax + 1..]));
                 let x3 = self.reshape(&x, &[outer, dim, inner]);
                 let xt = self.transpose(&x3, &[1, 0, 2]);
                 let xt = self.reshape(&xt, &[dim, outer * inner]);
@@ -1845,10 +2020,22 @@ impl<'g> Em<'g> {
                     return Err(format!("Pad {padding:?} does not fit {:?}", x.shape));
                 }
                 let lo: Vec<usize> = (0..r)
-                    .map(|d| if d + k >= r { padding[2 * (d + k - r)] } else { 0 })
+                    .map(|d| {
+                        if d + k >= r {
+                            padding[2 * (d + k - r)]
+                        } else {
+                            0
+                        }
+                    })
                     .collect();
                 let hi: Vec<usize> = (0..r)
-                    .map(|d| if d + k >= r { padding[2 * (d + k - r) + 1] } else { 0 })
+                    .map(|d| {
+                        if d + k >= r {
+                            padding[2 * (d + k - r) + 1]
+                        } else {
+                            0
+                        }
+                    })
                     .collect();
                 let shape: Vec<usize> = (0..r).map(|d| x.shape[d] + lo[d] + hi[d]).collect();
                 let pv = self.kf(*value, &[]);
@@ -1873,7 +2060,10 @@ impl<'g> Em<'g> {
                     (1, 1, numel(&s))
                 };
                 let x = self.reshape(&x, &[c, h, w]);
-                let (oh, ow) = ((h - kernel[0]) / stride[0] + 1, (w - kernel[1]) / stride[1] + 1);
+                let (oh, ow) = (
+                    (h - kernel[0]) / stride[0] + 1,
+                    (w - kernel[1]) / stride[1] + 1,
+                );
                 let init = self.kf(0.0, &[]);
                 self.n += 1;
                 let tag = self.n;
@@ -1925,13 +2115,27 @@ impl<'g> Em<'g> {
                 padding,
                 dilation,
                 groups,
-            } => self.conv(node, 1, &[*stride], &[[padding[0], padding[1]]], &[*dilation], *groups),
+            } => self.conv(
+                node,
+                1,
+                &[*stride],
+                &[[padding[0], padding[1]]],
+                &[*dilation],
+                *groups,
+            ),
             Op::Conv2d {
                 stride,
                 padding: p,
                 dilation,
                 groups,
-            } => self.conv(node, 2, stride, &[[p[0], p[2]], [p[1], p[3]]], dilation, *groups),
+            } => self.conv(
+                node,
+                2,
+                stride,
+                &[[p[0], p[2]], [p[1], p[3]]],
+                dilation,
+                *groups,
+            ),
             Op::Conv3d {
                 stride,
                 padding: p,
@@ -2084,7 +2288,10 @@ impl<'g> Em<'g> {
             Op::Transpose { perm } => {
                 let x = self.val(ins[0])?;
                 if perm.len() != x.shape.len() {
-                    return Err(format!("{perm:?} is not a permutation of rank {}", x.shape.len()));
+                    return Err(format!(
+                        "{perm:?} is not a permutation of rank {}",
+                        x.shape.len()
+                    ));
                 }
                 Ok(self.transpose(&x, perm))
             }
@@ -2092,7 +2299,9 @@ impl<'g> Em<'g> {
                 let x = self.val(ins[0])?;
                 let r = x.shape.len().max(reps.len());
                 let pad = |v: &[usize]| -> Vec<usize> {
-                    std::iter::repeat_n(1, r - v.len()).chain(v.iter().copied()).collect()
+                    std::iter::repeat_n(1, r - v.len())
+                        .chain(v.iter().copied())
+                        .collect()
                 };
                 let (ish, rp) = (pad(&x.shape), pad(reps));
                 let x = self.reshape(&x, &ish);
@@ -2112,7 +2321,11 @@ impl<'g> Em<'g> {
                 for &i in ins {
                     parts.push(self.val(i)?);
                 }
-                let ty = if parts.iter().all(|p| p.ty == Ty::I32) { Ty::I32 } else { Ty::F32 };
+                let ty = if parts.iter().all(|p| p.ty == Ty::I32) {
+                    Ty::I32
+                } else {
+                    Ty::F32
+                };
                 let parts: Vec<V> = parts.iter().map(|p| self.cast(p, ty)).collect();
                 let rank = parts[0].shape.len();
                 let ax = Self::norm_axis(*axis, rank)?;
@@ -2135,7 +2348,10 @@ impl<'g> Em<'g> {
         let w = self.flt(ins[1])?;
         let x = self.flt(ins[0])?;
         if w.shape.len() != nd + 2 || x.shape.len() < nd + 1 {
-            return Err(format!("conv shapes {:?} / {:?} do not fit {nd}-d", x.shape, w.shape));
+            return Err(format!(
+                "conv shapes {:?} / {:?} do not fit {nd}-d",
+                x.shape, w.shape
+            ));
         }
         let xs = x.shape.clone();
         let c_in = xs[xs.len() - nd - 1];
@@ -2154,7 +2370,10 @@ impl<'g> Em<'g> {
         }
         let sp: Vec<String> = (0..nd).map(|i| i.to_string()).collect();
         let sp = sp.join(", ");
-        let pads: Vec<String> = pad.iter().map(|p| format!("[{}, {}]", p[0], p[1])).collect();
+        let pads: Vec<String> = pad
+            .iter()
+            .map(|p| format!("[{}, {}]", p[0], p[1]))
+            .collect();
         let (xt, wt) = (x.t(), w.t());
         let y = self.op(out.clone(), Ty::F32, |t| {
             format!(
@@ -2257,14 +2476,22 @@ impl<'g> Em<'g> {
         };
         let nk = self.ki(n as i64, &[]);
         let c = self.cmp("LT", &arg(0), &nk);
-        let _ = writeln!(self.body, "      stablehlo.return {} : tensor<i1>\n    }} do {{", c.name);
+        let _ = writeln!(
+            self.body,
+            "      stablehlo.return {} : tensor<i1>\n    }} do {{",
+            c.name
+        );
         let (t, s) = (arg(0), arg(1));
         let z = self.ki(0, &[]);
         let row = |e: &mut Self, x: &V, w: usize| -> V {
             let r = e.dslice(x, &[t.clone(), z.clone(), z.clone()], &[1, vh, w]);
             e.reshape(&r, &[vh, w])
         };
-        let (qt, kt, vt) = (row(self, &arg(3), kd), row(self, &arg(4), kd), row(self, &arg(5), vd));
+        let (qt, kt, vt) = (
+            row(self, &arg(3), kd),
+            row(self, &arg(4), kd),
+            row(self, &arg(5), vd),
+        );
         let bt = self.dslice(&arg(6), &[t.clone(), z.clone()], &[1, vh]);
         let bt = self.reshape(&bt, &[vh]);
         let dt = self.dslice(&arg(7), &[t.clone(), z.clone()], &[1, vh]);

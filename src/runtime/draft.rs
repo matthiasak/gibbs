@@ -275,8 +275,7 @@ impl AneSide {
         build: impl FnOnce(&AneInfo) -> Result<(AneDraft, f32), String>,
     ) -> Self {
         let pinned = mode == PlacementMode::Pin(Device::Ane);
-        let auto = mode == PlacementMode::Auto
-            && crate::hardware::available_devices().contains(&Device::Metal);
+        let auto = mode == PlacementMode::Auto && crate::hardware::device_available(Device::Metal);
         if !pinned && !auto {
             return Self::default();
         }
@@ -312,7 +311,9 @@ impl AneSide {
 
     /// The windows, when drafting runs on the ANE.
     fn active(&self) -> Option<&Mutex<AneDraft>> {
-        self.lane.as_ref().filter(|_| self.on.load(Ordering::Relaxed))
+        self.lane
+            .as_ref()
+            .filter(|_| self.on.load(Ordering::Relaxed))
     }
 }
 
@@ -372,8 +373,12 @@ pub fn spec_drafter(
         }
         let inputs = [("embed", &e[..]), ("hidden", &h[..])];
         let got = lane.run(MTP_DRAFT, &mut Ring::new(), 0, &inputs)?;
-        let li = b.build(&d.component, &mtp_vars(1, "draft"))?.output_index("logits");
-        let got = li.and_then(|i| got.into_iter().nth(i)).ok_or("no logits output")?;
+        let li = b
+            .build(&d.component, &mtp_vars(1, "draft"))?
+            .output_index("logits");
+        let got = li
+            .and_then(|i| got.into_iter().nth(i))
+            .ok_or("no logits output")?;
         let want = comp.run(
             &b,
             &mtp_vars(1, "draft"),
@@ -384,7 +389,10 @@ pub fn spec_drafter(
                 ("positions", positions(0, 1)),
             ]),
         )?;
-        Ok((lane, crate::graph::ane::rel_rms(&got, &f32_out(&want, "logits")?)))
+        Ok((
+            lane,
+            crate::graph::ane::rel_rms(&got, &f32_out(&want, "logits")?),
+        ))
     });
     Ok(Some(Arc::new(Mtp {
         label,
@@ -466,7 +474,9 @@ impl Mtp {
         (tok, hidden, pos): (u32, &[f32], usize),
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
         let src = if i == MTP_TAP { "tap" } else { "draft" };
-        let inst = self.comp.shapes.get(&mtp_vars(1, src), || self.b.build(&self.comp.name, &mtp_vars(1, src)))?;
+        let inst = self.comp.shapes.get(&mtp_vars(1, src), || {
+            self.b.build(&self.comp.name, &mtp_vars(1, src))
+        })?;
         let table = inst
             .graph
             .nodes
@@ -479,7 +489,10 @@ impl Mtp {
             return Err(format!("no row {tok} of {}", table.name));
         }
         let mut out = lane.run(i, r, pos, &[("embed", &e), ("hidden", hidden)])?;
-        let at = |n: &str| inst.output_index(n).ok_or_else(|| format!("no output `{n}`"));
+        let at = |n: &str| {
+            inst.output_index(n)
+                .ok_or_else(|| format!("no output `{n}`"))
+        };
         let h = std::mem::take(&mut out[at("hidden")?]);
         Ok((std::mem::take(&mut out[at("logits")?]), h))
     }
@@ -511,6 +524,15 @@ impl Drafter for Mtp {
 
     fn set_ane(&self, on: bool, settled: bool) {
         self.ane.set(on, settled);
+    }
+
+    fn skip_prefix(&self, st: &mut DraftState, skipped: usize) {
+        if let Some(s) = st.downcast_mut::<MtpState>() {
+            s.len = skipped;
+            s.seen = skipped;
+            s.log_from = skipped;
+            s.ring.ids.resize(skipped, 0);
+        }
     }
 
     fn propose(
@@ -555,7 +577,9 @@ impl Drafter for Mtp {
         let (mut logits, mut normed) = match lane.as_deref_mut() {
             Some(lane) => {
                 let from = s.ring.ids.len().max(s.log_from);
-                s.ring.ids.extend_from_slice(&tokens[s.ring.ids.len() + 1..from + 1]);
+                s.ring
+                    .ids
+                    .extend_from_slice(&tokens[s.ring.ids.len() + 1..from + 1]);
                 let mut out = (Vec::new(), Vec::new());
                 for p in from..seen {
                     let h = &s.log[(p - s.log_from) * d..][..d];
@@ -937,6 +961,12 @@ impl Drafter for Block {
         })
     }
 
+    fn skip_prefix(&self, st: &mut DraftState, skipped: usize) {
+        if let Some(s) = st.downcast_mut::<BlockState>() {
+            s.len = skipped;
+        }
+    }
+
     fn propose(
         &self,
         st: &mut DraftState,
@@ -1082,12 +1112,7 @@ fn load_plain(
         let want = lm.forward(&[1], 0, &mut lm.prepare(Vec::new(), &[])?.1)?;
         Ok((lane, crate::graph::ane::rel_rms(got, &want)))
     });
-    Ok(Arc::new(Plain {
-        label,
-        lm,
-        ane,
-        io,
-    }))
+    Ok(Arc::new(Plain { label, lm, ane, io }))
 }
 
 /// Most rows a [`Plain`] drafter on the ANE catches up on before drafting: more than a trial
@@ -1124,7 +1149,13 @@ impl Plain {
         pick: &mut dyn FnMut(DraftLogits<'_>) -> u32,
     ) -> Result<Vec<u32>, String> {
         let n = tokens.len();
-        let keep = r.ids.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(n - 1);
+        let keep = r
+            .ids
+            .iter()
+            .zip(tokens)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(n - 1);
         r.truncate(keep);
         // A step catches up one row at a time, so a long gap (the prompt, a run of plain decoding)
         // is cut to its last ANE_CATCH_UP rows; earlier ones stay masked.

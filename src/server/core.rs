@@ -47,6 +47,7 @@ pub enum ToolChoice {
     Named(String),
 }
 
+#[derive(Clone)]
 pub enum Prompt {
     /// Rendered with the model's chat template.
     Chat {
@@ -70,6 +71,8 @@ pub struct GenRequest {
     pub label: String,
     /// A chat request's `compact` object, over the saved compaction settings.
     pub compact: Option<crate::compact::CompactionOverride>,
+    /// JSON mode / schema constraint on the output (`response_format`, the NDJSON API's `format`).
+    pub grammar: Option<crate::scheduler::grammar::GrammarConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,7 +136,11 @@ impl Compaction {
                 }
                 *p = match media.next() {
                     Some(MediaInput::Image(b)) => {
-                        let mime = if b.starts_with(b"\x89PNG") { "png" } else { "jpeg" };
+                        let mime = if b.starts_with(b"\x89PNG") {
+                            "png"
+                        } else {
+                            "jpeg"
+                        };
                         let url = format!(
                             "data:image/{mime};base64,{}",
                             crate::model::image::base64_encode(b)
@@ -175,6 +182,41 @@ pub fn label(api: &str, headers: &axum::http::HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
     format!("{api} · {ua}")
+}
+
+/// A chat request's compaction override: its body's `compact` object, else the `x-gibbs-compact`
+/// header (for SDKs that drop unknown body fields) as a JSON object or `key=value,...` pairs
+/// (`mode=auto,trigger=0.6`); checked with `check_local`.
+pub fn compact_override(
+    body: Option<crate::compact::CompactionOverride>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<crate::compact::CompactionOverride>, ApiError> {
+    let o = match (body, headers.get("x-gibbs-compact")) {
+        (Some(o), _) => o,
+        (None, None) => return Ok(None),
+        (None, Some(h)) => {
+            let bad = |e: &dyn std::fmt::Display| ApiError::bad(format!("x-gibbs-compact: {e}"));
+            let s = h.to_str().map_err(|e| bad(&e))?.trim();
+            let v = if s.starts_with('{') {
+                serde_json::from_str(s).map_err(|e| bad(&e))?
+            } else {
+                let mut map = serde_json::Map::new();
+                for kv in s.split(',').map(str::trim).filter(|kv| !kv.is_empty()) {
+                    let (k, v) = kv
+                        .split_once('=')
+                        .ok_or_else(|| bad(&format!("'{kv}' is not key=value")))?;
+                    let v = v.trim();
+                    let num = v.parse::<u64>().map(Value::from);
+                    let num = num.or_else(|_| v.parse::<f64>().map(Value::from));
+                    map.insert(k.trim().to_string(), num.unwrap_or_else(|_| v.into()));
+                }
+                Value::Object(map)
+            };
+            serde_json::from_value(v).map_err(|e| bad(&e))?
+        }
+    };
+    o.check_local().map_err(ApiError::bad)?;
+    Ok(Some(o))
 }
 
 /// Short unique id (tool calls, responses, messages).
@@ -438,6 +480,7 @@ async fn submit(
     text: String,
     params: SamplingParams,
     media: Vec<MediaInput>,
+    grammar: Option<crate::scheduler::grammar::GrammarConstraint>,
 ) -> Result<
     (
         u64,
@@ -460,7 +503,7 @@ async fn submit(
     let guard = CancelOnDrop(Default::default());
     let cancel = Some(guard.0.clone());
     tokio::task::spawn_blocking(move || {
-        scheduler.submit_cancellable(params, &media, cancel, |t| t.encode(&text))
+        scheduler.submit_cancellable(params, &media, cancel, grammar, |t| t.encode(&text))
     })
     .await
     .map_err(|e| ApiError {
@@ -515,7 +558,10 @@ pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, 
         return Err(no_text_model(state));
     }
     let mut compaction = None;
-    if let Prompt::Chat { messages, .. } = &mut req.prompt {
+    if let Prompt::Chat {
+        messages, tools, ..
+    } = &mut req.prompt
+    {
         let mut cfg = crate::tui::settings::load_settings().compact;
         if let Some(o) = &req.compact {
             o.apply(&mut cfg);
@@ -547,6 +593,9 @@ pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, 
                         report.tier2_chars_shaken,
                         report.tier3_turns_summarized,
                     ));
+                    if !tools.is_empty() {
+                        crate::compact::link_artifacts(messages, &report.artifacts);
+                    }
                     compaction = Some(Compaction {
                         report,
                         messages: messages.clone(),
@@ -562,7 +611,7 @@ pub async fn start(state: &AppState, mut req: GenRequest) -> Result<Generation, 
     }
     let (text, mut tools) = render_for(state, req.prompt, &req.media)?;
     let (id, mut rx, tokenizer, prompt_tokens, finish) =
-        submit(state, text, req.params, req.media).await?;
+        submit(state, text, req.params, req.media, req.grammar).await?;
     {
         let mut labels = LABELS.lock();
         labels.insert(id, req.label);

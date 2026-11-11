@@ -4,7 +4,9 @@ use gibbs_engine::hardware::{Device, PlacementMode, QuantFormat};
 use gibbs_engine::model::hub::{HuggingFaceHub, ModelArtifacts};
 use gibbs_engine::model::native::NativeLm;
 use gibbs_engine::model::tokenizer::Tokenizer;
-use gibbs_engine::model::weight_format::{reencode_override, set_reencode_override, ReencodeConfig};
+use gibbs_engine::model::weight_format::{
+    reencode_override, set_reencode_override, ReencodeConfig,
+};
 use gibbs_engine::scheduler::{
     ContinuousBatchScheduler, ExecutableModel, SamplingParams, DEFAULT_MAX_NEW_TOKENS,
 };
@@ -176,7 +178,9 @@ fn test_hub_model_budget_safeguard() {
 #[test]
 fn test_tiny_nvfp4_inference_and_generation() {
     let lm = tiny_lm(Some(QuantFormat::GGUF_NVFP4), Device::Cpu);
-    let ids = lm.tokenizer().encode("How many 'r's in the word strawberry?");
+    let ids = lm
+        .tokenizer()
+        .encode("How many 'r's in the word strawberry?");
     // Random weights over the synthetic config's vocab (wider than the fallback tokenizer's).
     let (out, _) = greedy_ids(&*lm, &ids, 5);
     assert_eq!(out.len(), 5);
@@ -289,7 +293,16 @@ fn test_smollm2_program_scheduler_inference() {
 
     // Prefill through scheduler
     let first_next = exec_model
-        .step_prefill_chunk(&prompt_tokens, 0, true, &prompt_tokens, 0.0, 1.0, &mut kv)
+        .step_prefill_chunk(
+            &prompt_tokens,
+            0,
+            true,
+            &prompt_tokens,
+            0.0,
+            1.0,
+            0,
+            &mut kv,
+        )
         .expect("prefill succeeds");
     let next_tok = first_next.expect("prefill returned next token");
     let mut generated_tokens = prompt_tokens.clone();
@@ -303,6 +316,7 @@ fn test_smollm2_program_scheduler_inference() {
                 generated_tokens.len(),
                 0.0,
                 1.0,
+                0,
                 None,
                 &mut kv,
             )
@@ -334,12 +348,17 @@ fn test_decode_throughput_benchmark_300_tok_s() {
     println!("Sample generation: '{generated}'");
     assert!(!generated.is_empty());
     let target_tps = if cfg!(debug_assertions) { 100.0 } else { 300.0 };
-    assert!(tps >= target_tps, "Throughput {tps:.1} tok/s must reach {target_tps} tok/s");
+    assert!(
+        tps >= target_tps,
+        "Throughput {tps:.1} tok/s must reach {target_tps} tok/s"
+    );
 }
 
 #[test]
 fn test_real_weights_tinystories_decode_throughput_300_tok_s() {
-    let Some(lm) = load_dir(TS_INSTRUCT_8M) else { return };
+    let Some(lm) = load_dir(TS_INSTRUCT_8M) else {
+        return;
+    };
     let num_tokens = 30;
     let _ = greedy_ids(&*lm, &lm.tokenizer().encode("Hello"), 2); // warm-up
     let prompt = lm.tokenizer().encode("Once upon a time");
@@ -348,12 +367,19 @@ fn test_real_weights_tinystories_decode_throughput_300_tok_s() {
     println!("⚡ Real TinyStories-8M Pure KV Decode Throughput: {tps:.1} tok/s");
     println!("Real weights generation: '{}'", lm.tokenizer().decode(&out));
     let target_tps = if cfg!(debug_assertions) { 20.0 } else { 300.0 };
-    assert!(tps > target_tps, "Throughput {tps:.1} tok/s must exceed {target_tps} tok/s");
+    assert!(
+        tps > target_tps,
+        "Throughput {tps:.1} tok/s must exceed {target_tps} tok/s"
+    );
 }
 
 #[test]
 fn test_all_readme_models_inference_and_zero_gibberish() {
-    assert_coherent(TS_INSTRUCT_8M, "Once in a quiet village surrounded by green hills,", 15);
+    assert_coherent(
+        TS_INSTRUCT_8M,
+        "Once in a quiet village surrounded by green hills,",
+        15,
+    );
     assert_coherent(PYTHIA, "In a secret garden behind the old stone wall,", 12);
     assert_coherent(SMOLLM2, "User: How are you today? Assistant: I am", 10);
 
@@ -378,7 +404,11 @@ fn test_xenova_llama2_c_stories15m_inference_and_comprehension() {
     if let Some(lm) = load_dir(STORIES15M) {
         assert_eq!(lm.tokenizer().vocab_size(), 32000);
     }
-    assert_coherent(STORIES15M, "Once upon a time, there was a little girl named Lily.", 20);
+    assert_coherent(
+        STORIES15M,
+        "Once upon a time, there was a little girl named Lily.",
+        20,
+    );
 }
 
 #[test]
@@ -419,11 +449,23 @@ fn test_all_readme_models_legibility_and_grammar_verification() {
 #[test]
 fn test_dynamic_unseen_prompts_across_all_readme_models() {
     for dir in [TS_1M, TS_3M, TS_8M, TS_INSTRUCT_8M] {
-        assert_coherent(dir, "In a quiet village near the mountains, a friendly dog", 12);
+        assert_coherent(
+            dir,
+            "In a quiet village near the mountains, a friendly dog",
+            12,
+        );
     }
     assert_coherent(PYTHIA, "The sun rises in the east and", 12);
-    assert_coherent(SMOLLM2, "User: What is the fastest animal on land? Assistant: The", 10);
-    assert_coherent(STORIES15M, "One morning, a little bird named Pip decided to", 12);
+    assert_coherent(
+        SMOLLM2,
+        "User: What is the fastest animal on land? Assistant: The",
+        10,
+    );
+    assert_coherent(
+        STORIES15M,
+        "One morning, a little bird named Pip decided to",
+        12,
+    );
     assert_coherent(PLYX, "The little boy opened the wooden box and", 10);
 }
 
@@ -443,10 +485,17 @@ fn test_glm_edge_matches_hf_oracle() {
     let logits = lm.forward(&seq, 0, &mut state).unwrap();
     assert_eq!(argmax(&logits), 14488); // " Paris"
     for (id, want) in [(14488usize, 16.5629f32), (11262, 13.4245)] {
-        assert!((logits[id] - want).abs() < 0.02, "logit[{id}] = {} want {want}", logits[id]);
+        assert!(
+            (logits[id] - want).abs() < 0.02,
+            "logit[{id}] = {} want {want}",
+            logits[id]
+        );
     }
     // HF greedy: " Paris. It is the most visited"
-    assert_eq!(greedy_ids(&*lm, &ids, 7).0, [14488, 46, 1462, 398, 283, 1945, 24733]);
+    assert_eq!(
+        greedy_ids(&*lm, &ids, 7).0,
+        [14488, 46, 1462, 398, 283, 1945, 24733]
+    );
 }
 
 /// llama.cpp oracle (`llama-tokenize`, `llama-simple`) on ggml-org/tiny-llamas stories15M:
@@ -499,13 +548,16 @@ fn test_gguf_smollm2_q4_k_m_matches_llama_cpp() {
     let lm = load_gguf(path);
     let prompt = lm.tokenizer().encode("The capital of France is");
     assert_eq!(prompt, [504, 3575, 282, 4649, 314]); // add_bos_token = false
-    // llama.cpp result_output logits[0..3] for this prompt.
+                                                     // llama.cpp result_output logits[0..3] for this prompt.
     let (seq, mut state) = lm.prepare(prompt.clone(), &[]).unwrap();
     let logits = lm.forward(&seq, 0, &mut state).unwrap();
     for (got, want) in logits.iter().zip([3.4901f32, -10.5134, -7.1320]) {
         assert!((got - want).abs() < 0.05, "logit {got} want {want}");
     }
-    assert_eq!(greedy_ids(&*lm, &prompt, 6).0, [7042, 30, 7042, 314, 253, 2240]);
+    assert_eq!(
+        greedy_ids(&*lm, &prompt, 6).0,
+        [7042, 30, 7042, 314, 253, 2240]
+    );
 }
 
 /// Minimal GGUF v3 writer (alignment 32, no metadata) for synthetic loader tests.
@@ -678,9 +730,7 @@ fn test_gguf_block_formats_decode_like_ggml() {
         }
     }
 
-    let bad = gguf_file(
-        &[("blk.0.ffn_down.weight", [256, 2], 15, vec![0; 2 * 292])],
-    );
+    let bad = gguf_file(&[("blk.0.ffn_down.weight", [256, 2], 15, vec![0; 2 * 292])]);
     let err = UniversalModelLoader::parse_gguf(&bad).unwrap_err();
     assert!(
         err.contains("blk.0.ffn_down.weight") && err.contains("Q8_K"),
@@ -840,6 +890,11 @@ fn test_missing_required_weight_names_the_tensor() {
         weights_path: Some(dir.path().join("model.safetensors")),
         ..Default::default()
     };
-    let err = load(&art).err().expect("a checkpoint without layer weights loads");
-    assert!(err.contains("model.layers.0.input_layernorm.weight"), "{err}");
+    let err = load(&art)
+        .err()
+        .expect("a checkpoint without layer weights loads");
+    assert!(
+        err.contains("model.layers.0.input_layernorm.weight"),
+        "{err}"
+    );
 }

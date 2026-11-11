@@ -4761,3 +4761,331 @@ fn plan_windows_packs_deterministically_without_overlap_explosion() {
         "total mapped bytes {total_mapped} exceeded map_len {map_len} + 1 page per boundary"
     );
 }
+
+#[test]
+fn gemv_rmsnorm_and_dual_glu_megakernel_match_cpu_across_codecs() {
+    use crate::hardware::QuantFormat;
+    use crate::model::layers::encode_rows;
+    use crate::model::weights::Mat;
+
+    let (hidden, inter) = (256usize, 512usize);
+    for (gate_fmt, up_fmt, down_fmt, geglu, with_pre_res) in [
+        (
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q4_0,
+            false,
+            false,
+        ),
+        (
+            QuantFormat::GGUF_NVFP4,
+            QuantFormat::GGUF_NVFP4,
+            QuantFormat::GGUF_NVFP4,
+            false,
+            false,
+        ),
+        (
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q6_K,
+            true,
+            false,
+        ),
+        (
+            QuantFormat::GGUF_Q5_K_M,
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q5_K_M,
+            false,
+            true,
+        ),
+    ] {
+        let mut g = Graph::new();
+        let x0 = g.input("x0", vec![1, hidden], DType::F32);
+        let mut w = Weights::new();
+
+        // Pre-attention RmsNorm -> QKV Linear (`gemv_rmsnorm` fusion)
+        let g_attn = g.weight("g_attn", vec![hidden], DType::F32);
+        w.insert("g_attn", Tensor::F32(rand(hidden, 10)));
+        let n_attn = g.add(
+            "n_attn",
+            Op::RmsNorm { eps: 1e-5 },
+            &[x0, g_attn],
+            vec![1, hidden],
+            DType::F32,
+        );
+        let w_qkv = g.weight("w_qkv", vec![hidden, hidden], DType::Quant(gate_fmt));
+        let raw_qkv = encode_rows(&rand(hidden * hidden, 11), hidden, gate_fmt).unwrap();
+        w.insert(
+            "w_qkv",
+            Tensor::Mat(Mat::from_packed_bytes(gate_fmt, raw_qkv, hidden, hidden)),
+        );
+        let qkv = g.add(
+            "qkv",
+            Op::Linear,
+            &[n_attn, w_qkv],
+            vec![1, hidden],
+            DType::F32,
+        );
+
+        let x_mlp = if with_pre_res {
+            g.add(
+                "pre_res",
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Add,
+                },
+                &[x0, qkv],
+                vec![1, hidden],
+                DType::F32,
+            )
+        } else {
+            qkv
+        };
+
+        let g_mlp = g.weight("g_mlp", vec![hidden], DType::F32);
+        w.insert("g_mlp", Tensor::F32(rand(hidden, 12)));
+        let n_mlp = g.add(
+            "n_mlp",
+            Op::RmsNorm { eps: 1e-5 },
+            &[x_mlp, g_mlp],
+            vec![1, hidden],
+            DType::F32,
+        );
+        let w_gate = g.weight("w_gate", vec![inter, hidden], DType::Quant(gate_fmt));
+        let w_up = g.weight("w_up", vec![inter, hidden], DType::Quant(up_fmt));
+        let w_down = g.weight("w_down", vec![hidden, inter], DType::Quant(down_fmt));
+        w.insert(
+            "w_gate",
+            Tensor::Mat(Mat::from_packed_bytes(
+                gate_fmt,
+                encode_rows(&rand(inter * hidden, 13), hidden, gate_fmt).unwrap(),
+                inter,
+                hidden,
+            )),
+        );
+        w.insert(
+            "w_up",
+            Tensor::Mat(Mat::from_packed_bytes(
+                up_fmt,
+                encode_rows(&rand(inter * hidden, 14), hidden, up_fmt).unwrap(),
+                inter,
+                hidden,
+            )),
+        );
+        w.insert(
+            "w_down",
+            Tensor::Mat(Mat::from_packed_bytes(
+                down_fmt,
+                encode_rows(&rand(hidden * inter, 15), inter, down_fmt).unwrap(),
+                hidden,
+                inter,
+            )),
+        );
+        let gate = g.add(
+            "gate",
+            Op::Linear,
+            &[n_mlp, w_gate],
+            vec![1, inter],
+            DType::F32,
+        );
+        let up = g.add("up", Op::Linear, &[n_mlp, w_up], vec![1, inter], DType::F32);
+        let glu = g.add(
+            "glu",
+            if geglu { Op::GeGlu } else { Op::SwiGlu },
+            &[gate, up],
+            vec![1, inter],
+            DType::F32,
+        );
+        let down = g.add(
+            "down",
+            Op::Linear,
+            &[glu, w_down],
+            vec![1, hidden],
+            DType::F32,
+        );
+        let out = g.add(
+            "res",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[x_mlp, down],
+            vec![1, hidden],
+            DType::F32,
+        );
+        g.output(out);
+
+        let inp = vec![Tensor::F32(rand(hidden, 99))];
+        let cpu_ref = {
+            let _exact = crate::model::qdot::exact();
+            crate::graph::cpu::run_stateless(&g, &w, inp.clone()).unwrap()
+        };
+
+        let (mut fg, mut fw) = (g.clone(), w.clone());
+        crate::graph::passes::prefuse(&mut fg);
+        crate::graph::passes::fuse(
+            &mut fg,
+            crate::graph::passes::fusion::FuseWeights::Materialize(&mut fw),
+        )
+        .unwrap();
+        assert!(
+            fg.nodes.iter().any(|n| matches!(n.op, Op::Megakernel(_))),
+            "expected MegakernelMlp for ({gate_fmt:?}, {up_fmt:?}, {down_fmt:?})"
+        );
+        let sess = Session::new(rt(), &fw).unwrap();
+        let plan = sess.prepare_plan(&fg).unwrap();
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s.op, Step::GemvPacked { norm: Some(_), .. })),
+            "expected pre-attention RmsNorm absorbed into GemvPacked"
+        );
+        let mut ms = StateStore::new();
+        let gpu_out = sess.run_prepared(&fg, &plan, Some(&mut ms), inp).unwrap();
+        for (i, (&c, &m)) in cpu_ref[0]
+            .as_f32()
+            .unwrap()
+            .iter()
+            .zip(gpu_out[0].as_f32().unwrap())
+            .enumerate()
+        {
+            assert!(
+                (c - m).abs() < 2e-3,
+                "mismatch at {i} for ({gate_fmt:?},{up_fmt:?},{down_fmt:?},geglu={geglu},pre={with_pre_res}): cpu={c} gpu={m}"
+            );
+        }
+    }
+}
+
+#[test]
+fn segmented_fused_qkv_eliminates_slice_copies_and_matches_cpu() {
+    use crate::model::layers::encode_rows;
+    use crate::model::weights::Mat;
+
+    let fmt = QuantFormat::GGUF_Q4_0;
+    let h = 128usize;
+    for (heads, kv_heads, hd) in [(4usize, 2usize, 32usize), (3, 1, 32)] {
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        for m in [5usize, 17] {
+            let mut g = Graph::new();
+            let mut w = Weights::new();
+            let x = g.input("x", vec![m, h], DType::F32);
+            let pos = g.input("pos", vec![m], DType::U32);
+            let gn = g.weight("gn", vec![h], DType::F32);
+            w.insert("gn", Tensor::F32(rand(h, 1)));
+            let inv = g.weight("inv", vec![hd / 2], DType::F32);
+            w.insert("inv", Tensor::F32(rand(hd / 2, 2)));
+
+            let mut qmat = |name: &str, rows: usize, cols: usize, seed: u64| -> ValueId {
+                let raw = encode_rows(&rand(rows * cols, seed), cols, fmt).unwrap();
+                w.insert(
+                    name,
+                    Tensor::Mat(Mat::from_packed_bytes(fmt, raw, rows, cols)),
+                );
+                g.weight(name, vec![rows, cols], DType::Quant(fmt))
+            };
+            let wq = qmat("wq", q_dim, h, 3);
+            let wk = qmat("wk", kv_dim, h, 4);
+            let wv = qmat("wv", kv_dim, h, 5);
+            let wo = qmat("wo", h, q_dim, 6);
+            let bq = g.weight("bq", vec![q_dim], DType::F32);
+            let bv = g.weight("bv", vec![kv_dim], DType::F32);
+            w.insert("bq", Tensor::F32(rand(q_dim, 8)));
+            w.insert("bv", Tensor::F32(rand(kv_dim, 9)));
+
+            let nx = g.add(
+                "nx",
+                Op::RmsNorm { eps: 1e-5 },
+                &[x, gn],
+                vec![m, h],
+                DType::F32,
+            );
+            let q = g.add("q", Op::Linear, &[nx, wq, bq], vec![m, q_dim], DType::F32);
+            let k = g.add("k", Op::Linear, &[nx, wk], vec![m, kv_dim], DType::F32);
+            let v = g.add("v", Op::Linear, &[nx, wv, bv], vec![m, kv_dim], DType::F32);
+            let rope = Op::Rope {
+                head_dim: hd,
+                rotary_dim: hd,
+                variant: crate::graph::RopeVariant::HalfSplit,
+                mscale: 1.0,
+            };
+            let qr = g.add(
+                "qr",
+                rope.clone(),
+                &[q, pos, inv],
+                vec![m, q_dim],
+                DType::F32,
+            );
+            let kr = g.add("kr", rope, &[k, pos, inv], vec![m, kv_dim], DType::F32);
+            let att = g.add(
+                "att",
+                Op::Attention {
+                    heads,
+                    kv_heads,
+                    causal: true,
+                    window: None,
+                    soft_cap: None,
+                    scale: None,
+                },
+                &[qr, kr, v],
+                vec![m, q_dim],
+                DType::F32,
+            );
+            let o = g.add("o", Op::Linear, &[att, wo], vec![m, h], DType::F32);
+            let res = g.add(
+                "res",
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Add,
+                },
+                &[x, o],
+                vec![m, h],
+                DType::F32,
+            );
+            g.output(res);
+
+            let inp = vec![
+                Tensor::F32(rand(m * h, 20 + m as u64)),
+                Tensor::U32((0..m as u32).collect()),
+            ];
+            let want = {
+                let _exact = crate::model::qdot::exact();
+                cpu::run_stateless(&g, &w, inp.clone()).unwrap()
+            };
+            let gpu_unfused = Session::new(rt(), &w)
+                .unwrap()
+                .run(&g, inp.clone())
+                .unwrap();
+
+            let (mut fg, mut fw) = (g, w);
+            let scalars = Weights::new();
+            crate::graph::passes::prefuse(&mut fg);
+            crate::graph::passes::fuse(
+                &mut fg,
+                crate::graph::passes::fusion::FuseWeights::Materialize(&mut fw),
+            )
+            .unwrap();
+            crate::graph::passes::canonical::run(&mut fg, &scalars);
+
+            let sess = Session::new(rt(), &fw).unwrap();
+            let plan = sess.prepare_plan(&fg).unwrap();
+            assert!(
+                !plan.steps.iter().any(|s| matches!(
+                    s.op,
+                    Step::Ext(ext::ExtStep::Movement(ext::movement::Step::Copy { .. }))
+                )),
+                "m={m} ({heads},{kv_heads}): unexpected Copy step in {:?}",
+                plan.steps.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            let got = sess.run_prepared(&fg, &plan, None, inp).unwrap();
+            let gpu_diff = max_abs_diff(gpu_unfused[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+            assert!(
+                gpu_diff < 1e-4,
+                "m={m} ({heads},{kv_heads}): segmented vs unfused GPU max_abs_diff {gpu_diff}"
+            );
+            let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+            let tol = if m >= 16 { 5e-3 } else { 5e-4 };
+            assert!(
+                err < tol,
+                "m={m} ({heads},{kv_heads}): CPU rel_err {err} >= {tol}"
+            );
+        }
+    }
+}

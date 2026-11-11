@@ -3,6 +3,7 @@
 pub mod canonical;
 pub mod dtype_adapt;
 pub mod fusion;
+pub mod hope;
 pub mod megakernel;
 
 use crate::graph::pattern::validate_ssa;
@@ -20,14 +21,18 @@ pub fn prefuse(graph: &mut Graph) {
 
 /// The graph fusions (megakernel MLP, gate/up, QKV), chosen by equality saturation and cost-model
 /// extraction ([`crate::graph::egraph`]), and the SSA check.
-pub fn fuse(graph: &mut Graph, weights: FuseWeights<'_>) -> Result<(), String> {
+pub fn fuse(graph: &mut Graph, mut weights: FuseWeights<'_>) -> Result<(), String> {
     let r = crate::graph::egraph::fuse(
         graph,
-        weights,
+        weights.reborrow(),
         crate::graph::egraph::DEFAULT_RULES,
         &crate::graph::egraph::CostModel::from_tune_cache(),
         crate::graph::egraph::Budget::default(),
     )?;
-    tracing::info!("egraph fusion: {r:?}, compile {:.1} ms", r.compile_ms());
+    let shared = fusion::fuse_shared_input_linears(graph, weights);
+    tracing::info!(
+        "egraph fusion: {r:?}, shared={shared}, compile {:.1} ms",
+        r.compile_ms()
+    );
     validate_ssa(graph)
 }

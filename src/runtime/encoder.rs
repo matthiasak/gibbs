@@ -71,6 +71,8 @@ pub struct SpecEncoder {
     program: Mutex<GraphProgram>,
     device: Device,
     params: usize,
+    mode: PlacementMode,
+    bucketed: Mutex<std::collections::HashMap<usize, Arc<crate::graph::Graph>>>,
 }
 
 impl SpecEncoder {
@@ -100,12 +102,18 @@ impl SpecEncoder {
             Some(e) => match model.env.eval(&e.as_str().into())? {
                 Val::Str(s) if s == "absolute" => None,
                 Val::Str(s) if s == "pad_offset" => Some(model.env.var("pad_id")?.usize()? as u32),
-                v => return Err(format!("{fam}: runtime.position_ids is {v}, not absolute|pad_offset")),
+                v => {
+                    return Err(format!(
+                        "{fam}: runtime.position_ids is {v}, not absolute|pad_offset"
+                    ))
+                }
             },
         };
         let shapes = ShapeCache::new(COMPONENT);
         let v = vars(1, head);
-        let first = shapes.get(&v, || build(&model.spec, COMPONENT, &model.env, &model.store, &v))?;
+        let first = shapes.get(&v, || {
+            build(&model.spec, COMPONENT, &model.env, &model.store, &v)
+        })?;
         let used: HashSet<String> = first.weights.iter().cloned().collect();
         let unused = model.store.unconsumed(&used, &model.ignore);
         if !unused.is_empty() {
@@ -117,7 +125,9 @@ impl SpecEncoder {
         let weights = model.store.materialize(&first.weights)?;
         let params = weights.parameter_count();
         let program = GraphProgram::compile_reshapable(first.graph.clone(), weights, mode)?;
-        if program.primary_device() != device || (device != Device::Cpu && program.cpu_node_count() > 0) {
+        if program.primary_device() != device
+            || (device != Device::Cpu && program.cpu_node_count() > 0)
+        {
             return Err(format!(
                 "gpu-only: {fam} compiled for {} with {} CPU nodes, wanted every node on {device}",
                 program.primary_device(),
@@ -133,6 +143,8 @@ impl SpecEncoder {
             program: Mutex::new(program),
             device,
             params,
+            mode,
+            bucketed: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -167,7 +179,8 @@ impl SpecEncoder {
         capacity: usize,
     ) -> Result<tokenizers::Tokenizer, String> {
         let mut tok = match hub.fetch_file(repo_id, "tokenizer.json") {
-            Ok(p) => tokenizers::Tokenizer::from_file(&p).map_err(|e| format!("load {}: {e}", p.display()))?,
+            Ok(p) => tokenizers::Tokenizer::from_file(&p)
+                .map_err(|e| format!("load {}: {e}", p.display()))?,
             Err(json_err) => {
                 let mut conv = None;
                 for c in &self.rt.tokenizer {
@@ -180,13 +193,15 @@ impl SpecEncoder {
                         break;
                     }
                 }
-                let kind = conv.ok_or_else(|| format!("{repo_id}: no tokenizer.json ({json_err})"))?;
+                let kind =
+                    conv.ok_or_else(|| format!("{repo_id}: no tokenizer.json ({json_err})"))?;
                 let files = kind
                     .files()
                     .into_iter()
                     .map(|f| {
-                        hub.fetch_file(repo_id, f)
-                            .map_err(|e| format!("{repo_id}: no tokenizer.json ({json_err}) or {f} ({e})"))
+                        hub.fetch_file(repo_id, f).map_err(|e| {
+                            format!("{repo_id}: no tokenizer.json ({json_err}) or {f} ({e})")
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let paths: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
@@ -215,13 +230,88 @@ impl SpecEncoder {
         if n > cap {
             return Err(format!("{n} tokens exceed {cap} positions"));
         }
+        let use_bucket = {
+            #[cfg(target_os = "macos")]
+            {
+                !matches!(self.head.as_str(), "max" | "max_l2")
+                    && (self.device == Device::Ane
+                        || (self.mode == PlacementMode::Auto
+                            && crate::graph::ane::probed().is_some()))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+        if use_bucket {
+            let b = n.max(16).next_power_of_two().min(cap);
+            if b > n {
+                let inst = self.instance(b)?;
+                let g_masked = {
+                    let mut cache = self.bucketed.lock();
+                    if let Some(g) = cache.get(&b) {
+                        g.clone()
+                    } else {
+                        let mut g = inst.graph.clone();
+                        let mask_in = g.input("__pad_mask", vec![b], crate::graph::DType::F32);
+                        for node in &mut g.nodes {
+                            if let crate::graph::Op::Attention { causal: false, .. } = node.op {
+                                if node.inputs.len() == 3 {
+                                    node.inputs.push(mask_in);
+                                }
+                            }
+                        }
+                        let arc = Arc::new(g);
+                        cache.insert(b, arc.clone());
+                        arc
+                    }
+                };
+                let pad_tok = self.pad_offset.unwrap_or(0);
+                let mut pad_ids = Vec::with_capacity(b);
+                pad_ids.extend_from_slice(ids);
+                pad_ids.resize(b, pad_tok);
+                let mut pad_types = Vec::with_capacity(b);
+                if types.len() == n {
+                    pad_types.extend_from_slice(types);
+                } else {
+                    pad_types.resize(n, 0);
+                }
+                pad_types.resize(b, 0);
+                let mut inputs = Vec::with_capacity(inst.inputs.len() + 1);
+                for d in &inst.inputs {
+                    if d.gen.is_none() && d.name == "attention_mask" {
+                        let mut am = vec![1u32; n];
+                        am.resize(b, 0);
+                        inputs.push(Tensor::U32(am));
+                    } else {
+                        inputs.push(self.input(d, &pad_ids, &pad_types)?);
+                    }
+                }
+                let mut attn_bias = vec![0.0f32; n];
+                attn_bias.resize(b, -65504.0);
+                inputs.push(Tensor::F32(attn_bias));
+                let mut out = self.program.lock().run_reshaped(&g_masked, inputs, true)?;
+                if out.is_empty() {
+                    return Err("encoder graph produced no output".into());
+                }
+                let mut vec = out.swap_remove(0).into_f32()?;
+                if self.head == "hidden" && b > 0 {
+                    let width = vec.len() / b;
+                    vec.truncate(n * width);
+                }
+                return Ok(vec);
+            }
+        }
         let inst = self.instance(n)?;
         let inputs = inst
             .inputs
             .iter()
             .map(|d| self.input(d, ids, types))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut out = self.program.lock().run_reshaped(&inst.graph, inputs, true)?;
+        let mut out = self
+            .program
+            .lock()
+            .run_reshaped(&inst.graph, inputs, true)?;
         if out.is_empty() {
             return Err("encoder graph produced no output".into());
         }
@@ -391,11 +481,18 @@ pub struct LabelScore {
 }
 
 /// `labels` with `activation` of `logits`, by descending score.
-pub fn label_scores(labels: &[String], activation: Activation, logits: Vec<f32>) -> Vec<LabelScore> {
+pub fn label_scores(
+    labels: &[String],
+    activation: Activation,
+    logits: Vec<f32>,
+) -> Vec<LabelScore> {
     let mut out: Vec<LabelScore> = labels
         .iter()
         .zip(activation.apply(logits))
-        .map(|(l, score)| LabelScore { label: l.clone(), score })
+        .map(|(l, score)| LabelScore {
+            label: l.clone(),
+            score,
+        })
         .collect();
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     out
@@ -433,7 +530,9 @@ pub struct Resolved {
 /// repo (`adapter_config.json`, task `SEQ_CLS`) resolves to its base model's config with the
 /// adapter repo's labels.
 pub fn resolve_config(hub: &HuggingFaceHub, repo_id: &str) -> Result<Resolved, String> {
-    let own = hub.fetch_file(repo_id, "config.json").and_then(|p| read_json(&p));
+    let own = hub
+        .fetch_file(repo_id, "config.json")
+        .and_then(|p| read_json(&p));
     let own_arch = own
         .as_ref()
         .ok()
@@ -441,7 +540,11 @@ pub fn resolve_config(hub: &HuggingFaceHub, repo_id: &str) -> Result<Resolved, S
         .map(str::to_string);
     if let (Ok(cfg), Some(a)) = (&own, &own_arch) {
         if a.ends_with("ForSequenceClassification") {
-            return Ok(Resolved { cfg: cfg.clone(), arch: a.clone(), peft: None });
+            return Ok(Resolved {
+                cfg: cfg.clone(),
+                arch: a.clone(),
+                peft: None,
+            });
         }
     }
     let Ok(ad) = hub
@@ -479,10 +582,16 @@ pub fn resolve_config(hub: &HuggingFaceHub, repo_id: &str) -> Result<Resolved, S
     let base_arch = cfg["architectures"][0]
         .as_str()
         .ok_or_else(|| format!("{base}: config.json names no architecture"))?;
-    let stem = ["ForSequenceClassification", "ForMaskedLM", "ForPreTraining", "ForCausalLM", "Model"]
-        .iter()
-        .find_map(|s| base_arch.strip_suffix(s))
-        .unwrap_or(base_arch);
+    let stem = [
+        "ForSequenceClassification",
+        "ForMaskedLM",
+        "ForPreTraining",
+        "ForCausalLM",
+        "Model",
+    ]
+    .iter()
+    .find_map(|s| base_arch.strip_suffix(s))
+    .unwrap_or(base_arch);
     let arch = format!("{stem}ForSequenceClassification");
     // Labels and scoring of the fine-tune live in the adapter repo's config.json, when it has one.
     if let Ok(own) = &own {
@@ -492,14 +601,23 @@ pub fn resolve_config(hub: &HuggingFaceHub, repo_id: &str) -> Result<Resolved, S
             }
         }
     }
-    Ok(Resolved { cfg, arch, peft: Some((base, ad)) })
+    Ok(Resolved {
+        cfg,
+        arch,
+        peft: Some((base, ad)),
+    })
 }
 
 impl Classifier {
     /// A Hugging Face `*ForSequenceClassification` checkpoint `r` of `repo_id` on its encoder
     /// family. A PEFT adapter is merged into its base once (`peft::prepare_seq_cls`), and the
     /// resolved config (classification class, labels) is written beside the merged weights.
-    pub fn from_hf(hub: &HuggingFaceHub, repo_id: &str, r: Resolved, mode: PlacementMode) -> Result<(Meta, Self), String> {
+    pub fn from_hf(
+        hub: &HuggingFaceHub,
+        repo_id: &str,
+        r: Resolved,
+        mode: PlacementMode,
+    ) -> Result<(Meta, Self), String> {
         let token = std::env::var("HF_TOKEN").ok();
         // A PEFT adapter reads its base model's tokenizer unless it ships one.
         let tok_repo = match &r.peft {
@@ -521,10 +639,12 @@ impl Classifier {
             // The base names its own class (`...Model`, `...ForMaskedLM`); the spec matches the
             // classification architecture.
             cfg["architectures"] = serde_json::json!([r.arch]);
-            std::fs::write(&path, cfg.to_string()).map_err(|e| format!("{}: {e}", path.display()))?;
+            std::fs::write(&path, cfg.to_string())
+                .map_err(|e| format!("{}: {e}", path.display()))?;
             a.config_path = Some(path);
         }
-        let enc = SpecEncoder::load(&a, None, mode, "classify").map_err(|e| format!("{repo_id}: {e}"))?;
+        let enc =
+            SpecEncoder::load(&a, None, mode, "classify").map_err(|e| format!("{repo_id}: {e}"))?;
         let tok_cfg = hub
             .fetch_file(tok_repo, "tokenizer_config.json")
             .ok()
@@ -545,13 +665,23 @@ impl Classifier {
             labels,
             activation: Activation::of(&r.cfg, n),
         };
-        Ok((meta, Self { tok, head: Head::Logits(enc) }))
+        Ok((
+            meta,
+            Self {
+                tok,
+                head: Head::Logits(enc),
+            },
+        ))
     }
 
     /// A sentence-transformers repo with a scikit-learn head (`config_setfit.json`): the body
     /// pooled per `1_Pooling/config.json` (and normalized) in its encoder spec, then the joblib
     /// `model_head.pkl` LogisticRegression; scores are its `predict_proba`.
-    pub fn from_sentence_transformers(hub: &HuggingFaceHub, repo_id: &str, mode: PlacementMode) -> Result<(Meta, Self), String> {
+    pub fn from_sentence_transformers(
+        hub: &HuggingFaceHub,
+        repo_id: &str,
+        mode: PlacementMode,
+    ) -> Result<(Meta, Self), String> {
         let err = |e: String| format!("{repo_id}: {e}");
         let st = read_json(&hub.fetch_file(repo_id, "config_setfit.json")?)?;
         let cfg = read_json(&hub.fetch_file(repo_id, "config.json")?)?;
@@ -560,13 +690,22 @@ impl Classifier {
         let modules = read_json(&hub.fetch_file(repo_id, "modules.json")?)?;
         let mut pool_dir = None;
         let mut normalize = st["normalize_embeddings"].as_bool().unwrap_or(false);
-        for (i, m) in modules.as_array().ok_or("modules.json is not a list")?.iter().enumerate() {
+        for (i, m) in modules
+            .as_array()
+            .ok_or("modules.json is not a list")?
+            .iter()
+            .enumerate()
+        {
             let ty = m["type"].as_str().unwrap_or("");
             match (i, ty.rsplit('.').next().unwrap_or("")) {
                 (0, "Transformer") if m["path"].as_str().unwrap_or("").is_empty() => {}
                 (1, "Pooling") => pool_dir = m["path"].as_str().map(str::to_string),
                 (2, "Normalize") => normalize = true,
-                _ => return Err(err(format!("sentence-transformers module {i} '{ty}' is not supported"))),
+                _ => {
+                    return Err(err(format!(
+                        "sentence-transformers module {i} '{ty}' is not supported"
+                    )))
+                }
             }
         }
         let pool_dir = pool_dir.ok_or_else(|| err("modules.json has no Pooling module".into()))?;
@@ -593,9 +732,15 @@ impl Classifier {
                 }
             }
         };
-        let head_kind = if normalize { format!("{pool}_l2") } else { pool.to_string() };
+        let head_kind = if normalize {
+            format!("{pool}_l2")
+        } else {
+            pool.to_string()
+        };
         if family(&cfg, Some(&arch)).is_none() {
-            return Err(err(format!("sentence-transformers body '{arch}' has no encoder family")));
+            return Err(err(format!(
+                "sentence-transformers body '{arch}' has no encoder family"
+            )));
         }
         let token = std::env::var("HF_TOKEN").ok();
         let art = hub.auto_download_and_cache(repo_id, token.as_deref())?;
@@ -608,7 +753,9 @@ impl Classifier {
             .transpose()?
             .unwrap_or(Value::Null);
         let max = enc.capacity()?;
-        let capacity = sbert["max_seq_length"].as_u64().map_or(max, |m| (m as usize).min(max));
+        let capacity = sbert["max_seq_length"]
+            .as_u64()
+            .map_or(max, |m| (m as usize).min(max));
         let tok_cfg = hub
             .fetch_file(repo_id, "tokenizer_config.json")
             .ok()
@@ -621,7 +768,11 @@ impl Classifier {
         let (head, classes) = logistic::read_head(&pkl, hidden).map_err(err)?;
         let names: Vec<String> = st["labels"]
             .as_array()
-            .map(|a| a.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
         let labels = classes
             .into_iter()
@@ -639,7 +790,13 @@ impl Classifier {
             labels,
             activation: Activation::Identity,
         };
-        Ok((meta, Self { tok, head: Head::Logistic(enc, head) }))
+        Ok((
+            meta,
+            Self {
+                tok,
+                head: Head::Logistic(enc, head),
+            },
+        ))
     }
 
     /// A GGUF classifier or reranker export at `path` on the encoder family of its
@@ -666,10 +823,20 @@ impl Classifier {
         let tok = meta.tokenizer(enc.capacity()?)?;
         let m = Meta {
             architecture: format!("GGUF {arch} classifier"),
-            activation: if n == 1 { Activation::Identity } else { Activation::Softmax },
+            activation: if n == 1 {
+                Activation::Identity
+            } else {
+                Activation::Softmax
+            },
             labels,
         };
-        Ok((m, Self { tok, head: Head::Logits(enc) }))
+        Ok((
+            m,
+            Self {
+                tok,
+                head: Head::Logits(enc),
+            },
+        ))
     }
 
     /// Where the encoder runs.
@@ -694,7 +861,11 @@ impl Classifier {
     }
 }
 
-fn encode(tok: &tokenizers::Tokenizer, text: &str, pair: Option<&str>) -> Result<tokenizers::Encoding, String> {
+fn encode(
+    tok: &tokenizers::Tokenizer,
+    text: &str,
+    pair: Option<&str>,
+) -> Result<tokenizers::Encoding, String> {
     let e = match pair {
         Some(p) => tok.encode((text, p), true),
         None => tok.encode(text, true),
@@ -724,10 +895,18 @@ mod tests {
     #[test]
     fn encoder_families_claim_classifier_classes() {
         let a = classifier_architectures();
-        for c in ["RobertaForSequenceClassification", "ModernBertForSequenceClassification", "DebertaV2ForSequenceClassification"] {
+        for c in [
+            "RobertaForSequenceClassification",
+            "ModernBertForSequenceClassification",
+            "DebertaV2ForSequenceClassification",
+        ] {
             assert!(a.iter().any(|x| x == c), "{c} unclaimed: {a:?}");
         }
         assert!(!a.iter().any(|x| x.starts_with("GPT2")));
-        assert!(family(&serde_json::json!({"model_type": "gpt2"}), Some("GPT2ForSequenceClassification")).is_none());
+        assert!(family(
+            &serde_json::json!({"model_type": "gpt2"}),
+            Some("GPT2ForSequenceClassification")
+        )
+        .is_none());
     }
 }

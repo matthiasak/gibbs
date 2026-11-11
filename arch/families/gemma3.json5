@@ -13,7 +13,7 @@
     gguf_arch: ["gemma3"],
   },
   pipeline: "causal_lm",
-  use_lib: ["transformer"],
+  use_lib: ["transformer", "gemma"],
   config: {
     tc: "first(cfg.text_config, cfg)",
     gguf_arch: "first(gguf['general.architecture'], '')",
@@ -24,10 +24,7 @@
     head_dim: "shape('model.layers.0.self_attn.q_norm.weight')[0]",
     heads: "shape('model.layers.0.self_attn.q_proj.weight')[0] // head_dim",
     kv_heads: "shape('model.layers.0.self_attn.k_proj.weight')[0] // head_dim",
-    rotary_dim: "head_dim",
-    rope_variant: "'HalfSplit'",
     eps: "first(gguf['attention.layer_norm_rms_epsilon'], tc.rms_norm_eps, 1e-6)",
-    act: "'GeluTanh'",
     // Without `layer_types` every `sliding_window_pattern`-th layer is global (llama.cpp: 6).
     pattern: "max(first(tc.sliding_window_pattern, 6), 1)",
     sliding_window: "first(gguf['attention.sliding_window'], tc.sliding_window, 4096)",
@@ -77,15 +74,6 @@
       ["blk.{i}.post_ffw_norm.weight", "model.layers.{i}.post_feedforward_layernorm.weight"],
     ],
   },
-  transforms: [
-    // `(1 + w)` gains in f32 (llama.cpp's converter already added the 1).
-    {tensor: "model.norm.weight", op: "to_f32", when: "!gg"},
-    {tensor: "model.norm.weight", op: "add", args: {value: 1}, when: "!gg"},
-    {tensor: "model.layers.{i}.{n:*}_layernorm.weight", op: "to_f32", when: "!gg"},
-    {tensor: "model.layers.{i}.{n:*}_layernorm.weight", op: "add", args: {value: 1}, when: "!gg"},
-    {tensor: "model.layers.{i}.self_attn.{n:*}_norm.weight", op: "to_f32", when: "!gg"},
-    {tensor: "model.layers.{i}.self_attn.{n:*}_norm.weight", op: "add", args: {value: 1}, when: "!gg"},
-  ],
   constants: {
     "rope.full": {gen: "rope_inv_freq", args: {dim: "head_dim", theta: "theta_full", kind: "type_full",
       factor: "type_full == 'yarn' ? first(factor_full, max_position_embeddings / orig_full) : factor_full",
@@ -113,7 +101,7 @@
         {repeat: "i", count: "layers", body: [
           {let: {p: "fmt('model.layers.{i}')",
                  sl: "tc.layer_types != null ? at(tc.layer_types, i) == 'sliding_attention' : (i + 1) % pattern != 0"}},
-          {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
+          {use: "gemma_rms_1p", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
           {use: "attn_cached", in: ["h"], out: "a", name: "l{i}.attn", args: {
             layer: "i", wq: "fmt('{p}.self_attn.q_proj')", wk: "fmt('{p}.self_attn.k_proj')",
             wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.o_proj')",
@@ -121,13 +109,13 @@
             inv_freq: "sl ? 'rope.sliding' : 'rope.full'", rope_mscale: "sl ? 1 : mscale_full",
             window: "sl ? sliding_window : null", soft_cap: "attn_softcap > 0 ? attn_softcap : null"}},
           {use: "sandwich", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x", "a"], out: "x", name: "l{i}.res1"},
-          {use: "rms_norm", args: {w: "fmt('{p}.pre_feedforward_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
+          {use: "gemma_rms_1p", args: {w: "fmt('{p}.pre_feedforward_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
           {use: "mlp_glu", in: ["h"], out: "m", name: "l{i}.mlp", args: {
             gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
           {use: "sandwich", args: {w: "fmt('{p}.post_feedforward_layernorm')"}, in: ["x", "m"], out: "x", name: "l{i}.res2"},
           {tap: "layer.{i}", in: "x"},
         ]},
-        {use: "decoder_tail", name: "", args: {norm: "'model.norm'", w: "head_w", softcap: "softcap", skip_last_single: true}, in: ["x"], out: ["logits", "hidden"]},
+        {use: "gemma_softcap_head", name: "", args: {norm: "'model.norm'", w: "head_w", softcap: "softcap", skip_last_single: true}, in: ["x"], out: ["logits", "hidden"]},
       ],
       outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
     },

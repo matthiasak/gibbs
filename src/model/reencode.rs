@@ -296,33 +296,43 @@ pub struct NativeStats {
     pub cached_choice: Option<ChoiceRecord>,
 }
 
-static NATIVE_STATS: Mutex<NativeStats> = Mutex::new(NativeStats {
-    tensors: 0,
-    reencoded: 0,
-    bytes_before: 0,
-    bytes_after: 0,
-    cache_hits: 0,
-    cache_mismatch: false,
-    cached_choice: None,
-});
+thread_local! {
+    static NATIVE_STATS: std::cell::Cell<NativeStats> =
+        const { std::cell::Cell::new(NativeStats {
+            tensors: 0,
+            reencoded: 0,
+            bytes_before: 0,
+            bytes_after: 0,
+            cache_hits: 0,
+            cache_mismatch: false,
+            cached_choice: None,
+        }) };
+}
 
 pub fn reset_native_stats() {
-    *NATIVE_STATS.lock() = NativeStats::default();
-    *PENDING_REENCODE.lock() = None;
+    NATIVE_STATS.with(|s| s.set(NativeStats::default()));
+    PENDING_REENCODE.with(|p| *p.borrow_mut() = None);
 }
 
 pub fn native_stats() -> NativeStats {
-    *NATIVE_STATS.lock()
+    NATIVE_STATS.with(|s| s.get())
 }
 
 pub fn set_cached_choice(c: ChoiceRecord) {
-    NATIVE_STATS.lock().cached_choice = Some(c);
+    NATIVE_STATS.with(|s| {
+        let mut st = s.get();
+        st.cached_choice = Some(c);
+        s.set(st);
+    });
 }
 /// Test hook: pretend the current load re-encoded `n` tensors.
 #[cfg(test)]
 pub(crate) fn fake_native_reencoded(n: usize) {
-    let mut s = NATIVE_STATS.lock();
-    (s.tensors, s.reencoded) = (n, n);
+    NATIVE_STATS.with(|s| {
+        let mut st = s.get();
+        (st.tensors, st.reencoded) = (n, n);
+        s.set(st);
+    });
 }
 
 static NATIVE_APPLIED: Mutex<Option<(ReencodePolicy, u64, Option<Q>)>> = Mutex::new(None);
@@ -476,16 +486,7 @@ pub fn reencode_native(
 ) -> Option<(Q, Vec<u8>)> {
     let f = target(cfg, name, src, cols, false)?;
     // The source's own decoder, so the values are exactly what the GPU would have read.
-    encode_blocks(
-        cfg,
-        name,
-        src,
-        f,
-        rows,
-        cols,
-        raw,
-        gguf_block_codec(src)?,
-    )
+    encode_blocks(cfg, name, src, f, rows, cols, raw, gguf_block_codec(src)?)
 }
 
 /// [`reencode_native`] for a projection stored as `src` (any format, floats included) whose
@@ -505,16 +506,7 @@ pub fn reencode_values(
             *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
         }
     }
-    encode_blocks(
-        cfg,
-        name,
-        src,
-        f,
-        rows,
-        cols,
-        &raw,
-        (32, 128, f32_block),
-    )
+    encode_blocks(cfg, name, src, f, rows, cols, &raw, (32, 128, f32_block))
 }
 
 /// Pure format selection for `(policy, name, src, cols)` shared by [`target`] and `variant::WeightHeader::after`.
@@ -586,9 +578,11 @@ fn target(
     if is_gather_table(name, float_src) || (cfg.ffn_only && !ffn) {
         return None;
     }
-    let mut stats = NATIVE_STATS.lock();
-    stats.tensors += 1;
-    drop(stats);
+    NATIVE_STATS.with(|s| {
+        let mut st = s.get();
+        st.tensors += 1;
+        s.set(st);
+    });
     target_for_policy(
         cfg.policy,
         name,
@@ -682,12 +676,15 @@ fn encode_blocks(
     }
     // A float target stores no blocks.
     let blocks = blocks?;
-    let mut stats = NATIVE_STATS.lock();
-    stats.reencoded += 1;
-    (stats.bytes_before, stats.bytes_after) = (
-        stats.bytes_before + (rows * src.tensor_bytes(cols)) as u64,
-        stats.bytes_after + blocks.len() as u64,
-    );
+    NATIVE_STATS.with(|s| {
+        let mut st = s.get();
+        st.reencoded += 1;
+        (st.bytes_before, st.bytes_after) = (
+            st.bytes_before + (rows * src.tensor_bytes(cols)) as u64,
+            st.bytes_after + blocks.len() as u64,
+        );
+        s.set(st);
+    });
     tracing::debug!("reencode {name} {rows}x{cols}: {src:?} -> {f:?} (rmse {rmse:.4})");
     Some((f, blocks))
 }
@@ -724,28 +721,33 @@ pub struct PendingTensor {
 
 pub type PendingReencode = (String, BTreeMap<String, PendingTensor>);
 
-static PENDING_REENCODE: Mutex<Option<PendingReencode>> = Mutex::new(None);
-
-static RETAINED_PENDING: Mutex<Option<(ReencodePolicy, PendingReencode)>> = Mutex::new(None);
+thread_local! {
+    static PENDING_REENCODE: std::cell::RefCell<Option<PendingReencode>> =
+        const { std::cell::RefCell::new(None) };
+    static RETAINED_PENDING: std::cell::RefCell<Option<(ReencodePolicy, PendingReencode)>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Retains encoded tensors from a rejected KL-gate rung so subsequent rungs (`ffn_only`) reuse them.
 pub fn retain_pending_reencode(policy: ReencodePolicy, pending: Option<PendingReencode>) {
     let Some((key, map)) = pending else {
         return;
     };
-    let mut guard = RETAINED_PENDING.lock();
-    match guard.as_mut() {
-        Some((p, (k, existing))) if *p == policy && *k == key => {
-            for (name, pt) in map {
-                existing.entry(name).or_insert(pt);
+    RETAINED_PENDING.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_mut() {
+            Some((p, (k, existing))) if *p == policy && *k == key => {
+                for (name, pt) in map {
+                    existing.entry(name).or_insert(pt);
+                }
             }
+            _ => *guard = Some((policy, (key, map))),
         }
-        _ => *guard = Some((policy, (key, map))),
-    }
+    });
 }
 
 pub fn clear_retained_pending() {
-    *RETAINED_PENDING.lock() = None;
+    RETAINED_PENDING.with(|c| *c.borrow_mut() = None);
 }
 
 /// Reuses a tensor already encoded on an earlier rung of [`crate::arch::load::gated`] when the
@@ -758,8 +760,8 @@ pub fn reuse_retained_pending(
     rows: usize,
     cols: usize,
 ) -> Option<PendingTensor> {
-    let pt = {
-        let guard = RETAINED_PENDING.lock();
+    let pt = RETAINED_PENDING.with(|cell| {
+        let guard = cell.borrow();
         let (policy, (rkey, map)) = guard.as_ref()?;
         if *policy != cfg.policy || rkey != key {
             return None;
@@ -768,15 +770,17 @@ pub fn reuse_retained_pending(
         if pt.rows != rows || pt.cols != cols {
             return None;
         }
-        pt
-    };
+        Some(pt)
+    })?;
     // Check whether the current rung's config (`ffn_only`, etc.) actually wants to re-encode `name`.
     let _ = target(cfg, name, src, cols, is_float(src))?;
-    let mut stats = NATIVE_STATS.lock();
-    stats.reencoded += 1;
-    stats.bytes_before += (rows * src.tensor_bytes(cols)) as u64;
-    stats.bytes_after += pt.bytes as u64;
-    drop(stats);
+    NATIVE_STATS.with(|s| {
+        let mut st = s.get();
+        st.reencoded += 1;
+        st.bytes_before += (rows * src.tensor_bytes(cols)) as u64;
+        st.bytes_after += pt.bytes as u64;
+        s.set(st);
+    });
     record_pending_tensor(
         key,
         name,
@@ -819,14 +823,17 @@ pub struct GateContext {
     pub allow_redirect: bool,
 }
 
-static GATE_CONTEXT: Mutex<Option<GateContext>> = Mutex::new(None);
+thread_local! {
+    static GATE_CONTEXT: std::cell::Cell<Option<GateContext>> =
+        const { std::cell::Cell::new(None) };
+}
 
 pub fn set_gate_context(ctx: Option<GateContext>) {
-    *GATE_CONTEXT.lock() = ctx;
+    GATE_CONTEXT.with(|c| c.set(ctx));
 }
 
 pub fn gate_context() -> Option<GateContext> {
-    *GATE_CONTEXT.lock()
+    GATE_CONTEXT.with(|c| c.get())
 }
 
 pub fn choice_key(
@@ -912,22 +919,28 @@ pub fn record_cache_hit(
     rows: usize,
     cols: usize,
 ) {
-    let mut stats = NATIVE_STATS.lock();
-    stats.tensors += 1;
-    stats.reencoded += 1;
-    stats.cache_hits += 1;
-    stats.bytes_before += (rows * src.tensor_bytes(cols)) as u64;
-    stats.bytes_after += bytes as u64;
-    drop(stats);
+    NATIVE_STATS.with(|s| {
+        let mut st = s.get();
+        st.tensors += 1;
+        st.reencoded += 1;
+        st.cache_hits += 1;
+        st.bytes_before += (rows * src.tensor_bytes(cols)) as u64;
+        st.bytes_after += bytes as u64;
+        s.set(st);
+    });
     record_pending_tensor(key, name, format, map, off, bytes, rows, cols);
 }
 
 pub fn record_cache_mismatch() {
-    NATIVE_STATS.lock().cache_mismatch = true;
+    NATIVE_STATS.with(|s| {
+        let mut st = s.get();
+        st.cache_mismatch = true;
+        s.set(st);
+    });
 }
 
 pub fn has_cache_mismatch() -> bool {
-    NATIVE_STATS.lock().cache_mismatch
+    NATIVE_STATS.with(|s| s.get().cache_mismatch)
 }
 
 pub fn record_pending_tensor(
@@ -940,26 +953,28 @@ pub fn record_pending_tensor(
     rows: usize,
     cols: usize,
 ) {
-    let mut guard = PENDING_REENCODE.lock();
-    let entry = guard.get_or_insert_with(|| (key.to_string(), BTreeMap::new()));
-    if entry.0 != key {
-        *entry = (key.to_string(), BTreeMap::new());
-    }
-    entry.1.insert(
-        name.to_string(),
-        PendingTensor {
-            format,
-            map,
-            off,
-            bytes,
-            rows,
-            cols,
-        },
-    );
+    PENDING_REENCODE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let entry = guard.get_or_insert_with(|| (key.to_string(), BTreeMap::new()));
+        if entry.0 != key {
+            *entry = (key.to_string(), BTreeMap::new());
+        }
+        entry.1.insert(
+            name.to_string(),
+            PendingTensor {
+                format,
+                map,
+                off,
+                bytes,
+                rows,
+                cols,
+            },
+        );
+    });
 }
 
 pub fn take_pending_reencode() -> Option<PendingReencode> {
-    PENDING_REENCODE.lock().take()
+    PENDING_REENCODE.with(|c| c.borrow_mut().take())
 }
 
 pub fn save_reencode_cache(
@@ -1525,7 +1540,10 @@ mod tests {
             };
             let (f, blocks) =
                 reencode_values(&cfg, name, Q::BF16, rows, cols, || Some(w.clone())).unwrap();
-            (f, relative_rmse(&w, &dequantize_gguf_blocks(f, &blocks).unwrap()))
+            (
+                f,
+                relative_rmse(&w, &dequantize_gguf_blocks(f, &blocks).unwrap()),
+            )
         };
         let (loose, loose_err) = run(None);
         let (tight, tight_err) = run(Some(vec!["*.self_attn.*".into()]));

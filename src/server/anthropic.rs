@@ -31,6 +31,9 @@ pub struct MessagesRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub stream: Option<bool>,
+    /// Compaction settings over the saved ones ([`core::compact_override`]).
+    #[serde(default)]
+    pub compact: Option<crate::compact::CompactionOverride>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,8 +241,9 @@ async fn run(
     headers: HeaderMap,
     mut req: MessagesRequest,
 ) -> Result<Response, ApiError> {
+    let compact = core::compact_override(req.compact.take(), &headers)?;
     let (prompt, media) = prompt(&state, &mut req).await?;
-    let gen = core::start(
+    let mut gen = core::start(
         &state,
         GenRequest {
             prompt,
@@ -250,27 +254,36 @@ async fn run(
             },
             stop: req.stop_sequences.unwrap_or_default(),
             label: label("anthropic", &headers),
-            compact: None,
+            compact,
+            grammar: None,
         },
     )
     .await?;
+    let compaction = gen.compaction.take();
     let model = req.model.unwrap_or_else(|| state.scheduler.model_id());
     let wire = MessagesWire::new(gen.id, model, gen.prompt_tokens);
-    if req.stream.unwrap_or(false) {
-        return Ok(stream_response(gen, wire, Framing::SseNamed));
-    }
-    let out = collect(gen).await?;
-    let mut content: Vec<Value> = Vec::new();
-    if !out.text.is_empty() {
-        content.push(json!({"type": "text", "text": out.text}));
-    }
-    content.extend(out.calls.iter().map(tool_use));
-    let mut msg = wire.message(content);
-    let (reason, seq) = stop_reason(&out.finish);
-    msg["stop_reason"] = reason.into();
-    msg["stop_sequence"] = seq.into();
-    msg["usage"]["output_tokens"] = out.completion_tokens.into();
-    Ok(Json(msg).into_response())
+    let mut resp = if req.stream.unwrap_or(false) {
+        stream_response(gen, wire, Framing::SseNamed)
+    } else {
+        let out = collect(gen).await?;
+        let mut content: Vec<Value> = Vec::new();
+        if !out.text.is_empty() {
+            content.push(json!({"type": "text", "text": out.text}));
+        }
+        content.extend(out.calls.iter().map(tool_use));
+        let mut msg = wire.message(content);
+        let (reason, seq) = stop_reason(&out.finish);
+        msg["stop_reason"] = reason.into();
+        msg["stop_sequence"] = seq.into();
+        msg["usage"]["output_tokens"] = out.completion_tokens.into();
+        if let Some(c) = &compaction {
+            msg["usage"]["compaction"] = json!(c.report);
+        }
+        Json(msg).into_response()
+    };
+    resp.headers_mut()
+        .extend(compaction.as_ref().map(|c| c.header()));
+    Ok(resp)
 }
 
 fn tool_use(c: &ToolCall) -> Value {

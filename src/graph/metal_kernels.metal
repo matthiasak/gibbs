@@ -1693,6 +1693,139 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
     attn_cached_f32_impl<ATTN_MAX_PER_LANE, float>(q, kc, vc, out, p, vis, k_in, v_in, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
+struct RaggedAttnParams {
+    uint n_heads;
+    uint head_dim;
+    uint stride;
+    uint group;
+    float scale;
+    uint window;
+    float softcap;
+    uint m;
+    uint block_bytes;
+};
+
+// Ragged batched decode: row `b` of `q` / `k_in` / `v_in` is sequence `b`'s one new token at
+// position `pos[b]`. `kt` / `vt` are ragged tables (`Session::ragged_state_bufs`): a 16-byte
+// header, then per sequence its `KvDesc` binding, `block_bytes` apart. Writes the token's K/V row
+// into the sequence's own pages and attends over them (grid: heads x sequences).
+template <uint NJ, typename T>
+kernel void attn_cached_ragged_t(device const float* q [[buffer(0)]],
+                                 device uchar* kt [[buffer(1)]],
+                                 device uchar* vt [[buffer(2)]],
+                                 device float* out [[buffer(3)]],
+                                 constant RaggedAttnParams& p [[buffer(4)]],
+                                 device const uint* pos [[buffer(5)]],
+                                 device const float* k_in [[buffer(6)]],
+                                 device const float* v_in [[buffer(7)]],
+                                 uint2 tg [[threadgroup_position_in_grid]],
+                                 uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]],
+                                 uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float tg_m[ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_MAX_SG];
+    threadgroup float tg_acc[ATTN_MAX_SG * NJ * 32];
+    const uint hd = p.head_dim;
+    const uint row = NJ * 32;
+    const uint head = tg.x;
+    const uint b = tg.y;
+    if (head >= p.n_heads || b >= p.m) return;
+
+    device T* kc = (device T*)(kt + 16 + (ulong)b * p.block_bytes);
+    device T* vc = (device T*)(vt + 16 + (ulong)b * p.block_bytes);
+    device const KvDesc* desc = (device const KvDesc*)kc;
+    const uint ring = desc->ring_pages;
+    const uint cur = pos[b] - desc->evicted; // stored row of the new token (host-checked)
+
+    device const float* qh = q + ((ulong)b * p.n_heads + head) * hd;
+    const uint kv_off = (head / p.group) * hd;
+    device const float* ki = k_in + (ulong)b * p.stride + kv_off;
+    device const float* vi = v_in + (ulong)b * p.stride + kv_off;
+    if ((head % p.group) == 0) {
+        const uint tid = sg * 32 + lane;
+        device T* kd = kv_row(kc, 1u, ring, cur, p.stride) + kv_off;
+        device T* vd = kv_row(vc, 1u, ring, cur, p.stride) + kv_off;
+        for (uint d = tid; d < hd; d += nsg * 32) {
+            kd[d] = kv_store(ki[d], T(0));
+            vd[d] = kv_store(vi[d], T(0));
+        }
+    }
+    float qr[NJ];
+    float acc[NJ];
+    for (uint j = 0; j < NJ; ++j) {
+        uint d = lane + 32 * j;
+        qr[j] = d < hd ? qh[d] : 0.0f;
+        acc[j] = 0.0f;
+    }
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    const uint hi = cur + 1;
+    const uint lo = (p.window > 0 && hi > p.window) ? (hi - p.window) : 0;
+    uint cur_pg = ~0u;
+    device const T* kp = kc;
+    device const T* vp = vc;
+    for (uint t = lo + sg; t < hi; t += nsg) {
+        // The new row comes from k_in / v_in (other heads' threadgroups may not see the store).
+        const bool cur_in = t == cur;
+        if ((t >> 6) != cur_pg) {
+            cur_pg = t >> 6;
+            kp = kv_row(kc, 1u, ring, t & ~63u, p.stride) + kv_off;
+            vp = kv_row(vc, 1u, ring, t & ~63u, p.stride) + kv_off;
+        }
+        device const T* k = kp + (ulong)(t & 63u) * p.stride;
+        device const T* v = vp + (ulong)(t & 63u) * p.stride;
+        float s = 0.0f;
+        for (uint j = 0; j < NJ; ++j) {
+            uint d = lane + 32 * j;
+            if (d < hd) s += qr[j] * (cur_in ? ki[d] : float(k[d]));
+        }
+        s = simd_sum(s) * p.scale;
+        if (p.softcap > 0.0f) {
+            s = tanh(s / p.softcap) * p.softcap;
+        }
+        float m_new = max(m, s);
+        float corr = exp(m - m_new);
+        float e = exp(s - m_new);
+        l = l * corr + e;
+        for (uint j = 0; j < NJ; ++j) {
+            uint d = lane + 32 * j;
+            if (d < hd) acc[j] = acc[j] * corr + e * (cur_in ? vi[d] : float(v[d]));
+        }
+        m = m_new;
+    }
+    if (lane == 0) {
+        tg_m[sg] = m;
+        tg_l[sg] = l;
+    }
+    for (uint j = 0; j < NJ; ++j) {
+        uint d = lane + 32 * j;
+        if (d < hd) tg_acc[sg * row + d] = acc[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gm = -FLT_MAX;
+    for (uint i = 0; i < nsg; ++i) gm = max(gm, tg_m[i]);
+    float gl = 0.0f;
+    for (uint i = 0; i < nsg; ++i) gl += tg_l[i] * exp(tg_m[i] - gm);
+    for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
+        float o = 0.0f;
+        for (uint i = 0; i < nsg; ++i) o += tg_acc[i * row + d] * exp(tg_m[i] - gm);
+        out[((ulong)b * p.n_heads + head) * hd + d] = o / gl;
+    }
+}
+
+typedef decltype(attn_cached_ragged_t<1, float>) attn_cached_ragged_k;
+typedef decltype(attn_cached_ragged_t<1, half>) attn_cached_ragged_kh;
+template [[host_name("attn_cached_ragged_f32_1")]] kernel attn_cached_ragged_k attn_cached_ragged_t<1, float>;
+template [[host_name("attn_cached_ragged_f32_2")]] kernel attn_cached_ragged_k attn_cached_ragged_t<2, float>;
+template [[host_name("attn_cached_ragged_f32_4")]] kernel attn_cached_ragged_k attn_cached_ragged_t<4, float>;
+template [[host_name("attn_cached_ragged_f32_8")]] kernel attn_cached_ragged_k attn_cached_ragged_t<8, float>;
+template [[host_name("attn_cached_ragged_f32_16")]] kernel attn_cached_ragged_k attn_cached_ragged_t<16, float>;
+template [[host_name("attn_cached_ragged_f16_1")]] kernel attn_cached_ragged_kh attn_cached_ragged_t<1, half>;
+template [[host_name("attn_cached_ragged_f16_2")]] kernel attn_cached_ragged_kh attn_cached_ragged_t<2, half>;
+template [[host_name("attn_cached_ragged_f16_4")]] kernel attn_cached_ragged_kh attn_cached_ragged_t<4, half>;
+template [[host_name("attn_cached_ragged_f16_8")]] kernel attn_cached_ragged_kh attn_cached_ragged_t<8, half>;
+template [[host_name("attn_cached_ragged_f16_16")]] kernel attn_cached_ragged_kh attn_cached_ragged_t<16, half>;
+
 kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
                                   device float* out [[buffer(1)]],
                                   constant AttnCachedParams& p [[buffer(2)]],
@@ -2589,6 +2722,160 @@ kernel void sample_topk_final(device uint2* cand [[buffer(0)]],
     out_token[0] = chosen;
     for (uint j = 0; j < k; ++j) {
         cand[j] = j < kept_k ? uint2(top_i[j], as_type<uint>(top_v[j] / total)) : uint2(0xFFFFFFFFu, 0u);
+    }
+}
+
+struct SampleRowsParams {
+    uint vocab;
+    uint stride;
+    uint rows;
+    uint top_k;
+    float inv_temp;
+    float top_p;
+};
+
+/// Multi-row `sample_topk_part`: grid `(parts, rows, 1)` of 256 threads.
+kernel void sample_topk_rows_part(device const float* logits [[buffer(0)]],
+                                  device uint2* cand [[buffer(1)]],
+                                  constant SampleRowsParams& p [[buffer(2)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    const uint part = tg.x;
+    const uint row = tg.y;
+    if (row >= p.rows) return;
+    threadgroup float sv[2][8];
+    threadgroup uint si[2][8];
+    const uint parts = (p.vocab + SAMPLE_SPAN - 1) / SAMPLE_SPAN;
+    const uint base = part * SAMPLE_SPAN + tid;
+    device const float* row_logits = logits + (ulong)row * p.stride;
+    float v[16];
+#pragma unroll
+    for (uint j = 0; j < 16; ++j) {
+        const uint i = base + 256 * j;
+        float x = -INFINITY;
+        if (i < p.vocab) {
+            x = row_logits[i];
+            if (isnan(x)) x = -INFINITY;
+        }
+        v[j] = x;
+    }
+    const uint k = min(max(p.top_k, 1u), 64u);
+    float lv = 0.0f;
+    uint li = 0;
+    bool first = true, rescan = true;
+    float bv = -INFINITY;
+    uint bi = 0xFFFFFFFFu;
+    for (uint r = 0; r < k; ++r) {
+        if (rescan) {
+            bv = -INFINITY;
+            bi = 0xFFFFFFFFu;
+#pragma unroll
+            for (uint j = 0; j < 16; ++j) {
+                const uint i = base + 256 * j;
+                if ((first || sample_before(lv, li, v[j], i)) && sample_before(v[j], i, bv, bi)) {
+                    bv = v[j];
+                    bi = i;
+                }
+            }
+            rescan = false;
+        }
+        float wv;
+        uint wi;
+        sample_tg_best(bv, bi, sv[r & 1], si[r & 1], sg, lane, wv, wi);
+        if (tid == 0) {
+            cand[((ulong)row * parts + part) * k + r] = uint2(as_type<uint>(wv), wi);
+        }
+        if (bi == wi) {
+            lv = wv;
+            li = wi;
+            first = false;
+            rescan = true;
+        }
+    }
+}
+
+/// Multi-row `sample_topk_final`: grid `(rows, 1, 1)` of 256 threads. Writes normalized nucleus
+/// `(id, prob_bits)` pairs (`(0xFFFFFFFF, 0)` past `kept_k`) to `out_cand[row * k .. (row + 1) * k]`.
+kernel void sample_topk_rows_final(device const uint2* cand [[buffer(0)]],
+                                   device uint2* out_cand [[buffer(1)]],
+                                   constant SampleRowsParams& p [[buffer(2)]],
+                                   uint row [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]],
+                                   uint sg [[simdgroup_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= p.rows) return;
+    threadgroup float sv[2][8];
+    threadgroup uint si[2][8];
+    const uint k = min(max(p.top_k, 1u), 64u);
+    const uint parts = (p.vocab + SAMPLE_SPAN - 1) / SAMPLE_SPAN;
+    const uint n = parts * k;
+    device const uint2* rcand = cand + (ulong)row * n;
+    float top_v[64];
+    uint top_i[64];
+    float lv = 0.0f;
+    uint li = 0;
+    bool first = true, rescan = true;
+    float bv = -INFINITY;
+    uint bi = 0xFFFFFFFFu;
+    for (uint r = 0; r < k; ++r) {
+        if (rescan) {
+            bv = -INFINITY;
+            bi = 0xFFFFFFFFu;
+            for (uint c = tid; c < n; c += 256) {
+                const uint2 e = rcand[c];
+                const float x = as_type<float>(e.x);
+                if ((first || sample_before(lv, li, x, e.y)) && sample_before(x, e.y, bv, bi)) {
+                    bv = x;
+                    bi = e.y;
+                }
+            }
+            rescan = false;
+        }
+        float wv;
+        uint wi;
+        sample_tg_best(bv, bi, sv[r & 1], si[r & 1], sg, lane, wv, wi);
+        if (tid == 0) {
+            top_v[r] = wv;
+            top_i[r] = wi;
+        }
+        if (bi == wi) {
+            lv = wv;
+            li = wi;
+            first = false;
+            rescan = true;
+        }
+    }
+    if (tid != 0) return;
+    device uint2* dst = out_cand + (ulong)row * k;
+    if (p.inv_temp <= 0.0f) {
+        dst[0] = uint2(top_i[0], as_type<uint>(1.0f));
+        for (uint j = 1; j < k; ++j) {
+            dst[j] = uint2(0xFFFFFFFFu, 0u);
+        }
+        return;
+    }
+    const float max_v = top_v[0];
+    float total = 0.0f;
+    for (uint j = 0; j < k; ++j) {
+        float w = (top_i[j] != 0xFFFFFFFFu && isfinite(top_v[j])) ? exp((top_v[j] - max_v) * p.inv_temp) : 0.0f;
+        top_v[j] = w;
+        total += w;
+    }
+    const float cutoff = total * clamp(p.top_p, 1e-6f, 1.0f);
+    float kept_sum = 0.0f;
+    uint kept_k = 0;
+    for (uint j = 0; j < k; ++j) {
+        kept_sum += top_v[j];
+        kept_k = j + 1;
+        if (kept_sum >= cutoff) break;
+    }
+    const float denom = max(kept_sum, 1e-30f);
+    for (uint j = 0; j < k; ++j) {
+        dst[j] = (j < kept_k && top_i[j] != 0xFFFFFFFFu)
+            ? uint2(top_i[j], as_type<uint>(top_v[j] / denom))
+            : uint2(0xFFFFFFFFu, 0u);
     }
 }
 

@@ -222,6 +222,16 @@ pub fn gemm_packed_name(codec: &Codec, epi: u32, indexed: bool) -> String {
 /// When `indexed` is true, runs grouped expert GEMM (`grid = (ceil(slots/128), ceil(n/64), experts)`)
 /// using `counts[experts]` and `slot_list[experts][slots]` produced by `moe_map_rows`.
 /// Reference: ggml-metal tensor-API `kernel_mul_mm` / `kernel_mul_mm_id`.
+const OUT_INDEX_MSL: &str = r#"
+static inline ulong out_index(uint r, uint col, uint n, uint m, uint s1, uint s2, uint s3) {
+    if (s1 == 0) return (ulong)r * n + col;
+    if (col < s1) return (ulong)r * s1 + col;
+    if (col < s2) return (ulong)m * s1 + (ulong)r * (s2 - s1) + (col - s1);
+    if (col < s3) return (ulong)m * s2 + (ulong)r * (s3 - s2) + (col - s2);
+    return (ulong)m * s3 + (ulong)r * (n - s3) + (col - s3);
+}
+"#;
+
 pub fn gemm_packed(codec: &Codec, epi: u32, indexed: bool) -> String {
     let name = gemm_packed_name(codec, epi, indexed);
     let dec = format!("decode8_{:?}", codec.format);
@@ -384,6 +394,13 @@ kernel void {name}(
 #if defined(GIBBS_MPP)
 using namespace mpp::tensor_ops;
 {codec_msl}
+{OUT_INDEX_MSL}
+struct GenGemmParams {{
+    GemmParams base;
+    uint s1;
+    uint s2;
+    uint s3;
+}};
 
 kernel void {name}(
     device float* x [[buffer(0)]],
@@ -391,11 +408,12 @@ kernel void {name}(
     device const float* bias [[buffer(2)]],
     device const float* res [[buffer(3)]],
     device float* out [[buffer(4)]],
-    constant GemmParams& p [[buffer(5)]],
+    constant GenGemmParams& gp [[buffer(5)]],
     threadgroup {sa_ty}* sa [[threadgroup(0)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
 ) {{
+    constant GemmParams& p = gp.base;
     const uint m0 = tg.x * 128;
     const uint n0 = tg.y * 64;
     if (m0 >= p.m || n0 >= p.n) return;
@@ -459,8 +477,27 @@ kernel void {name}(
             if (row < p.m && col < p.n) c[i] = epilogue<{epi}>(c[i], row, col, p, bias, res);
         }}
     }}
-    auto mo = tensor(out + (ulong)m0 * p.n + n0, dextents<int32_t, 2>(tile_n, tile_m), array<int, 2>({{1, int(p.n)}}));
-    c.store(mo);
+    if (gp.s1 == 0) {{
+        auto mo = tensor(out + (ulong)m0 * p.n + n0, dextents<int32_t, 2>(tile_n, tile_m), array<int, 2>({{1, int(p.n)}}));
+        c.store(mo);
+    }} else {{
+        uint seg_hi = n0 < gp.s1 ? gp.s1 : (n0 < gp.s2 ? gp.s2 : (n0 < gp.s3 ? gp.s3 : p.n));
+        uint seg_lo = n0 < gp.s1 ? 0u : (n0 < gp.s2 ? gp.s1 : (n0 < gp.s3 ? gp.s2 : gp.s3));
+        if (n0 + uint(tile_n) <= seg_hi) {{
+            uint seg_w = seg_hi - seg_lo;
+            auto mo = tensor(out + out_index(m0, n0, p.n, p.m, gp.s1, gp.s2, gp.s3), dextents<int32_t, 2>(tile_n, tile_m), array<int, 2>({{1, int(seg_w)}}));
+            c.store(mo);
+        }} else {{
+            #pragma unroll
+            for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
+                if (c.is_valid_element(i)) {{
+                    auto idx = c.get_multidimensional_index(i);
+                    uint col = n0 + uint(idx[0]), row = m0 + uint(idx[1]);
+                    if (row < p.m && col < p.n) out[out_index(row, col, p.n, p.m, gp.s1, gp.s2, gp.s3)] = c[i];
+                }}
+            }}
+        }}
+    }}
 }}
 #endif
 "#
@@ -604,6 +641,512 @@ kernel void {name}(
     )
 }
 
+/// Maximum `cols` normalized in dynamic Apple GPU threadgroup SRAM (`32 KB` at `8192` floats).
+pub const MAX_TG_HIDDEN: usize = 8192;
+
+/// Name of the fused RMSNorm + packed-GEMV kernel [`gemv_rmsnorm`] emits for `codec` with `p`.
+pub fn gemv_rmsnorm_name(codec: &Codec, p: GemvParams) -> String {
+    let sg = if p.simdgroups == 8 {
+        String::new()
+    } else {
+        format!("_sg{}", p.simdgroups)
+    };
+    format!("gemvgen_{:?}_r{}{sg}_rn", codec.format, p.rows_per_sg)
+}
+
+fn tg_rmsnorm_msl(tg_threads: usize, simdgroups: usize, eps_expr: &str) -> String {
+    format!(
+        r#"    threadgroup float shared_sum[8];
+    const uint tid = sg * 32 + lane;
+    const uint vecs = p.cols / 4;
+    float4 sq4 = float4(0.0f);
+    for (uint i = tid; i < vecs; i += {tg_threads}) {{
+        float4 xv = *(device const float4*)(x + i * 4);
+        sq4 += xv * xv;
+    }}
+    float sq = simd_sum(sq4.x + sq4.y + sq4.z + sq4.w);
+    if (lane == 0) shared_sum[sg] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {{
+        float part = (lane < {simdgroups}) ? shared_sum[lane] : 0.0f;
+        part = simd_sum(part);
+        if (lane == 0) shared_sum[0] = rsqrt(part / float(p.cols) + {eps_expr});
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_rms = shared_sum[0];
+    for (uint i = tid; i < vecs; i += {tg_threads}) {{
+        float4 xv = *(device const float4*)(x + i * 4);
+        float4 gv = *(device const float4*)(norm_w + i * 4);
+        *(threadgroup float4*)(shared_x + i * 4) = (xv * inv_rms) * gv;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+"#
+    )
+}
+
+/// Fused single-row RMSNorm + packed GEMV (`m == 1`, `cols <= MAX_TG_HIDDEN`): cooperatively
+/// normalizes `x * norm_w` into dynamic `threadgroup float* shared_x [[threadgroup(0)]]` and runs
+/// the codec's `tile` / `wide` / `decode8` GEMV reading `shared_x` from Apple GPU SRAM.
+pub fn gemv_rmsnorm(codec: &Codec, p: GemvParams) -> String {
+    let name = gemv_rmsnorm_name(codec, p);
+    let dec = format!("decode8_{:?}", codec.format);
+    let codec_msl = device_msl(codec).replace("decode8", &dec);
+    let (r, be) = (p.rows_per_sg, codec.block_elems);
+    let store_row = |val: &str, row: &str, indent: &str| {
+        format!(
+            "{indent}float a = {val};\n{indent}if (p.base.has_bias != 0) a += bias[{row}];\n{indent}y[{row}] = apply_gemv_epi(a, (ulong)({row}), p.base, res);\n"
+        )
+    };
+    let loop_src = gemv_loop(codec, p, &dec, "(row0", true)
+        .replace(
+            "*(device const float4*)(xb",
+            "*(threadgroup const float4*)(xb",
+        )
+        .replace("p.cols", "p.base.cols")
+        .replace("p.rows", "p.base.rows");
+    let (acc_decl, sums, guard, store) = if tile(codec.format).is_some() {
+        let lpr = 32 / r;
+        let shuffles: String = std::iter::successors(Some(lpr / 2), |o| Some(o / 2))
+            .take_while(|&o| o > 0)
+            .map(|o| format!("    acc0 += simd_shuffle_xor(acc0, {o});\n"))
+            .collect();
+        (
+            format!(
+                "const uint sl = lane % {lpr}, rl = lane / {lpr}, myrow = row0 + rl;\n    float acc0 = 0.0f;"
+            ),
+            shuffles,
+            format!("sl == 0 && myrow < p.base.rows"),
+            store_row("acc0", "myrow", "        "),
+        )
+    } else {
+        let store: String = (0..r)
+            .map(|i| {
+                format!(
+                    "        if (row0 + {i} < p.base.rows) {{\n{}        }}\n",
+                    store_row(
+                        &format!("simd_sum_{i}"),
+                        &format!("row0 + {i}"),
+                        "            "
+                    )
+                )
+            })
+            .collect();
+        (
+            (0..r)
+                .map(|i| format!("float acc{i} = 0.0f;"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (0..r)
+                .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
+                .collect(),
+            "lane == 0".to_string(),
+            store,
+        )
+    };
+    let norm_msl =
+        tg_rmsnorm_msl(gemv_threads(p), p.simdgroups, "p.eps").replace("p.cols", "p.base.cols");
+    format!(
+        r#"
+{codec_msl}
+{wide_msl}
+struct PackedGemvNormParams {{
+    PackedGemvParams base;
+    float eps;
+}};
+
+kernel void {name}(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant PackedGemvNormParams& p [[buffer(3)]],
+    device const float* bias [[buffer(4)]],
+    device const float* res [[buffer(5)]],
+    device const float* norm_w [[buffer(6)]],
+    threadgroup float* shared_x [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {{
+{norm_msl}    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
+    if (row0 >= p.base.rows) return;
+    const uint blocks_per_row = p.base.cols / {be};
+    threadgroup const float* xb = shared_x;
+    {acc_decl}
+{loop_src}{sums}    if ({guard}) {{
+{store}    }}
+}}
+"#,
+        rows_per_tg = gemv_rows_per_tg(p),
+        wide_msl = wide_msl(codec, &dec, true),
+    )
+}
+
+/// Name of the fused Gate+Up+SwiGLU/GeGLU (+ optional inline RMSNorm) kernel [`gemv_dual_glu`] emits.
+pub fn gemv_dual_glu_name(gate_codec: &Codec, up_codec: &Codec, p: GemvParams) -> String {
+    let sg = if p.simdgroups == 8 {
+        String::new()
+    } else {
+        format!("_sg{}", p.simdgroups)
+    };
+    format!(
+        "gemvdual_{:?}_{:?}_r{}{sg}",
+        gate_codec.format, up_codec.format, p.rows_per_sg
+    )
+}
+
+fn dual_glu_fn_msl(
+    fn_name: &str,
+    x_space: &str,
+    gate_codec: &Codec,
+    up_codec: &Codec,
+    p: GemvParams,
+    dec_g: &str,
+    dec_u: &str,
+) -> String {
+    let r = p.rows_per_sg;
+    let same = gate_codec.format == up_codec.format;
+    if same {
+        if let Some(t) = tile(gate_codec.format) {
+            let (be, segs) = (gate_codec.block_elems, t.segs);
+            let lpr = 32 / r;
+            let nm = |n: &str| dec_g.replace("decode8", n);
+            let (seg, load, scale, tseg) = (
+                nm("group_seg"),
+                nm("tile_load"),
+                nm("tile_scale"),
+                nm("tile_seg"),
+            );
+            let brg = block_ref(gate_codec, "wg", "(ulong)myrow * blocks_per_row + blk");
+            let bru = block_ref(gate_codec, "wu", "(ulong)myrow * blocks_per_row + blk");
+            let body: String = (0..segs)
+                .map(|k| {
+                    format!(
+                        "        {{\n            const uint e = blk * {be} + {seg}(g, {k});\n            const float4 xa = *({x_space} const float4*)(xb + e), xc = *({x_space} const float4*)(xb + e + 4);\n            float vg[8], vu[8];\n            {tseg}(qg, {k}, vg);\n            {tseg}(qu, {k}, vu);\n            tg_acc += dot(float4(vg[0], vg[1], vg[2], vg[3]), xa) + dot(float4(vg[4], vg[5], vg[6], vg[7]), xc);\n            tu_acc += dot(float4(vu[0], vu[1], vu[2], vu[3]), xa) + dot(float4(vu[4], vu[5], vu[6], vu[7]), xc);\n        }}\n"
+                    )
+                })
+                .collect();
+            let groups = t.groups;
+            let loop_msl = if t.b == 0.0 {
+                format!(
+                    "    const uint tiles = blocks_per_row * {groups};\n    for (uint s = sl; s < tiles; s += {lpr}) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        uint4 qg = uint4(0), qu = uint4(0);\n        float dg = 0.0f, du = 0.0f, tg_acc = 0.0f, tu_acc = 0.0f;\n        if (myrow < p.rows) {{\n            {{ {dg_decl} qg = {load}(b, {dg_grp}g); dg = {scale}(b, {dg_grp}g); }}\n            {{ {du_decl} qu = {load}(b, {du_grp}g); du = {scale}(b, {du_grp}g); }}\n        }}\n{body}        acc_g += dg * ({a:?}f * tg_acc);\n        acc_u += du * ({a:?}f * tu_acc);\n    }}\n",
+                    dg_decl = brg.decl, dg_grp = brg.group,
+                    du_decl = bru.decl, du_grp = bru.group,
+                    a = t.a
+                )
+            } else {
+                let spr = segs as usize / r;
+                let sx_parts: String = (0..spr)
+                    .map(|m| {
+                        format!(
+                            "        {{\n            const uint e = blk * {be} + {seg}(g, rl * {spr} + {m});\n            sx += *({x_space} const float4*)(xb + e) + *({x_space} const float4*)(xb + e + 4);\n        }}\n"
+                        )
+                    })
+                    .collect();
+                let sx_sum: String = std::iter::successors(Some(lpr), |o| Some(o * 2))
+                    .take_while(|&o| o < 32)
+                    .map(|o| format!("        sxs += simd_shuffle_xor(sxs, {o});\n"))
+                    .collect();
+                format!(
+                    "    const uint tiles = blocks_per_row * {groups};\n    for (uint s = sl; s < tiles; s += {lpr}) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        uint4 qg = uint4(0), qu = uint4(0);\n        float dg = 0.0f, du = 0.0f, tg_acc = 0.0f, tu_acc = 0.0f;\n        if (myrow < p.rows) {{\n            {{ {dg_decl} qg = {load}(b, {dg_grp}g); dg = {scale}(b, {dg_grp}g); }}\n            {{ {du_decl} qu = {load}(b, {du_grp}g); du = {scale}(b, {du_grp}g); }}\n        }}\n        float4 sx = float4(0.0f);\n{sx_parts}        float sxs = dot(sx, float4(1.0f));\n{sx_sum}{body}        acc_g += dg * ({a:?}f * tg_acc - {b:?}f * sxs);\n        acc_u += du * ({a:?}f * tu_acc - {b:?}f * sxs);\n    }}\n",
+                    dg_decl = brg.decl, dg_grp = brg.group,
+                    du_decl = bru.decl, du_grp = bru.group,
+                    a = t.a, b = t.b
+                )
+            };
+            let shuffles: String = std::iter::successors(Some(lpr / 2), |o| Some(o / 2))
+                .take_while(|&o| o > 0)
+                .map(|o| {
+                    format!(
+                        "    acc_g += simd_shuffle_xor(acc_g, {o});\n    acc_u += simd_shuffle_xor(acc_u, {o});\n"
+                    )
+                })
+                .collect();
+            return format!(
+                r#"static inline void {fn_name}(
+    device const uchar* wg,
+    device const uchar* wu,
+    {x_space} const float* xb,
+    device float* y,
+    constant DualGluParams& p,
+    uint row0,
+    uint lane
+) {{
+    const uint blocks_per_row = p.cols / {be};
+    const uint sl = lane % {lpr}, rl = lane / {lpr}, myrow = row0 + rl;
+    float acc_g = 0.0f, acc_u = 0.0f;
+{loop_msl}{shuffles}    if (sl == 0 && myrow < p.rows) {{
+        y[myrow] = dual_glu_act(acc_g, acc_u, p.flags);
+    }}
+}}
+"#,
+                be = gate_codec.block_elems,
+            );
+        }
+        if let Some(wd) = wide(gate_codec.format) {
+            let be = gate_codec.block_elems;
+            let (gdec, gseg) = (
+                dec_g.replace("decode8", "decode_group"),
+                dec_g.replace("decode8", "group_seg"),
+            );
+            let xs: String = (0..wd.segs)
+                .map(|k| {
+                    format!(
+                        "        {{ const uint e = blk * {be} + {gseg}(g, {k}); xs[{}] = *({x_space} const float4*)(xb + e); xs[{}] = *({x_space} const float4*)(xb + e + 4); }}\n",
+                        2 * k,
+                        2 * k + 1
+                    )
+                })
+                .collect();
+            let groups = wd.groups;
+            let nseg = wd.segs as usize;
+            let sx: String = if wd.uniform || wd.fused_dot {
+                String::new()
+            } else {
+                (0..nseg)
+                    .map(|k| {
+                        format!(
+                            "        const float sx{k} = dot(xs[{}], float4(1.0f)) + dot(xs[{}], float4(1.0f));\n",
+                            2 * k,
+                            2 * k + 1
+                        )
+                    })
+                    .collect()
+            };
+            let rows_msl: String = if wd.fused_dot {
+                let gdot = dec_g.replace("decode8", "dot_group");
+                (0..r)
+                    .map(|i| {
+                        let brg = block_ref(gate_codec, "wg", &format!("(row0 + {i}) * blocks_per_row + blk"));
+                        let bru = block_ref(gate_codec, "wu", &format!("(row0 + {i}) * blocks_per_row + blk"));
+                        format!(
+                            "        if (row0 + {i} < p.rows) {{\n            {{ {}\n            acc_g{i} += {gdot}(b, {}g, xs); }}\n            {{ {}\n            acc_u{i} += {gdot}(b, {}g, xs); }}\n        }}\n",
+                            brg.decl, brg.group, bru.decl, bru.group
+                        )
+                    })
+                    .collect()
+            } else {
+                let v_len = if wd.uniform {
+                    8 * wd.segs + 1
+                } else {
+                    10 * wd.segs
+                };
+                let dot_expr = |acc: &str| -> String {
+                    let seg_dot = |k: usize| {
+                        let o = 8 * k;
+                        format!(
+                            "dot(float4(v[{o}], v[{}], v[{}], v[{}]), xs[{}]) + dot(float4(v[{}], v[{}], v[{}], v[{}]), xs[{}])",
+                            o + 1, o + 2, o + 3, 2 * k, o + 4, o + 5, o + 6, o + 7, 2 * k + 1
+                        )
+                    };
+                    let mut dots = String::new();
+                    if wd.uniform {
+                        let sum = (0..nseg)
+                            .map(|k| format!("({})", seg_dot(k)))
+                            .collect::<Vec<_>>()
+                            .join(" + ");
+                        dots += &format!("                {acc} += v[{}] * ({sum});\n", 8 * nseg);
+                    } else {
+                        for k in 0..nseg {
+                            dots += &format!(
+                                "                {acc} += v[{}] * ({}) + v[{}] * sx{k};\n",
+                                8 * nseg + k,
+                                seg_dot(k),
+                                9 * nseg + k
+                            );
+                        }
+                    }
+                    dots
+                };
+                (0..r)
+                    .map(|i| {
+                        let brg = block_ref(gate_codec, "wg", &format!("(row0 + {i}) * blocks_per_row + blk"));
+                        let bru = block_ref(gate_codec, "wu", &format!("(row0 + {i}) * blocks_per_row + blk"));
+                        let dg = dot_expr(&format!("acc_g{i}"));
+                        let du = dot_expr(&format!("acc_u{i}"));
+                        format!(
+                            "        if (row0 + {i} < p.rows) {{\n            {{ {}\n            float v[{v_len}];\n            {gdec}(b, {}g, v);\n{dg}            }}\n            {{ {}\n            float v[{v_len}];\n            {gdec}(b, {}g, v);\n{du}            }}\n        }}\n",
+                            brg.decl, brg.group, bru.decl, bru.group
+                        )
+                    })
+                    .collect()
+            };
+            let acc_decl: String = (0..r)
+                .map(|i| format!("float acc_g{i} = 0.0f, acc_u{i} = 0.0f;"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let sums: String = (0..r)
+                .map(|i| {
+                    format!("    float sg_{i} = simd_sum(acc_g{i}), su_{i} = simd_sum(acc_u{i});\n")
+                })
+                .collect();
+            let stores: String = (0..r)
+                .map(|i| {
+                    format!(
+                        "        if (row0 + {i} < p.rows) y[row0 + {i}] = dual_glu_act(sg_{i}, su_{i}, p.flags);\n"
+                    )
+                })
+                .collect();
+            return format!(
+                r#"static inline void {fn_name}(
+    device const uchar* wg,
+    device const uchar* wu,
+    {x_space} const float* xb,
+    device float* y,
+    constant DualGluParams& p,
+    uint row0,
+    uint lane
+) {{
+    const uint blocks_per_row = p.cols / {be};
+    {acc_decl}
+    const uint groups = blocks_per_row * {groups};
+    for (uint s = lane; s < groups; s += 32) {{
+        const uint blk = s / {groups};
+        const uint g = s % {groups};
+        float4 xs[{xs_len}];
+{xs}{sx}{rows_msl}    }}
+{sums}    if (lane == 0) {{
+{stores}    }}
+}}
+"#,
+                xs_len = 2 * wd.segs,
+            );
+        }
+    }
+    // Universal `decode8` path (also covers mixed `gate_codec.format != up_codec.format`).
+    let (beg, beu) = (gate_codec.block_elems, up_codec.block_elems);
+    let rows_msl: String = (0..r)
+        .map(|i| {
+            let brg = block_ref(gate_codec, "wg", &format!("(row0 + {i}) * bpr_g + blk_g"));
+            let bru = block_ref(up_codec, "wu", &format!("(row0 + {i}) * bpr_u + blk_u"));
+            format!(
+                "        if (row0 + {i} < p.rows) {{\n            {{ {}\n            float v[8];\n            {dec_g}(b, {}sub_g, v);\n            acc_g{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1); }}\n            {{ {}\n            float v[8];\n            {dec_u}(b, {}sub_u, v);\n            acc_u{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1); }}\n        }}\n",
+                brg.decl, brg.sub, bru.decl, bru.sub
+            )
+        })
+        .collect();
+    let acc_decl: String = (0..r)
+        .map(|i| format!("float acc_g{i} = 0.0f, acc_u{i} = 0.0f;"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sums: String = (0..r)
+        .map(|i| format!("    float sg_{i} = simd_sum(acc_g{i}), su_{i} = simd_sum(acc_u{i});\n"))
+        .collect();
+    let stores: String = (0..r)
+        .map(|i| {
+            format!(
+                "        if (row0 + {i} < p.rows) y[row0 + {i}] = dual_glu_act(sg_{i}, su_{i}, p.flags);\n"
+            )
+        })
+        .collect();
+    format!(
+        r#"static inline void {fn_name}(
+    device const uchar* wg,
+    device const uchar* wu,
+    {x_space} const float* xb,
+    device float* y,
+    constant DualGluParams& p,
+    uint row0,
+    uint lane
+) {{
+    const uint bpr_g = p.cols / {beg}, bpr_u = p.cols / {beu};
+    {acc_decl}
+    const uint subs = p.cols / 8;
+    for (uint s = lane; s < subs; s += 32) {{
+        float4 x0 = *({x_space} const float4*)(xb + s * 8);
+        float4 x1 = *({x_space} const float4*)(xb + s * 8 + 4);
+        const uint blk_g = (s * 8) / {beg}, sub_g = ((s * 8) % {beg}) / 8;
+        const uint blk_u = (s * 8) / {beu}, sub_u = ((s * 8) % {beu}) / 8;
+{rows_msl}    }}
+{sums}    if (lane == 0) {{
+{stores}    }}
+}}
+"#
+    )
+}
+
+/// Fused single-row Gate+Up GEMV + SwiGLU/GeGLU (`flags & 1`: GeGLU, `flags & 2`: inline
+/// threadgroup RMSNorm over `x * norm_w` into dynamic `shared_x [[threadgroup(0)]]`).
+pub fn gemv_dual_glu(gate_codec: &Codec, up_codec: &Codec, p: GemvParams) -> String {
+    let name = gemv_dual_glu_name(gate_codec, up_codec, p);
+    let dec_g = format!("decode8_{:?}", gate_codec.format);
+    let dec_u = format!("decode8_{:?}", up_codec.format);
+    let same = gate_codec.format == up_codec.format;
+    let codec_g_msl = device_msl(gate_codec).replace("decode8", &dec_g);
+    let codec_u_msl = if same {
+        String::new()
+    } else {
+        device_msl(up_codec).replace("decode8", &dec_u)
+    };
+    let wide_msl_str = if same {
+        wide_msl(gate_codec, &dec_g, true)
+    } else {
+        String::new()
+    };
+    let fn_tg = dual_glu_fn_msl(
+        "dual_glu_tg",
+        "threadgroup",
+        gate_codec,
+        up_codec,
+        p,
+        &dec_g,
+        &dec_u,
+    );
+    let fn_dev = dual_glu_fn_msl(
+        "dual_glu_dev",
+        "device",
+        gate_codec,
+        up_codec,
+        p,
+        &dec_g,
+        &dec_u,
+    );
+    let norm_msl = tg_rmsnorm_msl(gemv_threads(p), p.simdgroups, "p.eps");
+    format!(
+        r#"
+{codec_g_msl}
+{codec_u_msl}
+{wide_msl_str}
+struct DualGluParams {{
+    uint rows;
+    uint cols;
+    uint flags;
+    float eps;
+}};
+
+static inline float dual_glu_act(float g, float u, uint flags) {{
+    return ((flags & 1u) != 0u) ? (u * gelu_tanh(g)) : (u * (g / (1.0f + exp(-g))));
+}}
+
+{fn_tg}
+{fn_dev}
+
+kernel void {name}(
+    device const uchar* wg [[buffer(0)]],
+    device const uchar* wu [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device const float* norm_w [[buffer(3)]],
+    device float* y [[buffer(4)]],
+    constant DualGluParams& p [[buffer(5)]],
+    threadgroup float* shared_x [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {{
+    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
+    if ((p.flags & 2u) != 0u) {{
+{norm_msl}        if (row0 >= p.rows) return;
+        dual_glu_tg(wg, wu, shared_x, y, p, row0, lane);
+    }} else {{
+        if (row0 >= p.rows) return;
+        dual_glu_dev(wg, wu, x, y, p, row0, lane);
+    }}
+}}
+"#,
+        rows_per_tg = gemv_rows_per_tg(p),
+        r = p.rows_per_sg,
+    )
+}
+
 /// Most x rows one threadgroup of [`gemv_packed_mr`] applies each weight block to.
 pub const GEMV_MR: usize = 4;
 
@@ -739,24 +1282,33 @@ pub fn gemv_packed_mr(codec: &Codec, p: GemvParams, mb: usize) -> String {
     let sums = each(&|i, j| format!("    acc{i}_{j} = simd_sum(acc{i}_{j});\n"));
     let store = each(&|i, j| {
         format!(
-            "        if (batch0 + {j} < p.batch_size && row0 + {i} < p.rows) {{\n            float a = acc{i}_{j};\n            if (p.has_bias != 0) a += bias[row0 + {i}];\n            ulong o = (ulong)(batch0 + {j}) * p.rows + row0 + {i};\n            y[o] = apply_gemv_epi(a, o, p, res);\n        }}\n"
+            "        if (batch0 + {j} < p.batch_size && row0 + {i} < p.rows) {{\n            float a = acc{i}_{j};\n            if (p.has_bias != 0) a += bias[row0 + {i}];\n            ulong o = out_index(batch0 + {j}, row0 + {i}, p.rows, p.batch_size, gp.s1, gp.s2, gp.s3);\n            y[o] = apply_gemv_epi(a, o, p, res);\n        }}\n"
         )
     });
     format!(
         r#"
 {codec_msl}
 {wide_msl}
+{OUT_INDEX_MSL}
+struct PackedGemvMrParams {{
+    PackedGemvParams base;
+    uint s1;
+    uint s2;
+    uint s3;
+}};
+
 kernel void {name}(
     device const uchar* w [[buffer(0)]],
     device const float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
-    constant PackedGemvParams& p [[buffer(3)]],
+    constant PackedGemvMrParams& gp [[buffer(3)]],
     device const float* bias [[buffer(4)]],
     device const float* res [[buffer(5)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {{
+    constant PackedGemvParams& p = gp.base;
     const uint row0 = tg.x * {rows_per_tg} + sg * {r};
     const uint batch0 = tg.y * {mb};
     if (row0 >= p.rows || batch0 >= p.batch_size) return;

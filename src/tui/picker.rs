@@ -329,6 +329,12 @@ impl Picker {
                 self.refilter();
                 return PickerAction::Reload("variant");
             }
+            KeyCode::Char('o') if ctrl => {
+                let mut s = crate::tui::settings::load_settings();
+                s.hope = s.hope.next();
+                let _ = crate::tui::settings::save_settings(&s);
+                return PickerAction::Reload("hope");
+            }
             KeyCode::Char(c) if !ctrl => {
                 let mut q = self.query.clone();
                 q.push(c);
@@ -1066,8 +1072,8 @@ impl Picker {
             .unwrap_or_default();
         let s = &settings;
         let policy_str = format!(
-            " · reencode: {} (^r) · variant: {} (^f)",
-            s.reencode, s.variant
+            " · reencode: {} (^r) · variant: {} (^f) · hope: {} (^o)",
+            s.reencode, s.variant, s.hope
         );
         lines.push(spread(
             vec![

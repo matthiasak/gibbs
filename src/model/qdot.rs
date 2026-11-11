@@ -47,6 +47,7 @@ enum Path {
     Generic,
     Dot,
     I8mm,
+    Sme2,
 }
 
 /// Quantized activation layout a dot kernel reads.
@@ -67,8 +68,13 @@ impl Act {
 
 fn act_of(f: Q) -> Option<Act> {
     match f {
-        Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_IQ4_NL => Some(Act::Q80),
-        Q::GGUF_Q4_K_M | Q::GGUF_Q6_K | Q::GGUF_Q2_K | Q::GGUF_TQ2_0 => Some(Act::Q8K),
+        Q::GGUF_Q4_0 | Q::GGUF_Q5_0 | Q::GGUF_Q8_0 | Q::GGUF_IQ4_NL => Some(Act::Q80),
+        Q::GGUF_Q4_K_M
+        | Q::GGUF_Q5_K_M
+        | Q::GGUF_Q6_K
+        | Q::GGUF_Q3_K
+        | Q::GGUF_Q2_K
+        | Q::GGUF_TQ2_0 => Some(Act::Q8K),
         _ => None,
     }
 }
@@ -76,10 +82,19 @@ fn act_of(f: Q) -> Option<Act> {
 fn dotprod() -> bool {
     #[cfg(target_arch = "aarch64")]
     return std::arch::is_aarch64_feature_detected!("dotprod");
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    return std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma");
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     false
 }
 
+fn sme2_ok() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    return crate::model::sme2::available();
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    false
+}
 fn i8mm() -> bool {
     #[cfg(target_arch = "aarch64")]
     return std::arch::is_aarch64_feature_detected!("i8mm");
@@ -208,27 +223,95 @@ unsafe fn generic(job: &Job, j0: usize, j1: usize) {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+unsafe fn sme2_panel(job: &Job, j0: usize, j1: usize) {
+    let cols = job.cols;
+    let mut bp = vec![0.0f32; 32 * 256];
+    let mut ap = vec![0.0f32; 32 * 256];
+    let mut w_row = [0.0f32; 256];
+    for jn in (j0..j1).step_by(32) {
+        let nc = (j1 - jn).min(32);
+        let mut c_tiles = vec![0.0f32; job.rows.div_ceil(32) * 1024];
+        for p0 in (0..cols).step_by(256) {
+            let kc = (cols - p0).min(256);
+            bp[..32 * kc].fill(0.0);
+            for jj in 0..nc {
+                job.m
+                    .decode_slice_f32(job.wrow0 + jn + jj, p0, &mut w_row[..kc]);
+                for (p, &v) in w_row[..kc].iter().enumerate() {
+                    bp[p * 32 + jj] = v;
+                }
+            }
+            for (ti, r0) in (0..job.rows).step_by(32).enumerate() {
+                let mr = (job.rows - r0).min(32);
+                crate::model::sme2::pack_panel_32(
+                    &job.x[r0 * cols..],
+                    mr,
+                    cols,
+                    p0,
+                    kc,
+                    &mut ap[..32 * kc],
+                );
+                crate::model::sme2::sgemm_32x32(
+                    &ap[..32 * kc],
+                    &bp[..32 * kc],
+                    &mut c_tiles[ti * 1024..(ti + 1) * 1024],
+                    kc,
+                    32,
+                    p0 > 0,
+                );
+            }
+        }
+        for (ti, r0) in (0..job.rows).step_by(32).enumerate() {
+            let mr = (job.rows - r0).min(32);
+            let tile = &c_tiles[ti * 1024..(ti + 1) * 1024];
+            for rr in 0..mr {
+                for jj in 0..nc {
+                    job.put(r0 + rr, jn + jj, tile[rr * 32 + jj]);
+                }
+            }
+        }
+    }
+}
+
 fn kernel(path: Path, f: Q) -> Option<Kernel> {
     #[cfg(target_arch = "aarch64")]
     {
         use neon::*;
         let k: Kernel = match (path, f) {
             (Path::Dot, Q::GGUF_Q4_0) => dot32::<Q40>,
+            (Path::Dot, Q::GGUF_Q5_0) => dot32::<Q50>,
             (Path::Dot, Q::GGUF_Q8_0) => dot32::<Q80>,
             (Path::Dot, Q::GGUF_IQ4_NL) => dot32::<Iq4Nl>,
             (Path::Dot, Q::GGUF_Q4_K_M) => dotk::<Q4K>,
+            (Path::Dot, Q::GGUF_Q5_K_M) => dotk::<Q5K>,
             (Path::Dot, Q::GGUF_Q6_K) => dotk::<Q6K>,
+            (Path::Dot, Q::GGUF_Q3_K) => dotk::<Q3K>,
             (Path::Dot, Q::GGUF_Q2_K) => dotk::<Q2K>,
             (Path::Dot, Q::GGUF_TQ2_0) => dotk::<Tq20>,
             (Path::I8mm, Q::GGUF_Q4_0) => mm32::<Q40>,
+            (Path::I8mm, Q::GGUF_Q5_0) => mm32::<Q50>,
             (Path::I8mm, Q::GGUF_Q8_0) => mm32::<Q80>,
             (Path::I8mm, Q::GGUF_Q4_K_M) => mmk::<Q4K>,
+            (Path::I8mm, Q::GGUF_Q5_K_M) => mmk::<Q5K>,
             (Path::I8mm, Q::GGUF_Q6_K) => mmk::<Q6K>,
+            (Path::I8mm, Q::GGUF_Q3_K) => mmk::<Q3K>,
             _ => return None,
         };
         Some(k)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        let k: Kernel = match (path, f) {
+            (Path::Dot, Q::GGUF_Q4_0) => avx2::dot_q4_0,
+            (Path::Dot, Q::GGUF_Q8_0) => avx2::dot_q8_0,
+            (Path::Dot, Q::GGUF_Q4_K_M) => avx2::dot_q4_k,
+            (Path::Dot, Q::GGUF_Q6_K) => avx2::dot_q6_k,
+            _ => return None,
+        };
+        Some(k)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = (path, f);
         None
@@ -245,14 +328,18 @@ fn quant_kernel(m: &Mat, path: Path) -> Option<(Kernel, Act)> {
     Some((kernel(path, f)?, act))
 }
 
+fn sme2_format(f: Q) -> bool {
+    matches!(f, Q::GGUF_Q4_0 | Q::GGUF_Q8_0)
+}
+
 fn path_for(m: &Mat, rows: usize) -> Path {
     match m.packed() {
+        Some(p) if rows >= 32 && sme2_ok() && sme2_format(p.format) => Path::Sme2,
         Some(p) if rows > DOT_ROWS && i8mm_format(p.format) => Path::I8mm,
         _ if dotprod() && quantize_activations() => Path::Dot,
         _ => Path::Generic,
     }
 }
-
 /// `out[rows, m.rows] = x[rows, m.cols] · mᵀ (+ bias)`, straight from `m`'s stored encoding.
 pub fn linear_q(m: &Mat, x: &[f32], rows: usize, bias: Option<&[f32]>, out: &mut [f32]) {
     linear_with(m, x, rows, bias, out, path_for(m, rows));
@@ -289,6 +376,10 @@ fn linear_with(m: &Mat, x: &[f32], rows: usize, bias: Option<&[f32]>, out: &mut 
             k(job, t * TASK_ROWS, ((t + 1) * TASK_ROWS).min(n))
         });
     };
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if path == Path::Sme2 {
+        return run(&job, sme2_panel);
+    }
     let Some((k, act)) = quant_kernel(m, path) else {
         return run(&job, generic);
     };
@@ -419,6 +510,28 @@ mod neon {
         }
     }
 
+    pub struct Q50;
+    impl B32 for Q50 {
+        const BYTES: usize = 22;
+        #[inline(always)]
+        unsafe fn unpack(b: *const u8) -> (int8x16_t, int8x16_t, f32) {
+            const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let mask = vld1q_u8(BITS.as_ptr());
+            let m16 = vdupq_n_u8(0x10);
+            let blo = vcombine_u8(vdup_n_u8(*b.add(2)), vdup_n_u8(*b.add(3)));
+            let bhi = vcombine_u8(vdup_n_u8(*b.add(4)), vdup_n_u8(*b.add(5)));
+            let h0 = vandq_u8(vtstq_u8(blo, mask), m16);
+            let h1 = vandq_u8(vtstq_u8(bhi, mask), m16);
+            let (lo, hi) = nibbles(b.add(6));
+            let off = vdupq_n_s8(16);
+            (
+                vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(lo, h0)), off),
+                vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(hi, h1)), off),
+                f16(b),
+            )
+        }
+    }
+
     pub struct Q80;
     impl B32 for Q80 {
         const BYTES: usize = 34;
@@ -475,6 +588,45 @@ mod neon {
                 k.q[4 * g + 1] = vreinterpretq_s8_u8(l1);
                 k.q[4 * g + 2] = vreinterpretq_s8_u8(h0);
                 k.q[4 * g + 3] = vreinterpretq_s8_u8(h1);
+                for h in 0..2 {
+                    let (sc, m) = crate::model::layers::k4_scale_min(2 * g + h, s);
+                    for i in 0..2 {
+                        k.sc[4 * g + 2 * h + i] = sc as i32;
+                        k.mn[4 * g + 2 * h + i] = m as i16;
+                    }
+                }
+            }
+            k
+        }
+    }
+
+    pub struct Q5K;
+    impl BK for Q5K {
+        const BYTES: usize = 176;
+        #[inline(always)]
+        unsafe fn unpack(b: *const u8) -> KBlk {
+            let s = std::slice::from_raw_parts(b.add(4), 12);
+            let mut k = KBlk {
+                q: [vdupq_n_s8(0); 16],
+                sc: [0; 16],
+                mn: [0; 16],
+                d: f16(b),
+                dmin: f16(b.add(2)),
+            };
+            let (qh0, qh1) = (vld1q_u8(b.add(16)), vld1q_u8(b.add(32)));
+            let m16 = vdupq_n_u8(0x10);
+            for g in 0..4 {
+                let (l0, h0) = nibbles(b.add(48 + 32 * g));
+                let (l1, h1) = nibbles(b.add(64 + 32 * g));
+                let bit0 = vdupq_n_u8(1u8 << (2 * g));
+                let bit1 = vdupq_n_u8(1u8 << (2 * g + 1));
+                k.q[4 * g] = vreinterpretq_s8_u8(vorrq_u8(l0, vandq_u8(vtstq_u8(qh0, bit0), m16)));
+                k.q[4 * g + 1] =
+                    vreinterpretq_s8_u8(vorrq_u8(l1, vandq_u8(vtstq_u8(qh1, bit0), m16)));
+                k.q[4 * g + 2] =
+                    vreinterpretq_s8_u8(vorrq_u8(h0, vandq_u8(vtstq_u8(qh0, bit1), m16)));
+                k.q[4 * g + 3] =
+                    vreinterpretq_s8_u8(vorrq_u8(h1, vandq_u8(vtstq_u8(qh1, bit1), m16)));
                 for h in 0..2 {
                     let (sc, m) = crate::model::layers::k4_scale_min(2 * g + h, s);
                     for i in 0..2 {
@@ -576,6 +728,53 @@ mod neon {
         }
     }
 
+    pub struct Q3K;
+    impl BK for Q3K {
+        const BYTES: usize = 110;
+        #[inline(always)]
+        unsafe fn unpack(b: *const u8) -> KBlk {
+            let d = f16(b.add(108));
+            let mut k = KBlk {
+                q: [vdupq_n_s8(0); 16],
+                sc: [0; 16],
+                mn: [0; 16],
+                d,
+                dmin: 0.0,
+            };
+            let u32_le = |off: usize| {
+                u32::from_le_bytes([
+                    *b.add(off),
+                    *b.add(off + 1),
+                    *b.add(off + 2),
+                    *b.add(off + 3),
+                ])
+            };
+            let (a0, a1, a2) = (u32_le(96), u32_le(100), u32_le(104));
+            let (k1, k2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+            let aux = [
+                (a0 & k2) | ((a2 & k1) << 4),
+                (a1 & k2) | (((a2 >> 2) & k1) << 4),
+                ((a0 >> 4) & k2) | (((a2 >> 4) & k1) << 4),
+                ((a1 >> 4) & k2) | (((a2 >> 6) & k1) << 4),
+            ];
+            for g in 0..16 {
+                k.sc[g] = ((aux[g / 4] >> (8 * (g % 4))) as u8 as i8 as i32) - 32;
+            }
+            let (hm0, hm1) = (vld1q_u8(b), vld1q_u8(b.add(16)));
+            let four = vdupq_n_u8(4);
+            for n in 0..2 {
+                crumbs(b.add(32 + 32 * n), &mut k.q[8 * n..]);
+                for s in 0..4 {
+                    let bit = vdupq_n_u8(1u8 << (4 * n + s));
+                    let sub0 = vreinterpretq_s8_u8(vbicq_u8(four, vtstq_u8(hm0, bit)));
+                    let sub1 = vreinterpretq_s8_u8(vbicq_u8(four, vtstq_u8(hm1, bit)));
+                    k.q[8 * n + 2 * s] = vsubq_s8(k.q[8 * n + 2 * s], sub0);
+                    k.q[8 * n + 2 * s + 1] = vsubq_s8(k.q[8 * n + 2 * s + 1], sub1);
+                }
+            }
+            k
+        }
+    }
     pub struct Tq20;
     impl BK for Tq20 {
         const BYTES: usize = 66;
@@ -799,6 +998,234 @@ mod neon {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::Job;
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn f16(b: *const u8) -> f32 {
+        crate::model::f16_to_f32(u16::from_le_bytes([*b, *b.add(1)]))
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn hsum256_epi32(v: __m256i) -> i32 {
+        let lo = _mm256_castsi256_si128(v);
+        let hi = _mm256_extracti128_si256(v, 1);
+        let s = _mm_add_epi32(lo, hi);
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+        _mm_cvtsi128_si32(s)
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn dot_u8_i8_32(u: __m256i, y: __m256i) -> i32 {
+        let p16 = _mm256_maddubs_epi16(u, y);
+        let p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+        hsum256_epi32(p32)
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_q4_0(job: &Job, j0: usize, j1: usize) {
+        let (cols, nb) = (job.cols, job.cols / 32);
+        let (qs, ds) = (job.a.qs.as_ptr(), job.a.d.as_ptr());
+        let m4 = _mm_set1_epi8(0x0F);
+        let eights = _mm256_set1_epi8(8);
+        for rc in (0..job.rows).step_by(8) {
+            let nr = (job.rows - rc).min(8);
+            for j in j0..j1 {
+                let w = job.w.as_ptr().add((job.wrow0 + j) * job.row_bytes);
+                let mut acc = [0.0f32; 8];
+                for b in 0..nb {
+                    let wb = w.add(b * 18);
+                    let d = f16(wb);
+                    let raw = _mm_loadu_si128(wb.add(2) as *const __m128i);
+                    let lo = _mm_and_si128(raw, m4);
+                    let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+                    let u = _mm256_set_m128i(hi, lo);
+                    for (r, a) in acc[..nr].iter_mut().enumerate() {
+                        let y =
+                            _mm256_loadu_si256(qs.add((rc + r) * cols + b * 32) as *const __m256i);
+                        let s = dot_u8_i8_32(u, y) - dot_u8_i8_32(eights, y);
+                        *a += (s as f32) * (d * *ds.add((rc + r) * nb + b));
+                    }
+                }
+                for (r, &a) in acc[..nr].iter().enumerate() {
+                    job.put(rc + r, j, a);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_q8_0(job: &Job, j0: usize, j1: usize) {
+        let (cols, nb) = (job.cols, job.cols / 32);
+        let (qs, ds) = (job.a.qs.as_ptr(), job.a.d.as_ptr());
+        let flip = _mm256_set1_epi8(-128i8);
+        let ones = _mm256_set1_epi8(1);
+        for rc in (0..job.rows).step_by(8) {
+            let nr = (job.rows - rc).min(8);
+            for j in j0..j1 {
+                let w = job.w.as_ptr().add((job.wrow0 + j) * job.row_bytes);
+                let mut acc = [0.0f32; 8];
+                for b in 0..nb {
+                    let wb = w.add(b * 34);
+                    let d = f16(wb);
+                    let wv = _mm256_loadu_si256(wb.add(2) as *const __m256i);
+                    let u = _mm256_xor_si256(wv, flip);
+                    for (r, a) in acc[..nr].iter_mut().enumerate() {
+                        let y =
+                            _mm256_loadu_si256(qs.add((rc + r) * cols + b * 32) as *const __m256i);
+                        let s = dot_u8_i8_32(u, y) - 128 * dot_u8_i8_32(ones, y);
+                        *a += (s as f32) * (d * *ds.add((rc + r) * nb + b));
+                    }
+                }
+                for (r, &a) in acc[..nr].iter().enumerate() {
+                    job.put(rc + r, j, a);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_q4_k(job: &Job, j0: usize, j1: usize) {
+        let nb = job.cols / 256;
+        let (qs, ds, bs) = (job.a.qs.as_ptr(), job.a.d.as_ptr(), job.a.bs.as_ptr());
+        let m4 = _mm256_set1_epi8(0x0F);
+        for rc in (0..job.rows).step_by(8) {
+            let nr = (job.rows - rc).min(8);
+            for j in j0..j1 {
+                let w = job.w.as_ptr().add((job.wrow0 + j) * job.row_bytes);
+                let mut acc = [0.0f32; 8];
+                for b in 0..nb {
+                    let wb = w.add(b * 144);
+                    let (d, dmin) = (f16(wb), f16(wb.add(2)));
+                    let sc_bytes = std::slice::from_raw_parts(wb.add(4), 12);
+                    let mut u = [_mm256_setzero_si256(); 8];
+                    let mut sc = [0i32; 8];
+                    let mut mn = [0i32; 8];
+                    for g in 0..4 {
+                        let raw = _mm256_loadu_si256(wb.add(16 + 32 * g) as *const __m256i);
+                        u[2 * g] = _mm256_and_si256(raw, m4);
+                        u[2 * g + 1] = _mm256_and_si256(_mm256_srli_epi16(raw, 4), m4);
+                        let (s0, m0) = crate::model::layers::k4_scale_min(2 * g, sc_bytes);
+                        let (s1, m1) = crate::model::layers::k4_scale_min(2 * g + 1, sc_bytes);
+                        sc[2 * g] = s0 as i32;
+                        mn[2 * g] = m0 as i32;
+                        sc[2 * g + 1] = s1 as i32;
+                        mn[2 * g + 1] = m1 as i32;
+                    }
+                    for (r, a) in acc[..nr].iter_mut().enumerate() {
+                        let blk = (rc + r) * nb + b;
+                        let ybase = qs.add(blk * 256);
+                        let bbase = bs.add(blk * 16);
+                        let (mut dot_s, mut min_s) = (0i32, 0i32);
+                        for sg in 0..8 {
+                            let y = _mm256_loadu_si256(ybase.add(32 * sg) as *const __m256i);
+                            dot_s += sc[sg] * dot_u8_i8_32(u[sg], y);
+                            let bsum =
+                                (*bbase.add(2 * sg) as i32) + (*bbase.add(2 * sg + 1) as i32);
+                            min_s += mn[sg] * bsum;
+                        }
+                        *a += *ds.add(blk) * (d * dot_s as f32 - dmin * min_s as f32);
+                    }
+                }
+                for (r, &a) in acc[..nr].iter().enumerate() {
+                    job.put(rc + r, j, a);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_q6_k(job: &Job, j0: usize, j1: usize) {
+        let nb = job.cols / 256;
+        let (qs, ds, bs) = (job.a.qs.as_ptr(), job.a.d.as_ptr(), job.a.bs.as_ptr());
+        let m4 = _mm_set1_epi8(0x0F);
+        let m3 = _mm_set1_epi8(0x03);
+        for rc in (0..job.rows).step_by(8) {
+            let nr = (job.rows - rc).min(8);
+            for j in j0..j1 {
+                let w = job.w.as_ptr().add((job.wrow0 + j) * job.row_bytes);
+                let mut acc = [0.0f32; 8];
+                for b in 0..nb {
+                    let wb = w.add(b * 210);
+                    let d = f16(wb.add(208));
+                    let mut u16 = [_mm_setzero_si128(); 16];
+                    let mut sc = [0i32; 16];
+                    for n in 0..2 {
+                        let ql = wb.add(64 * n);
+                        let qh = wb.add(128 + 32 * n);
+                        let ql0 = _mm_loadu_si128(ql as *const __m128i);
+                        let ql1 = _mm_loadu_si128(ql.add(16) as *const __m128i);
+                        let ql2 = _mm_loadu_si128(ql.add(32) as *const __m128i);
+                        let ql3 = _mm_loadu_si128(ql.add(48) as *const __m128i);
+                        let qh0 = _mm_loadu_si128(qh as *const __m128i);
+                        let qh1 = _mm_loadu_si128(qh.add(16) as *const __m128i);
+                        let hi = |h: __m128i| _mm_slli_epi16(_mm_and_si128(h, m3), 4);
+                        let q = [
+                            _mm_or_si128(_mm_and_si128(ql0, m4), hi(qh0)),
+                            _mm_or_si128(_mm_and_si128(ql1, m4), hi(qh1)),
+                            _mm_or_si128(_mm_and_si128(ql2, m4), hi(_mm_srli_epi16(qh0, 2))),
+                            _mm_or_si128(_mm_and_si128(ql3, m4), hi(_mm_srli_epi16(qh1, 2))),
+                            _mm_or_si128(
+                                _mm_and_si128(_mm_srli_epi16(ql0, 4), m4),
+                                hi(_mm_srli_epi16(qh0, 4)),
+                            ),
+                            _mm_or_si128(
+                                _mm_and_si128(_mm_srli_epi16(ql1, 4), m4),
+                                hi(_mm_srli_epi16(qh1, 4)),
+                            ),
+                            _mm_or_si128(
+                                _mm_and_si128(_mm_srli_epi16(ql2, 4), m4),
+                                hi(_mm_srli_epi16(qh0, 6)),
+                            ),
+                            _mm_or_si128(
+                                _mm_and_si128(_mm_srli_epi16(ql3, 4), m4),
+                                hi(_mm_srli_epi16(qh1, 6)),
+                            ),
+                        ];
+                        for (i, v) in q.into_iter().enumerate() {
+                            let g = 8 * n + i;
+                            u16[g] = v;
+                            sc[g] = *wb.add(192 + g) as i8 as i32;
+                        }
+                    }
+                    for (r, a) in acc[..nr].iter_mut().enumerate() {
+                        let blk = (rc + r) * nb + b;
+                        let ybase = qs.add(blk * 256);
+                        let bbase = bs.add(blk * 16);
+                        let (mut dot_s, mut min_s) = (0i32, 0i32);
+                        for g in (0..16).step_by(2) {
+                            let u = _mm256_set_m128i(u16[g + 1], u16[g]);
+                            let y = _mm256_loadu_si256(ybase.add(16 * g) as *const __m256i);
+                            let p16 = _mm256_maddubs_epi16(u, y);
+                            let p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+                            let lo = _mm256_castsi256_si128(p32);
+                            let hi = _mm256_extracti128_si256(p32, 1);
+                            let slo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0x4E));
+                            let slo =
+                                _mm_cvtsi128_si32(_mm_add_epi32(slo, _mm_shuffle_epi32(slo, 0xB1)));
+                            let shi = _mm_add_epi32(hi, _mm_shuffle_epi32(hi, 0x4E));
+                            let shi =
+                                _mm_cvtsi128_si32(_mm_add_epi32(shi, _mm_shuffle_epi32(shi, 0xB1)));
+                            dot_s += sc[g] * slo + sc[g + 1] * shi;
+                            min_s += 32 * sc[g] * (*bbase.add(g) as i32)
+                                + 32 * sc[g + 1] * (*bbase.add(g + 1) as i32);
+                        }
+                        *a += (*ds.add(blk) * d) * (dot_s - min_s) as f32;
+                    }
+                }
+                for (r, &a) in acc[..nr].iter().enumerate() {
+                    job.put(rc + r, j, a);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,7 +1275,7 @@ mod tests {
             let (raw, w) = random_weights(f, n, cols, &mut rng);
             let m = Mat::from_packed_bytes(f, raw, n, cols);
             let bias: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
-            for rows in [1, 2, 7, 16] {
+            for rows in [1, 2, 7, 16, 33] {
                 let x: Vec<f32> = (0..rows * cols).map(|_| rng.f32()).collect();
                 let mut paths = vec![Path::Generic];
                 if dotprod() && kernel(Path::Dot, f).is_some() {
@@ -856,6 +1283,9 @@ mod tests {
                 }
                 if i8mm() && kernel(Path::I8mm, f).is_some() {
                     paths.push(Path::I8mm);
+                }
+                if rows >= 32 && sme2_ok() && sme2_format(f) {
+                    paths.push(Path::Sme2);
                 }
                 for path in paths {
                     let mut out = vec![0.0f32; rows * n];
@@ -874,7 +1304,7 @@ mod tests {
                             let abs: f64 =
                                 wr.iter().zip(xr).map(|(&a, &b)| (a * b).abs() as f64).sum();
                             // Int8 activations err by at most half a step (amax / 254) per element.
-                            let quant = if path == Path::Generic {
+                            let quant = if matches!(path, Path::Generic | Path::Sme2) {
                                 0.0
                             } else {
                                 wr.iter().map(|&a| a.abs() as f64).sum::<f64>() * amax / 250.0
@@ -891,10 +1321,16 @@ mod tests {
         }
         assert!(exercised[&Path::Generic] > 0);
         if dotprod() {
-            assert!(exercised[&Path::Dot] >= 7 * 4, "{exercised:?}");
+            #[cfg(target_arch = "aarch64")]
+            assert!(exercised[&Path::Dot] >= 10 * 5, "{exercised:?}");
+            #[cfg(target_arch = "x86_64")]
+            assert!(exercised[&Path::Dot] >= 4 * 5, "{exercised:?}");
         }
         if i8mm() {
-            assert!(exercised[&Path::I8mm] >= 4 * 4, "{exercised:?}");
+            assert!(exercised[&Path::I8mm] >= 7 * 5, "{exercised:?}");
+        }
+        if sme2_ok() {
+            assert!(exercised[&Path::Sme2] >= 2, "{exercised:?}");
         }
     }
 }

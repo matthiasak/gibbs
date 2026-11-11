@@ -3,55 +3,18 @@
 // Classification (ElectraClassificationHead): token 0 -> `classifier.dense` -> GELU -> `classifier.out_proj`.
 {
   family: "electra",
+  extends: "bert",
   match: {hf_model_type: ["electra"], hf_architectures: ["ElectraForSequenceClassification", "ElectraModel"]},
-  pipeline: "encoder",
-  use_lib: ["transformer"],
+  names: {rules: [
+    ["electra.embeddings_project.{r:*}", "electra.embeddings_project.{r}"],
+    ["electra.{r:*}", "{r}"],
+  ]},
   config: {
-    hidden: "cfg.hidden_size",
-    layers: "cfg.num_hidden_layers",
-    heads: "cfg.num_attention_heads",
-    kv_heads: "heads",
-    head_dim: "hidden // heads",
-    eps: "first(cfg.layer_norm_eps, 1e-12)",
-    max_position_embeddings: "cfg.max_position_embeddings",
-    labels: "shape('classifier.out_proj.weight')[0]",
+    head_act: "'GeluErf'",
   },
   checks: [
+    {expr: "heads == 0 || hidden % heads != 0", error: "hidden_size {hidden} not divisible by num_attention_heads {heads}"},
     {expr: "first(cfg.hidden_act, 'gelu') != 'gelu'", error: "hidden_act {cfg.hidden_act} is not supported"},
     {expr: "first(cfg.position_embedding_type, 'absolute') != 'absolute'", error: "only absolute position embeddings are supported"},
   ],
-  components: {
-    encoder: {
-      vars: ["rows", "head"],
-      inputs: [
-        {name: "token_ids", dtype: "u32", shape: ["rows"]},
-        {name: "positions", dtype: "u32", shape: ["rows"]},
-        {name: "token_types", dtype: "u32", shape: ["rows"]},
-      ],
-      body: [
-        {op: "Embedding", in: ["w:electra.embeddings.word_embeddings.weight", "i:token_ids"], out: "x", name: "emb.word"},
-        {op: "Embedding", in: ["w:electra.embeddings.position_embeddings.weight", "i:positions"], out: "pe", name: "emb.pos"},
-        {op: "Embedding", in: ["w:electra.embeddings.token_type_embeddings.weight", "i:token_types"], out: "te", name: "emb.type"},
-        {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "emb.add_pos"},
-        {op: "Binary", args: {kind: "Add"}, in: ["x", "te"], out: "x", name: "emb.add_type"},
-        {use: "layer_norm", args: {w: "'electra.embeddings.LayerNorm'"}, in: ["x"], out: "x", name: "emb.ln"},
-        {op: "Linear", in: ["x", "w:electra.embeddings_project.weight", "w?:electra.embeddings_project.bias"], out: "x",
-         name: "emb.proj", when: "has('electra.embeddings_project.weight')"},
-        {repeat: "i", count: "layers", body: [
-          {let: {p: "fmt('electra.encoder.layer.{i}')"}},
-          {use: "post_ln_encoder_layer", in: ["x"], out: "x", name: "l{i}", args: {
-            wq: "fmt('{p}.attention.self.query')", wk: "fmt('{p}.attention.self.key')",
-            wv: "fmt('{p}.attention.self.value')", wo: "fmt('{p}.attention.output.dense')",
-            ln1: "fmt('{p}.attention.output.LayerNorm')", up: "fmt('{p}.intermediate.dense')",
-            down: "fmt('{p}.output.dense')", ln2: "fmt('{p}.output.LayerNorm')"}},
-          {tap: "layer.{i}", in: "x"},
-        ]},
-        {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["x"], out: "c", name: "cls", when: "head == 'classify'"},
-        {op: "Linear", in: ["c", "w:classifier.dense.weight", "w?:classifier.dense.bias"], out: "c", name: "cls.dense", when: "head == 'classify'"},
-        {op: "Unary", args: {kind: "GeluErf"}, in: ["c"], out: "c", name: "cls.act", when: "head == 'classify'"},
-        {op: "Linear", in: ["c", "w:classifier.out_proj.weight", "w?:classifier.out_proj.bias"], out: "logits", name: "cls.out", when: "head == 'classify'"},
-      ],
-      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", value: "x", when: "head == 'hidden'"}],
-    },
-  },
 }

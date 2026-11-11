@@ -48,7 +48,7 @@ use std::time::Instant;
 const FUSED_KEY_BASE: i64 = 1 << 40;
 
 const SCHEMA: &str = r#"
-(datatype W (Wt i64) (Cat2 W W) (Cat3 W W W))
+(datatype W (Wt i64) (Cat2 W W) (Cat2Q W W) (Cat3 W W W))
 (datatype*
   (E (V i64)
      (Node i64 L)
@@ -96,10 +96,12 @@ pub enum Rule {
     GateUp,
     /// Q, K, V Linears of one input → one Linear (all three of one format).
     Qkv,
+    /// Q, K Linears of one input → one Linear (2-way fallback when V has another quant or is absent).
+    Qk,
 }
 
 /// The rules of the default pass pipeline.
-pub const DEFAULT_RULES: &[Rule] = &[Rule::MegakernelMlp, Rule::GateUp, Rule::Qkv];
+pub const DEFAULT_RULES: &[Rule] = &[Rule::MegakernelMlp, Rule::GateUp, Rule::Qkv, Rule::Qk];
 
 impl Rule {
     fn text(self) -> &'static str {
@@ -169,6 +171,21 @@ impl Rule {
        (union k (Slice f rq (+ rq rk)))
        (union v (Slice f (+ rq rk) (+ rq (+ rk rv)))))
       :ruleset fuse :name "qkv")
+"#
+            }
+            Rule::Qk => {
+                r#"
+(rule ((= q (Lin kq x wq)) (= k (Lin kk x wk)) (< kq kk)
+       (QkvIn wq) (QkvIn wk)
+       (= key (wkey wq)) (= key (wkey wk))
+       (= x (Node xid xa))
+       (= rq (wrows wq)) (= rk (wrows wk)))
+      ((let w (Cat2Q wq wk))
+       (set (wrows w) (+ rq rk)) (set (wkey w) key)
+       (let f (Lin kq x w))
+       (union q (Slice f 0 rq))
+       (union k (Slice f rq (+ rq rk))))
+      :ruleset fuse :name "qk")
 "#
             }
         }
@@ -303,6 +320,8 @@ pub struct Report {
     pub groups: usize,
     /// Fusions applied: megakernel MLP, gate/up, QKV.
     pub applied: [usize; 3],
+    /// 2-way Q+K fusions applied when V differed in format or was absent.
+    pub applied_qk: usize,
 }
 
 impl Report {
@@ -334,6 +353,14 @@ fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<String> {
 fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), String> {
     let mut uses = vec![0i64; g.values.len()];
     let mut declared = vec![false; g.values.len()];
+    let mut glu_branches: HashSet<ValueId> = HashSet::new();
+    for n in &g.nodes {
+        if matches!(n.op, Op::SwiGlu | Op::GeGlu) {
+            for &inp in &n.inputs {
+                glu_branches.insert(inp);
+            }
+        }
+    }
     for n in &g.nodes {
         if n.outputs.len() != 1 {
             return Err(format!(
@@ -390,26 +417,30 @@ fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), S
             if rows(&g.value(out).shape) == 1 {
                 fs.add("OneRow", o)?;
             }
-            if let (Op::Linear, [_, w]) = (&n.op, &n.inputs[..]) {
-                if let Some(key) = cat_key(g, *w, weights) {
-                    let wi = w.0 as usize;
-                    let wt = fs.add("Wt", wi as i64)?;
-                    if !w_seen[wi] {
-                        w_seen[wi] = true;
-                        fs.set("wrows", wt, g.value(*w).shape[0] as i64)?;
-                        fs.set("wkey", wt, key)?;
-                        fs.add("QkvIn", wt)?;
-                        let mat = weights
-                            .and_then(|ws| ws.get(&g.value(*w).name))
-                            .is_some_and(|t| matches!(t, Tensor::Mat(_)));
-                        // Separate gate/up lets Metal fold GLU into the up GEMV epilogue (`Epi::UpGeGlu/UpSwiGlu`);
-                        // fusing them costs an extra activation round trip per layer.
-                        if !mat {
-                            fs.add("GluIn", wt)?;
+            if let (Op::Linear, [_, w] | [_, w, _]) = (&n.op, &n.inputs[..]) {
+                if fusion::valid_linear_bias(g, n) {
+                    if let Some(key) = cat_key(g, *w, weights) {
+                        let wi = w.0 as usize;
+                        let wt = fs.add("Wt", wi as i64)?;
+                        if !w_seen[wi] {
+                            w_seen[wi] = true;
+                            fs.set("wrows", wt, g.value(*w).shape[0] as i64)?;
+                            fs.set("wkey", wt, key)?;
+                            if !glu_branches.contains(&out) {
+                                fs.add("QkvIn", wt)?;
+                            }
+                            let mat = weights
+                                .and_then(|ws| ws.get(&g.value(*w).name))
+                                .is_some_and(|t| matches!(t, Tensor::Mat(_)));
+                            // Separate gate/up lets Metal fold GLU into the up GEMV epilogue (`Epi::UpGeGlu/UpSwiGlu`);
+                            // fusing them costs an extra activation round trip per layer.
+                            if !mat {
+                                fs.add("GluIn", wt)?;
+                            }
                         }
+                        let lin = fs.add("Lin", (id, args[0], wt))?;
+                        fs.union(o, lin)?;
                     }
-                    let lin = fs.add("Lin", (id, args[0], wt))?;
-                    fs.union(o, lin)?;
                 }
             }
         }
@@ -423,6 +454,7 @@ enum Kind {
     Mlp = 0,
     GateUp = 1,
     Qkv = 2,
+    Qk = 3,
 }
 
 /// One e-node as extraction sees it.
@@ -521,7 +553,6 @@ impl Extract<'_> {
     }
 }
 
-
 /// How to materialize one choice.
 struct Pick {
     on: bool,
@@ -575,7 +606,6 @@ fn mlp_cover(g: &Graph, add: ValueId) -> Vec<ValueId> {
     out
 }
 
-
 /// A saturated and extracted e-graph of one graph: its fusion choices, and the materialization of
 /// the cost model's set ([`Fusion::apply`] with no flips) or of any other consistent set.
 pub struct Fusion {
@@ -605,7 +635,11 @@ pub(crate) fn fuse_rule(graph: &mut Graph, weights: FuseWeights<'_>, rule: Rule)
         &CostModel::constants(),
         Budget::default(),
     );
-    r.expect("egraph fusion").applied[rule as usize]
+    let r = r.expect("egraph fusion");
+    match rule {
+        Rule::Qk => r.applied_qk,
+        _ => r.applied[rule as usize],
+    }
 }
 
 impl Fusion {
@@ -693,8 +727,12 @@ impl Fusion {
         for (c, ch) in rows_of("Wt")? {
             wterm.insert(c, Ok(ValueId(int(ch[0]) as u32)));
         }
-        for name in ["Cat2", "Cat3"] {
+        let mut cat2q: HashSet<Value> = HashSet::new();
+        for name in ["Cat2", "Cat2Q", "Cat3"] {
             for (c, ch) in rows_of(name)? {
+                if name == "Cat2Q" {
+                    cat2q.insert(c);
+                }
                 wterm.insert(c, Err(ch));
             }
         }
@@ -760,7 +798,8 @@ impl Fusion {
             let leaves = wleaves(ch[2]);
             let out_rows: usize = leaves.iter().map(|w| g.value(*w).shape[0]).sum();
             let xv = g.value(value_of[&x]);
-            let cost_us = cost.dispatch_us
+            let is_qk = cat2q.contains(&ch[2]);
+            let cost_us = (if is_qk { 1.05 } else { 1.0 }) * cost.dispatch_us
                 + cost.read_us(g, value_of[&x])
                 + leaves.iter().map(|w| cost.read_us(g, *w)).sum::<f64>()
                 + cost.act_us((rows(&xv.shape) * out_rows * 4) as f64);
@@ -768,6 +807,8 @@ impl Fusion {
                 c,
                 if parts.len() == 3 {
                     Kind::Qkv
+                } else if is_qk {
+                    Kind::Qk
                 } else {
                     Kind::GateUp
                 },
@@ -920,7 +961,7 @@ impl Fusion {
         let mut picks = Vec::with_capacity(groups.len());
         for (i, gr) in groups.iter().enumerate() {
             let members: Vec<Result<ValueId, ValueId>> = match gr.kind {
-                Kind::GateUp | Kind::Qkv => gr
+                Kind::GateUp | Kind::Qkv | Kind::Qk => gr
                     .members
                     .iter()
                     .map(|(c, _)| match value_of.get(c) {
@@ -948,10 +989,7 @@ impl Fusion {
                     .collect(),
             });
         }
-        Ok(Self {
-            picks,
-            report,
-        })
+        Ok(Self { picks, report })
     }
 
     /// Applies the cost model's choices with `flip` toggled to `graph` (the graph [`Fusion::new`]
@@ -1015,6 +1053,8 @@ impl Fusion {
             chosen(Kind::GateUp).map(|p| &p.members[..]).collect();
         let qkv: Vec<&[Result<ValueId, ValueId>]> =
             chosen(Kind::Qkv).map(|p| &p.members[..]).collect();
+        let qk: Vec<&[Result<ValueId, ValueId>]> =
+            chosen(Kind::Qk).map(|p| &p.members[..]).collect();
 
         let node_of = |g: &Graph, v: ValueId| match g.value(v).kind {
             ValueKind::Node(n) => Some(n),
@@ -1061,7 +1101,9 @@ impl Fusion {
             vs.iter().filter_map(|v| node_of(g, *v)).collect()
         };
         let want = [mlp_adds.len(), gate_up.len(), qkv.len()];
+        let want_qk = qk.len();
         report.applied = [0; 3];
+        report.applied_qk = 0;
         if !mlp_adds.is_empty() {
             let s = only(graph, &mlp_adds);
             report.applied[0] = megakernel::fuse_mlp_blocks(graph, &s);
@@ -1070,11 +1112,15 @@ impl Fusion {
         report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.reborrow());
         let ms = contexts(graph, &qkv, &["q", "k", "v"]);
         report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.reborrow());
+        let ms = contexts(graph, &qk, &["q", "k"]);
+        report.applied_qk = fusion::rewrite_qk(graph, &ms, weights.reborrow());
         report.decode_ms = t.elapsed().as_secs_f64() * 1e3;
-        if report.applied != want && !matches!(weights, FuseWeights::ReuseOnly(_)) {
+        if (report.applied != want || report.applied_qk != want_qk)
+            && !matches!(weights, FuseWeights::ReuseOnly(_))
+        {
             return Err(format!(
-                "egraph: extracted fusions {want:?} but the rewriters applied {:?}",
-                report.applied
+                "egraph: extracted fusions {want:?} (+qk {want_qk}) but the rewriters applied {:?} (+qk {})",
+                report.applied, report.applied_qk
             ));
         }
         Ok(report)
@@ -1096,8 +1142,14 @@ mod tests {
 
     fn by_egraph((mut g, mut w): Gw, rules: &[Rule], cost: &CostModel) -> (Gw, Report) {
         crate::graph::passes::prefuse(&mut g);
-        let r = fuse(&mut g, FuseWeights::Materialize(&mut w), rules, cost, Budget::default())
-            .expect("egraph fusion");
+        let r = fuse(
+            &mut g,
+            FuseWeights::Materialize(&mut w),
+            rules,
+            cost,
+            Budget::default(),
+        )
+        .expect("egraph fusion");
         crate::graph::pattern::validate_ssa(&g).expect("SSA after egraph fusion");
         ((g, w), r)
     }
@@ -1274,8 +1326,17 @@ mod tests {
             let o = b.lin(&format!("l{i}"), n, 16 * (i + 1));
             b.g.output(o);
         }
-        let r = check("five linears", &b.done(), 0x951cf9bcebed410d);
+        let five = b.done();
+        let (got3, r3) = by_egraph(
+            five.clone(),
+            &[Rule::MegakernelMlp, Rule::GateUp, Rule::Qkv],
+            &CostModel::constants(),
+        );
+        assert_eq!(digest(&got3), 0x951cf9bcebed410d);
+        assert_eq!(r3.applied, [0, 0, 1]);
+        let (_, r) = by_egraph(five, DEFAULT_RULES, &CostModel::constants());
         assert_eq!(r.applied, [0, 0, 1]);
+        assert_eq!(r.applied_qk, 1);
     }
 
     #[test]
@@ -1296,7 +1357,6 @@ mod tests {
         let r = check("parallel", &b.done(), 0xff392cdb64415b10);
         assert_eq!(r.applied, [0, 1, 1]);
     }
-
 
     /// The llama spec's decode instance (one row, last-row head) on the synthetic checkpoint of
     /// [`crate::arch::testing::synthetic_llama`].

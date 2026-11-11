@@ -30,7 +30,7 @@ fn chat(m: &dyn NativeLm, text: &str) -> Result<String, String> {
     let mut logits = m.forward(&ids, 0, &mut st)?;
     let mut out = Vec::new();
     loop {
-        let next = sample_logits(&logits, &[], 0.0, 50, 0.9);
+        let next = sample_logits(&logits, &[], 0.0, 50, 0.9, 0);
         if tok.ends_generation(next) {
             break;
         }
@@ -72,7 +72,7 @@ fn marian_en_de_translates() {
     let mut logits = m.forward(&p, 0, &mut st).unwrap();
     let mut n = 0;
     loop {
-        let t = sample_logits(&logits, &[], 0.0, 50, 0.9);
+        let t = sample_logits(&logits, &[], 0.0, 50, 0.9, 0);
         if tok.ends_generation(t) {
             break;
         }
